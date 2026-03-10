@@ -12,6 +12,7 @@
     "ecosystem.config.cjs",
     ".env.example",
     "README.md",
+    "README.en.md",
     "LICENSE"
   ],
   "scripts": {

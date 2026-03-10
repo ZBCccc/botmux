@@ -1,155 +1,155 @@
 # claude-code-robot
 
-English | [中文](README.zh-CN.md)
+中文 | [English](README.en.md)
 
-Bridge between Lark (Feishu) topic groups and Claude Code. The daemon listens for Lark messages and automatically spawns an independent Claude Code process for each new topic thread, with live streaming cards and a web-based terminal.
+飞书话题群与 Claude Code 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 Claude Code 进程，提供实时流式卡片和 Web 终端。
 
-## Features
+## 功能特性
 
-- **One topic = one Claude Code session** — each Lark thread gets its own isolated Claude Code process
-- **Live streaming cards** — real-time terminal output rendered in Feishu cards with markdown support, per-turn card lifecycle
-- **Web terminal (xterm.js)** — full PTY output in the browser with optional write access via on-demand DM link
-- **Session persistence** — sessions survive daemon restarts and resume automatically
-- **Scheduled tasks** — cron-based recurring prompts with natural language scheduling (Chinese supported)
-- **Project management** — interactive repo selector, per-session working directory
-- **MCP integration** — Claude Code can reply to Lark threads, read message history, and add reactions via MCP tools
-- **Access control** — allowlist for users, token-based write access for terminals, button restrictions on cards
+- **一个话题 = 一个 Claude Code 会话** — 每个飞书话题线程对应一个独立的 Claude Code 进程
+- **实时流式卡片** — 终端输出实时渲染到飞书卡片中，支持 Markdown 格式，每轮对话独立卡片
+- **Web 终端 (xterm.js)** — 浏览器查看完整 PTY 输出，按需获取可操作链接
+- **会话持久化** — 会话在 Daemon 重启后自动恢复
+- **定时任务** — 基于 Cron 的周期性任务，支持中文自然语言配置
+- **项目管理** — 交互式仓库选择器，每个会话独立工作目录
+- **MCP 集成** — Claude Code 可通过 MCP 工具回复飞书话题、读取消息历史、添加表情回应
+- **权限控制** — 用户白名单、终端 Token 写入权限、卡片按钮操作限制
 
-## Architecture
+## 架构
 
 ```
-Lark WebSocket Events
+飞书 WebSocket 事件
     |
 Daemon (daemon.ts)
-    |-- Event: im.message.receive_v1 (new topics & thread replies)
-    |-- Event: card.action.trigger (repo select, restart, close)
-    |-- Scheduler (cron tasks)
+    |-- 事件: im.message.receive_v1 (新话题 & 话题回复)
+    |-- 事件: card.action.trigger (选择仓库、重启、关闭)
+    |-- 定时任务调度器
     |
-Worker (worker.ts) -- forked child process per session
-    |-- node-pty: spawns Claude Code CLI in a pseudo-terminal
-    |-- HTTP + WebSocket server: serves xterm.js web terminal
-    |-- Headless xterm: captures screen for streaming cards
-    |-- IPC: communicates with daemon
+Worker (worker.ts) -- 每个会话 fork 一个子进程
+    |-- node-pty: 在伪终端中启动 Claude Code CLI
+    |-- HTTP + WebSocket: 提供 xterm.js Web 终端
+    |-- Headless xterm: 捕获屏幕内容用于流式卡片
+    |-- IPC: 与 Daemon 通信
     |
-Claude Code CLI (interactive TTY mode)
+Claude Code CLI (交互式 TTY 模式)
     |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
     |
-Lark API
-    |-- Replies, reactions, card updates, DMs
+飞书 API
+    |-- 回复消息、表情回应、卡片更新、私聊
 ```
 
-## Prerequisites
+## 前置要求
 
 - **Node.js** >= 20
-- **Claude Code CLI** installed and authenticated (`claude` in PATH)
-- **Lark app** with Bot and Message permissions (WebSocket event subscription)
+- **Claude Code CLI** 已安装并完成认证（`claude` 在 PATH 中）
+- **飞书应用** 具备机器人和消息权限（WebSocket 事件订阅）
 
-## Installation
+## 安装
 
 ```bash
 npm install -g @byted/claude-code-robot
 ```
 
-## Quick Start
+## 快速开始
 
 ```bash
-# 1. Interactive setup — creates ~/.claude-code-robot/.env
+# 1. 交互式配置 — 创建 ~/.claude-code-robot/.env
 claude-code-robot setup
 
-# 2. Start the daemon
+# 2. 启动 daemon
 claude-code-robot start
 ```
 
-The `setup` command will guide you through:
-- Creating a Lark app (with required permissions listed)
-- Entering App ID, App Secret, Chat ID
-- Optional: Claude model, working directory, access control
+`setup` 命令会引导你完成：
+- 创建飞书应用（列出所需权限）
+- 输入 App ID、App Secret、Chat ID
+- 可选：Claude 模型、工作目录、权限控制
 
-## CLI Commands
+## CLI 命令
 
-| Command | Description |
-|---------|-------------|
-| `claude-code-robot setup` | Interactive first-time configuration |
-| `claude-code-robot start` | Start daemon (PM2 managed) |
-| `claude-code-robot stop` | Stop daemon |
-| `claude-code-robot restart` | Restart daemon (auto-restores active sessions) |
-| `claude-code-robot logs` | View daemon logs (`--lines N` for more) |
-| `claude-code-robot status` | Show daemon status |
-| `claude-code-robot upgrade` | Upgrade to latest version |
+| 命令 | 说明 |
+|------|------|
+| `claude-code-robot setup` | 交互式首次配置 |
+| `claude-code-robot start` | 启动 daemon（PM2 管理） |
+| `claude-code-robot stop` | 停止 daemon |
+| `claude-code-robot restart` | 重启 daemon（自动恢复活跃会话） |
+| `claude-code-robot logs` | 查看日志（`--lines N`） |
+| `claude-code-robot status` | 查看 daemon 状态 |
+| `claude-code-robot upgrade` | 升级到最新版本 |
 
-## Configuration
+## 配置
 
-Configuration is stored at `~/.claude-code-robot/.env`. Run `claude-code-robot setup` to create it interactively, or edit manually:
+配置文件位于 `~/.claude-code-robot/.env`。运行 `claude-code-robot setup` 交互式创建，或手动编辑：
 
-### Required
+### 必填
 
-| Variable | Description |
-|----------|-------------|
-| `LARK_APP_ID` | Lark app ID |
-| `LARK_APP_SECRET` | Lark app secret |
-| `LARK_DEFAULT_CHAT_ID` | Default Lark chat ID for the topic group |
+| 变量 | 说明 |
+|------|------|
+| `LARK_APP_ID` | 飞书应用 App ID |
+| `LARK_APP_SECRET` | 飞书应用 App Secret |
+| `LARK_DEFAULT_CHAT_ID` | 话题群的 Chat ID |
 
-### Optional
+### 可选
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LARK_BRIDGE_MODEL` | `opus` | Claude model (`opus`, `sonnet`, `haiku`) |
-| `LARK_BRIDGE_MAX_TURNS` | `500` | Max conversation turns per session |
-| `CLAUDE_PATH` | `claude` | Path to Claude Code CLI binary |
-| `CLAUDE_WORKING_DIR` | `~` | Default working directory |
-| `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated Lark open_ids |
-| `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
-| `WEB_HOST` | `0.0.0.0` | HTTP server bind address |
-| `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP for terminal URLs |
-| `SESSION_DATA_DIR` | `~/.claude-code-robot/data` | Where sessions and queues are stored |
-| `DEBUG` | _(unset)_ | Set to `1` for debug logging |
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `LARK_BRIDGE_MODEL` | `opus` | Claude 模型（`opus`、`sonnet`、`haiku`） |
+| `LARK_BRIDGE_MAX_TURNS` | `500` | 每个会话的最大对话轮数 |
+| `CLAUDE_PATH` | `claude` | Claude Code CLI 路径 |
+| `CLAUDE_WORKING_DIR` | `~` | 默认工作目录 |
+| `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的飞书用户 open_id，逗号分隔 |
+| `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
+| `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
+| `WEB_EXTERNAL_HOST` | _(自动检测局域网 IP)_ | 终端链接中的外部主机名/IP |
+| `SESSION_DATA_DIR` | `~/.claude-code-robot/data` | 会话和队列的存储目录 |
+| `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
 
-## File Locations
+## 文件位置
 
-| Path | Description |
-|------|-------------|
-| `~/.claude-code-robot/.env` | Configuration |
-| `~/.claude-code-robot/data/` | Session data, message queues |
-| `~/.claude-code-robot/logs/` | Daemon logs |
+| 路径 | 说明 |
+|------|------|
+| `~/.claude-code-robot/.env` | 配置文件 |
+| `~/.claude-code-robot/data/` | 会话数据、消息队列 |
+| `~/.claude-code-robot/logs/` | Daemon 日志 |
 
-## Usage
+## 使用
 
-### Workflow
+### 使用流程
 
-1. Send a message in your Lark topic group to create a new thread
-2. The bot shows a repo selection card — pick a project or click "Start directly"
-3. Claude Code spawns in the selected directory
-4. A live streaming card appears in the thread, showing real-time terminal output with markdown rendering
-5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
-6. Click "🔑 Get Write Link" on the card to receive a write-enabled terminal URL via DM
-7. Claude replies in the thread via MCP tools
+1. 在飞书话题群中发送消息创建新话题
+2. 机器人弹出仓库选择卡片 — 选择项目或点击「直接开启会话」
+3. Claude Code 在所选目录下启动
+4. 话题中出现实时流式卡片，展示终端输出并支持 Markdown 渲染
+5. 每次回复创建新的流式卡片，上一轮卡片冻结在最后状态
+6. 点击卡片上的「🔑 获取操作链接」通过私聊获取可写终端链接
+7. Claude 通过 MCP 工具在话题中回复
 
-### Slash Commands
+### 斜杠命令
 
-| Command | Description |
-|---------|-------------|
-| `/repo` | Show project selector card |
-| `/repo <N>` | Switch to Nth project from last scan |
-| `/cd <path>` | Change working directory |
-| `/status` | Show session info (uptime, terminal URL, etc.) |
-| `/cost` | Show token usage and estimated cost |
-| `/restart` | Restart Claude process |
-| `/close` | Close session and terminate Claude |
-| `/clear` | Clear context (new session, same thread) |
-| `/schedule` | Manage scheduled tasks |
-| `/help` | Show available commands |
+| 命令 | 说明 |
+|------|------|
+| `/repo` | 显示项目选择卡片 |
+| `/repo <N>` | 切换到上次扫描的第 N 个项目 |
+| `/cd <路径>` | 切换工作目录 |
+| `/status` | 查看会话信息（运行时间、终端地址等） |
+| `/cost` | 查看 Token 用量和费用估算 |
+| `/restart` | 重启 Claude 进程 |
+| `/close` | 关闭会话并终止 Claude |
+| `/clear` | 清除上下文（新会话，同一话题） |
+| `/schedule` | 管理定时任务 |
+| `/help` | 显示可用命令 |
 
-### Scheduled Tasks
+### 定时任务
 
-Create recurring tasks with natural language:
+用自然语言创建周期性任务：
 
 ```
-/schedule every day at 17:50 check AI news
-/schedule weekdays at 9:00 run health check
-/schedule every Monday at 10:00 generate weekly report
+/schedule 每日17:50 帮我看看AI圈有什么新闻
+/schedule 工作日每天9:00 检查服务状态
+/schedule 每周一10:00 生成周报
 ```
 
-Manage tasks:
+管理任务：
 
 ```
 /schedule list
@@ -159,36 +159,36 @@ Manage tasks:
 /schedule run <id>
 ```
 
-### Streaming Cards
+### 流式卡片
 
-Each conversation turn gets a live-updating Feishu card that shows:
+每轮对话会生成一个实时更新的飞书卡片，展示：
 
-- Real-time terminal output (rendered via headless xterm + Feishu Card v2 markdown)
-- Status indicator: 🟡 Starting → 🔵 Working → 🟢 Idle
-- Action buttons: Open Terminal, Get Write Link, Restart Claude, Close Session
+- 实时终端输出（通过 headless xterm 捕获 + 飞书卡片 v2 Markdown 渲染）
+- 状态指示：🟡 启动中 → 🔵 工作中 → 🟢 就绪
+- 操作按钮：打开终端、获取操作链接、重启 Claude、关闭会话
 
-The card content is captured from a headless xterm terminal that filters out TUI chrome (logo, status bar, prompts, box-drawing characters) and shows only Claude's actual work output.
+卡片内容由 headless xterm 终端捕获，自动过滤 TUI 装饰（Logo、状态栏、提示符、框线字符），仅展示 Claude 的实际工作输出。
 
-### Web Terminal
+### Web 终端
 
-Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
+每个会话提供一个 Web 终端，地址为 `http://<WEB_EXTERNAL_HOST>:<端口>`。
 
-- **Read-only link** — shown on the streaming card in the group thread
-- **Write-enabled link** — sent via DM on demand (click "🔑 Get Write Link" on the card)
+- **只读链接** — 展示在群话题的流式卡片上
+- **可操作链接** — 按需获取（点击卡片上的「🔑 获取操作链接」通过私聊发送）
 
-Features: xterm.js with fit/unicode11/web-links addons, TokyoNight theme, scrollback buffer, mobile-friendly viewport.
+特性：xterm.js + fit/unicode11/web-links 插件、TokyoNight 主题、滚动缓冲区、移动端适配。
 
-## MCP Tools
+## MCP 工具
 
-Claude Code has access to three MCP tools for interacting with Lark:
+Claude Code 可使用三个 MCP 工具与飞书交互：
 
-| Tool | Description |
-|------|-------------|
-| `send_to_thread` | Send a message (text or rich post) to the Lark thread |
-| `get_thread_messages` | Retrieve message history from the thread |
-| `react_to_message` | Add or remove emoji reactions on messages |
+| 工具 | 说明 |
+|------|------|
+| `send_to_thread` | 向飞书话题发送消息（纯文本或富文本） |
+| `get_thread_messages` | 获取话题的消息历史 |
+| `react_to_message` | 添加或移除消息的表情回应 |
 
-## Development
+## 开发
 
 ```bash
 git clone <repo-url>
@@ -196,42 +196,42 @@ cd claude-code-robot
 pnpm install
 pnpm build
 
-# Run directly (no PM2)
+# 直接运行（不经 PM2）
 pnpm daemon
 
-# Or with PM2
+# 或使用 PM2
 pnpm daemon:start
 pnpm daemon:logs
 ```
 
-## Project Structure
+## 项目结构
 
 ```
 src/
-  cli.ts                 # CLI entry point (setup/start/stop/restart/logs)
-  daemon.ts              # Main daemon: event handling, session lifecycle, commands
-  worker.ts              # Worker process: PTY, HTTP/WS server, prompt detection
-  scheduler.ts           # Cron scheduling with natural language parsing
-  config.ts              # Configuration from environment variables
-  server.ts              # MCP server setup
-  types.ts               # IPC message types
+  cli.ts                 # CLI 入口（setup/start/stop/restart/logs）
+  daemon.ts              # 主进程：事件处理、会话生命周期、命令
+  worker.ts              # Worker 进程：PTY、HTTP/WS 服务、Prompt 检测
+  scheduler.ts           # 定时任务调度（自然语言解析）
+  config.ts              # 环境变量配置
+  server.ts              # MCP Server
+  types.ts               # IPC 消息类型
   services/
-    lark-client.ts       # Lark API wrapper
-    session-store.ts     # Session persistence (JSON)
-    schedule-store.ts    # Scheduled task persistence
-    message-queue.ts     # Per-thread JSONL message queue
-    project-scanner.ts   # Git repo/worktree discovery
+    lark-client.ts       # 飞书 API 封装
+    session-store.ts     # 会话持久化 (JSON)
+    schedule-store.ts    # 定时任务持久化
+    message-queue.ts     # 话题消息队列 (JSONL)
+    project-scanner.ts   # Git 仓库/Worktree 扫描
   tools/
-    send-to-thread.ts    # MCP tool: send message
-    get-thread-messages.ts # MCP tool: read messages
-    react-to-message.ts  # MCP tool: emoji reactions
+    send-to-thread.ts    # MCP 工具：发送消息
+    get-thread-messages.ts # MCP 工具：读取消息
+    react-to-message.ts  # MCP 工具：表情回应
   utils/
-    card-builder.ts      # Lark interactive card builders (session, streaming, repo-select)
-    terminal-renderer.ts # Headless xterm renderer for screen capture & TUI filtering
-    message-parser.ts    # Lark event message parsing
-    logger.ts            # Logging utility
+    card-builder.ts      # 飞书交互卡片构建（会话卡片、流式卡片、仓库选择卡片）
+    terminal-renderer.ts # Headless xterm 渲染器（屏幕捕获 & TUI 过滤）
+    message-parser.ts    # 飞书事件消息解析
+    logger.ts            # 日志工具
 ```
 
-## License
+## 许可证
 
 [MIT](LICENSE)

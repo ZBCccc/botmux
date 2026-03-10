@@ -3,23 +3,21 @@ import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
-import { startDaemon } from './daemon.js';
-import { logger } from './utils/logger.js';
 
-// Load .env: try ~/.claude-code-robot/.env first, then CWD/.env
+// Load .env BEFORE any other module reads process.env
+// Try ~/.claude-code-robot/.env first (npm global install), then CWD/.env (dev)
 const globalEnv = join(homedir(), '.claude-code-robot', '.env');
-if (existsSync(globalEnv)) {
-  dotenvConfig({ path: globalEnv });
-} else {
-  dotenvConfig();
-}
+dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 
 async function main() {
+  // Dynamic import so config.ts reads env vars AFTER dotenv has loaded them
+  const { startDaemon } = await import('./daemon.js');
+  const { logger } = await import('./utils/logger.js');
   logger.info('Starting claude-code-robot daemon...');
   await startDaemon();
 }
 
 main().catch((err) => {
-  logger.error(`Fatal error: ${err}`);
+  console.error(`Fatal error: ${err}`);
   process.exit(1);
 });
