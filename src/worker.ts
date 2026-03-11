@@ -111,7 +111,7 @@ function onPtyData(data: string): void {
 
   // Track spinner animation — spinner chars mean Claude is actively working.
   // But "✻ Worked for Xm Ys" is a static completion marker, not animation.
-  if (SPINNER_CHARS_RE.test(stripped) && !WORKED_FOR_RE.test(stripped)) {
+  if (SPINNER_CHARS_RE.test(stripped) && !WORKED_FOR_RE.test(outputTail)) {
     lastSpinnerAt = Date.now();
   }
 
@@ -131,8 +131,8 @@ function onPtyData(data: string): void {
   }
 
   // Strategy 2 — "Worked for" completion marker: Claude prints this after finishing.
-  // Use a short delay to let the ❯ prompt render before marking ready.
-  if (!isPromptReady && WORKED_FOR_RE.test(stripped)) {
+  // Check outputTail (not stripped) because PTY data arrives in arbitrary chunks.
+  if (!isPromptReady && WORKED_FOR_RE.test(outputTail)) {
     if (quiescenceTimer) clearTimeout(quiescenceTimer);
     quiescenceTimer = setTimeout(() => {
       quiescenceTimer = null;
