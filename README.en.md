@@ -6,7 +6,7 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 
 ## Demo
 
-<video src="https://github.com/deepcoldy/botmux/releases/download/v1.0.0/introduce.mp4" width="100%" controls></video>
+https://github.com/user-attachments/assets/840d3bb6-3b98-465a-8662-b4beadeb48ce
 
 ## Features
 
