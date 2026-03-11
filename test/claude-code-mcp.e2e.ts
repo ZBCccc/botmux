@@ -14,7 +14,14 @@ import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, copyFileS
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROJECT_ROOT = join(__dirname, '..');
+const DIST_INDEX = join(PROJECT_ROOT, 'dist', 'index.js');
+const DATA_DIR = join(PROJECT_ROOT, 'data');
 const CLAUDE_JSON = join(homedir(), '.claude.json');
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -59,7 +66,7 @@ describe('Claude Code MCP auto-installation', () => {
     adapter.ensureMcpConfig({
       name: 'botmux',
       command: 'node',
-      args: ['/root/iserver/claude-code-robot/dist/index.js'],
+      args: [DIST_INDEX],
       env: {
         LARK_APP_ID: 'test-app-id',
         LARK_APP_SECRET: 'test-app-secret',
@@ -88,7 +95,7 @@ describe('Claude Code MCP auto-installation', () => {
     if (!data.mcpServers) data.mcpServers = {};
     data.mcpServers['botmux'] = {
       command: 'node',
-      args: ['/root/iserver/claude-code-robot/dist/index.js'],
+      args: [DIST_INDEX],
       env: {
         LARK_APP_ID: 'old-app-id',
         LARK_APP_SECRET: 'old-secret',
@@ -102,7 +109,7 @@ describe('Claude Code MCP auto-installation', () => {
     adapter.ensureMcpConfig({
       name: 'botmux',
       command: 'node',
-      args: ['/root/iserver/claude-code-robot/dist/index.js'],
+      args: [DIST_INDEX],
       env: {
         LARK_APP_ID: 'new-app-id',
         LARK_APP_SECRET: 'new-secret',
@@ -137,11 +144,11 @@ describe('Claude Code MCP auto-installation', () => {
     adapter.ensureMcpConfig({
       name: 'botmux',
       command: 'node',
-      args: ['/root/iserver/claude-code-robot/dist/index.js'],
+      args: [DIST_INDEX],
       env: {
         LARK_APP_ID: before?.env?.LARK_APP_ID ?? 'test',
         LARK_APP_SECRET: before?.env?.LARK_APP_SECRET ?? 'test',
-        SESSION_DATA_DIR: '/root/iserver/claude-code-robot/data',
+        SESSION_DATA_DIR: DATA_DIR,
       },
     });
 
@@ -149,7 +156,7 @@ describe('Claude Code MCP auto-installation', () => {
     console.log('After:', JSON.stringify(after, null, 2));
 
     expect(after, 'botmux MCP entry must exist').toBeDefined();
-    expect(after.env.SESSION_DATA_DIR, 'SESSION_DATA_DIR must be set').toBe('/root/iserver/claude-code-robot/data');
+    expect(after.env.SESSION_DATA_DIR, 'SESSION_DATA_DIR must be set').toBe(DATA_DIR);
     expect(after.env.LARK_APP_ID, 'LARK_APP_ID preserved').toBeTruthy();
     expect(after.env.LARK_APP_SECRET, 'LARK_APP_SECRET preserved').toBeTruthy();
   });

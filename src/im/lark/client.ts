@@ -185,9 +185,10 @@ export async function downloadMessageResource(messageId: string, fileKey: string
 }
 
 /**
- * Resolve email prefixes (e.g. "shenhan.sh") to Lark open_ids via batch user lookup.
+ * Resolve email prefixes (e.g. "john.doe") to Lark open_ids via batch user lookup.
  * Accepts mixed input: items starting with "ou_" are kept as-is; everything else
- * is treated as an email prefix and looked up as `${prefix}@bytedance.com`.
+ * is treated as an email and looked up. If no "@" is present, `LARK_EMAIL_DOMAIN`
+ * env var is used as the default domain (e.g. `john.doe` → `john.doe@example.com`).
  * Returns an array of open_ids (unresolvable entries are dropped with a warning).
  */
 export async function resolveAllowedUsers(raw: string[]): Promise<string[]> {
@@ -202,7 +203,15 @@ export async function resolveAllowedUsers(raw: string[]): Promise<string[]> {
   }
   if (emailPrefixes.length === 0) return openIds;
 
-  const emails = emailPrefixes.map(p => p.includes('@') ? p : `${p}@bytedance.com`);
+  const domain = process.env.LARK_EMAIL_DOMAIN ?? '';
+  const emails = emailPrefixes.map(p => {
+    if (p.includes('@')) return p;
+    if (!domain) {
+      logger.warn(`Email prefix "${p}" has no domain and LARK_EMAIL_DOMAIN is not set — skipping`);
+      return '';
+    }
+    return `${p}@${domain}`;
+  }).filter(Boolean);
   const c = getLarkClient();
   try {
     const res = await (c as any).contact.v3.user.batchGetId({
