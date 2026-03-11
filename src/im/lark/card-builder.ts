@@ -1,4 +1,16 @@
 import type { ProjectInfo } from '../../services/project-scanner.js';
+import type { CliId } from '../../adapters/cli/types.js';
+
+const cliDisplayNames: Record<CliId, string> = {
+  'claude-code': 'Claude',
+  'aiden': 'Aiden',
+  'coco': 'CoCo',
+  'codex': 'Codex',
+};
+
+export function getCliDisplayName(cliId: CliId): string {
+  return cliDisplayNames[cliId] ?? cliId;
+}
 
 /** Escape Lark markdown special characters in user-controlled strings. */
 function escapeMd(s: string): string {
@@ -13,7 +25,9 @@ export function buildSessionCard(
   rootId: string,
   terminalUrl: string,
   title: string,
+  cliId?: CliId,
 ): string {
+  const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const card = {
     config: { wide_screen_mode: true },
     header: {
@@ -25,7 +39,7 @@ export function buildSessionCard(
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**终端地址：** [${terminalUrl}](${terminalUrl})\nSession: \`${sessionId.substring(0, 8)}\``,
+          content: `**终端地址：** [${terminalUrl}](${terminalUrl})`,
         },
       },
       {
@@ -50,7 +64,7 @@ export function buildSessionCard(
           },
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: '🔄 重启 Claude' },
+            text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
             type: 'default',
             value: { action: 'restart', root_id: rootId, session_id: sessionId },
           },
@@ -78,7 +92,9 @@ export function buildStreamingCard(
   title: string,
   screenContent: string,
   status: 'starting' | 'working' | 'idle',
+  cliId?: CliId,
 ): string {
+  const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const templateMap = { starting: 'yellow', working: 'blue', idle: 'green' } as const;
   const statusMap = { starting: '启动中…', working: '工作中', idle: '就绪' } as const;
 
@@ -98,7 +114,7 @@ export function buildStreamingCard(
       { tag: 'hr' },
       {
         tag: 'markdown',
-        content: `**终端：** [${terminalUrl}](${terminalUrl})　|　Session: \`${sessionId.substring(0, 8)}\``,
+        content: `**终端：** [${terminalUrl}](${terminalUrl})`,
       },
       {
         tag: 'action',
@@ -122,7 +138,7 @@ export function buildStreamingCard(
           },
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: '🔄 重启 Claude' },
+            text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
             type: 'default',
             value: { action: 'restart', root_id: rootId, session_id: sessionId },
           },

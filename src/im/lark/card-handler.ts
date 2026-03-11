@@ -5,7 +5,7 @@
  */
 import { config } from '../../config.js';
 import { sendUserMessage } from './client.js';
-import { buildSessionCard } from './card-builder.js';
+import { buildSessionCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { forkWorker, killWorker } from '../../core/worker-pool.js';
@@ -56,12 +56,14 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
         // Worker alive — tell it to restart Claude
         logger.info(`[${tag(ds)}] Restart via card button`);
         ds.worker.send({ type: 'restart' } as DaemonToWorker);
-        await sessionReply(rootId, '🔄 已重启 Claude');
+        const cliName = getCliDisplayName(config.daemon.cliId);
+        await sessionReply(rootId, `🔄 已重启 ${cliName}`);
       } else {
         // Worker gone (e.g. after daemon restart) — re-fork
         logger.info(`[${tag(ds)}] Re-forking worker via card button`);
         forkWorker(ds, '', ds.hasHistory);
-        await sessionReply(rootId, '🔄 已重新启动 Claude');
+        const cliName = getCliDisplayName(config.daemon.cliId);
+        await sessionReply(rootId, `🔄 已重新启动 ${cliName}`);
         // DM card will be sent by the ready handler when worker starts
       }
     }
@@ -82,6 +84,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps): Promis
           ds.session.rootMessageId,
           writeUrl,
           ds.session.title || 'Claude Code',
+          config.daemon.cliId,
         );
         sendUserMessage(operatorOpenId, dmCardJson, 'interactive').catch(err =>
           logger.warn(`[${tag(ds)}] Failed to DM write link: ${err}`),

@@ -1,11 +1,11 @@
 {
-  "name": "@byted/claude-code-robot",
+  "name": "botmux",
   "version": "1.0.0",
-  "description": "Bridge between Lark (Feishu) topic groups and Claude Code — one topic, one Claude session with live streaming cards",
+  "description": "Bridge between IM platforms and AI coding CLIs — one topic, one CLI session with live streaming",
   "type": "module",
   "main": "dist/index-daemon.js",
   "bin": {
-    "claude-code-robot": "dist/cli.js"
+    "botmux": "dist/cli.js"
   },
   "files": [
     "dist/",
@@ -19,10 +19,10 @@
     "build": "tsc",
     "daemon": "tsx src/index-daemon.ts",
     "daemon:start": "pm2 start ecosystem.config.cjs",
-    "daemon:stop": "pm2 stop claude-code-robot",
-    "daemon:restart": "pm2 restart claude-code-robot",
-    "daemon:logs": "pm2 logs claude-code-robot",
-    "daemon:status": "pm2 status claude-code-robot",
+    "daemon:stop": "pm2 stop botmux",
+    "daemon:restart": "pm2 restart botmux",
+    "daemon:logs": "pm2 logs botmux",
+    "daemon:status": "pm2 status botmux",
     "test": "vitest run",
     "test:codex": "vitest run test/codex-input.e2e.ts",
     "test:mcp": "vitest run test/codex-mcp.e2e.ts",

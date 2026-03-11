@@ -8,7 +8,7 @@ async function main() {
   const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info('claude-code-robot MCP server running (stdio)');
+  logger.info('botmux MCP server running (stdio)');
 }
 
 main().catch((err) => {

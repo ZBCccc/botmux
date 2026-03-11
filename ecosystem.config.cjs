@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'claude-code-robot',
+      name: 'botmux',
       script: 'dist/index-daemon.js',
       cwd: __dirname,
       autorestart: true,

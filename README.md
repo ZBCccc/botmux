@@ -1,4 +1,4 @@
-# claude-code-robot
+# botmux
 
 中文 | [English](README.en.md)
 
@@ -53,17 +53,17 @@ AI 编程 CLI (交互式 TTY 模式)
 ## 安装
 
 ```bash
-npm install -g @byted/claude-code-robot
+npm install -g botmux
 ```
 
 ## 快速开始
 
 ```bash
-# 1. 交互式配置 — 创建 ~/.claude-code-robot/.env
-claude-code-robot setup
+# 1. 交互式配置 — 创建 ~/.botmux/.env
+botmux setup
 
 # 2. 启动 daemon
-claude-code-robot start
+botmux start
 ```
 
 `setup` 命令会引导你完成：
@@ -75,17 +75,17 @@ claude-code-robot start
 
 | 命令 | 说明 |
 |------|------|
-| `claude-code-robot setup` | 交互式首次配置 |
-| `claude-code-robot start` | 启动 daemon（PM2 管理） |
-| `claude-code-robot stop` | 停止 daemon |
-| `claude-code-robot restart` | 重启 daemon（自动恢复活跃会话） |
-| `claude-code-robot logs` | 查看日志（`--lines N`） |
-| `claude-code-robot status` | 查看 daemon 状态 |
-| `claude-code-robot upgrade` | 升级到最新版本 |
+| `botmux setup` | 交互式首次配置 |
+| `botmux start` | 启动 daemon（PM2 管理） |
+| `botmux stop` | 停止 daemon |
+| `botmux restart` | 重启 daemon（自动恢复活跃会话） |
+| `botmux logs` | 查看日志（`--lines N`） |
+| `botmux status` | 查看 daemon 状态 |
+| `botmux upgrade` | 升级到最新版本 |
 
 ## 配置
 
-配置文件位于 `~/.claude-code-robot/.env`。运行 `claude-code-robot setup` 交互式创建，或手动编辑：
+配置文件位于 `~/.botmux/.env`。运行 `botmux setup` 交互式创建，或手动编辑：
 
 ### 必填
 
@@ -106,16 +106,16 @@ claude-code-robot start
 | `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
 | `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
 | `WEB_EXTERNAL_HOST` | _(自动检测局域网 IP)_ | 终端链接中的外部主机名/IP |
-| `SESSION_DATA_DIR` | `~/.claude-code-robot/data` | 会话和队列的存储目录 |
+| `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列的存储目录 |
 | `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
 
 ## 文件位置
 
 | 路径 | 说明 |
 |------|------|
-| `~/.claude-code-robot/.env` | 配置文件 |
-| `~/.claude-code-robot/data/` | 会话数据、消息队列 |
-| `~/.claude-code-robot/logs/` | Daemon 日志 |
+| `~/.botmux/.env` | 配置文件 |
+| `~/.botmux/data/` | 会话数据、消息队列 |
+| `~/.botmux/logs/` | Daemon 日志 |
 
 ## 使用
 
@@ -197,7 +197,7 @@ Claude Code 可使用三个 MCP 工具与飞书交互：
 
 ```bash
 git clone <repo-url>
-cd claude-code-robot
+cd botmux
 pnpm install
 pnpm build
 

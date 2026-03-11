@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * CLI entry point for claude-code-robot.
+ * CLI entry point for botmux.
  *
  * Usage:
- *   claude-code-robot setup          — interactive first-time configuration
- *   claude-code-robot start          — start daemon (pm2)
- *   claude-code-robot stop           — stop daemon
- *   claude-code-robot restart        — restart daemon (auto-restores sessions)
- *   claude-code-robot logs [--lines] — view daemon logs
- *   claude-code-robot status         — show daemon status
- *   claude-code-robot upgrade        — upgrade to latest version
+ *   botmux setup          — interactive first-time configuration
+ *   botmux start          — start daemon (pm2)
+ *   botmux stop           — stop daemon
+ *   botmux restart        — restart daemon (auto-restores sessions)
+ *   botmux logs [--lines] — view daemon logs
+ *   botmux status         — show daemon status
+ *   botmux upgrade        — upgrade to latest version
  */
 import { execSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs';
@@ -23,11 +23,11 @@ const __dirname = dirname(__filename);
 
 // Package root is one level up from dist/
 const PKG_ROOT = dirname(__dirname);
-const CONFIG_DIR = join(homedir(), '.claude-code-robot');
+const CONFIG_DIR = join(homedir(), '.botmux');
 const ENV_FILE = join(CONFIG_DIR, '.env');
 const DATA_DIR = join(CONFIG_DIR, 'data');
 const LOG_DIR = join(CONFIG_DIR, 'logs');
-const PM2_NAME = 'claude-code-robot';
+const PM2_NAME = 'botmux';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -89,7 +89,7 @@ function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<
 async function cmdSetup(): Promise<void> {
   ensureConfigDir();
 
-  console.log('\n🤖 claude-code-robot 配置向导\n');
+  console.log('\n🤖 botmux 配置向导\n');
   console.log(`配置目录: ${CONFIG_DIR}`);
   console.log(`数据目录: ${DATA_DIR}\n`);
 
@@ -149,21 +149,21 @@ async function cmdSetup(): Promise<void> {
 
   writeFileSync(ENV_FILE, lines.join('\n') + '\n');
   console.log(`\n✅ 配置已写入: ${ENV_FILE}`);
-  console.log(`\n下一步: claude-code-robot start`);
+  console.log(`\n下一步: botmux start`);
 }
 
 function cmdStart(): void {
   if (!hasEnvFile()) {
     console.error(`❌ 未找到配置文件: ${ENV_FILE}`);
-    console.error('   请先运行: claude-code-robot setup');
+    console.error('   请先运行: botmux setup');
     process.exit(1);
   }
   ensureConfigDir();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
   console.log(`\n✅ daemon 已启动`);
-  console.log(`   日志: claude-code-robot logs`);
-  console.log(`   状态: claude-code-robot status`);
+  console.log(`   日志: botmux logs`);
+  console.log(`   状态: botmux status`);
 }
 
 function cmdStop(): void {
@@ -177,7 +177,7 @@ function cmdStop(): void {
 function cmdRestart(): void {
   if (!hasEnvFile()) {
     console.error(`❌ 未找到配置文件: ${ENV_FILE}`);
-    console.error('   请先运行: claude-code-robot setup');
+    console.error('   请先运行: botmux setup');
     process.exit(1);
   }
   ensureConfigDir();
@@ -209,17 +209,17 @@ function cmdStatus(): void {
 function cmdUpgrade(): void {
   console.log('🔄 升级中...');
   try {
-    execSync('npm install -g @byted/claude-code-robot@latest', { stdio: 'inherit' });
-    console.log('\n✅ 升级完成。运行 claude-code-robot restart 以应用更新。');
+    execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+    console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
   } catch {
-    console.error('❌ 升级失败，请手动运行: npm install -g @byted/claude-code-robot@latest');
+    console.error('❌ 升级失败，请手动运行: npm install -g botmux@latest');
     process.exit(1);
   }
 }
 
 function showHelp(): void {
   console.log(`
-claude-code-robot — 飞书话题 ↔ AI 编程 CLI 桥接
+botmux — IM ↔ AI 编程 CLI 桥接
 
 命令:
   setup       交互式配置（首次使用）
@@ -230,8 +230,8 @@ claude-code-robot — 飞书话题 ↔ AI 编程 CLI 桥接
   status      查看 daemon 状态
   upgrade     升级到最新版本
 
-配置目录: ~/.claude-code-robot/
-文档: https://github.com/anthropics/claude-code-robot
+配置目录: ~/.botmux/
+文档: https://github.com/nicepkg/botmux
 `);
 }
 

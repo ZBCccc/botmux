@@ -7,7 +7,7 @@ export function createServer(): McpServer {
   validateConfig();
 
   const server = new McpServer({
-    name: 'claude-code-robot',
+    name: 'botmux',
     version: '1.0.0',
   });
 

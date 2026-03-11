@@ -1,4 +1,4 @@
-# claude-code-robot
+# botmux
 
 [中文](README.md) | English
 
@@ -53,17 +53,17 @@ Lark API
 ## Installation
 
 ```bash
-npm install -g @byted/claude-code-robot
+npm install -g botmux
 ```
 
 ## Quick Start
 
 ```bash
-# 1. Interactive setup — creates ~/.claude-code-robot/.env
-claude-code-robot setup
+# 1. Interactive setup — creates ~/.botmux/.env
+botmux setup
 
 # 2. Start the daemon
-claude-code-robot start
+botmux start
 ```
 
 The `setup` command will guide you through:
@@ -75,17 +75,17 @@ The `setup` command will guide you through:
 
 | Command | Description |
 |---------|-------------|
-| `claude-code-robot setup` | Interactive first-time configuration |
-| `claude-code-robot start` | Start daemon (PM2 managed) |
-| `claude-code-robot stop` | Stop daemon |
-| `claude-code-robot restart` | Restart daemon (auto-restores active sessions) |
-| `claude-code-robot logs` | View daemon logs (`--lines N` for more) |
-| `claude-code-robot status` | Show daemon status |
-| `claude-code-robot upgrade` | Upgrade to latest version |
+| `botmux setup` | Interactive first-time configuration |
+| `botmux start` | Start daemon (PM2 managed) |
+| `botmux stop` | Stop daemon |
+| `botmux restart` | Restart daemon (auto-restores active sessions) |
+| `botmux logs` | View daemon logs (`--lines N` for more) |
+| `botmux status` | Show daemon status |
+| `botmux upgrade` | Upgrade to latest version |
 
 ## Configuration
 
-Configuration is stored at `~/.claude-code-robot/.env`. Run `claude-code-robot setup` to create it interactively, or edit manually:
+Configuration is stored at `~/.botmux/.env`. Run `botmux setup` to create it interactively, or edit manually:
 
 ### Required
 
@@ -106,16 +106,16 @@ Configuration is stored at `~/.claude-code-robot/.env`. Run `claude-code-robot s
 | `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
 | `WEB_HOST` | `0.0.0.0` | HTTP server bind address |
 | `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP for terminal URLs |
-| `SESSION_DATA_DIR` | `~/.claude-code-robot/data` | Where sessions and queues are stored |
+| `SESSION_DATA_DIR` | `~/.botmux/data` | Where sessions and queues are stored |
 | `DEBUG` | _(unset)_ | Set to `1` for debug logging |
 
 ## File Locations
 
 | Path | Description |
 |------|-------------|
-| `~/.claude-code-robot/.env` | Configuration |
-| `~/.claude-code-robot/data/` | Session data, message queues |
-| `~/.claude-code-robot/logs/` | Daemon logs |
+| `~/.botmux/.env` | Configuration |
+| `~/.botmux/data/` | Session data, message queues |
+| `~/.botmux/logs/` | Daemon logs |
 
 ## Usage
 
@@ -197,7 +197,7 @@ Claude Code has access to three MCP tools for interacting with Lark:
 
 ```bash
 git clone <repo-url>
-cd claude-code-robot
+cd botmux
 pnpm install
 pnpm build
 

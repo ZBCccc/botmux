@@ -320,7 +320,7 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
       const prevTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
       const frozenCard = buildStreamingCard(
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
-        ds.lastScreenContent ?? '', 'idle',
+        ds.lastScreenContent ?? '', 'idle', config.daemon.cliId,
       );
       updateMessage(ds.streamCardId, frozenCard).catch(() => {});
     }

@@ -55,7 +55,7 @@ export const restartCounts = new Map<string, { count: number; lastAt: number }>(
 let mcpConfigDone = false;
 
 /**
- * Ensure the claude-code-robot MCP server is registered globally.
+ * Ensure the botmux MCP server is registered globally.
  * Delegates to the CLI adapter which knows the correct config file location.
  */
 export function ensureMcpConfig(): void {
@@ -66,7 +66,7 @@ export function ensureMcpConfig(): void {
   // Resolve path relative to src/ (one level up from core/)
   const serverScript = join(__dirname, '..', 'index.js');
   adapter.ensureMcpConfig({
-    name: 'claude-code-robot',
+    name: 'botmux',
     command: 'node',
     args: [serverScript],
     env: {
@@ -173,6 +173,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             initTitle,
             '',
             'starting',
+            config.daemon.cliId,
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive');
         } catch (err) {
@@ -183,6 +184,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.session.rootMessageId,
             readOnlyUrl,
             ds.session.title || 'Claude Code',
+            config.daemon.cliId,
           );
           await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive');
         }
@@ -207,6 +209,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           turnTitle,
           msg.content,
           msg.status,
+          config.daemon.cliId,
         );
 
         if (ds.streamCardPending || !ds.streamCardId) {

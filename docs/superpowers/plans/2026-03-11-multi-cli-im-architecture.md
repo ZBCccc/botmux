@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Refactor claude-code-robot to support multiple CLI tools (Claude Code, Aiden, CoCo, Codex) via adapters, abstract the PTY layer behind a session backend interface, and decompose the 1498-line daemon.ts into focused modules with an IM-agnostic core.
+**Goal:** Refactor botmux to support multiple CLI tools (Claude Code, Aiden, CoCo, Codex) via adapters, abstract the PTY layer behind a session backend interface, and decompose the 1498-line daemon.ts into focused modules with an IM-agnostic core.
 
 **Architecture:** CLI-specific logic extracted into adapter objects implementing `CliAdapter`. PTY management abstracted behind `SessionBackend` (default: node-pty, future: tmux). daemon.ts split into `SessionManager`, `WorkerPool`, and Lark-specific event handling. `ImAdapter` interface defined for future multi-IM support.
 
@@ -983,7 +983,7 @@ function ensureMcpConfig(): void {
   );
   const serverScript = join(__dirname, 'index.js');
   adapter.ensureMcpConfig({
-    name: 'claude-code-robot',
+    name: 'botmux',
     command: 'node',
     args: [serverScript],
     env: {

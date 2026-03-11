@@ -304,9 +304,9 @@ describe('MCP session lookup', () => {
 });
 
 describe('Codex MCP config registration', () => {
-  it('codex mcp list shows claude-code-robot', () => {
+  it('codex mcp list shows botmux', () => {
     const output = execSync('codex mcp list 2>&1', { encoding: 'utf-8' });
-    expect(output).toContain('claude-code-robot');
+    expect(output).toContain('botmux');
     expect(output).toContain('node');
     expect(output).toContain('index.js');
   }, 10_000);

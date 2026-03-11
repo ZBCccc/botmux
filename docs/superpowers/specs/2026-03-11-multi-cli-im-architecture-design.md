@@ -4,7 +4,7 @@ Date: 2026-03-11
 
 ## Context
 
-claude-code-robot bridges Lark (Feishu) group threads to CLI coding agents via PTY.
+botmux bridges Lark (Feishu) group threads to CLI coding agents via PTY.
 It currently supports Claude Code, Aiden, and partially CoCo (Trae), but CLI-specific
 logic is scattered across `daemon.ts` (1498 lines) and `worker.ts` with if/else chains.
 Lark is hardcoded throughout with no abstraction. Adding a new CLI or IM requires

@@ -10,7 +10,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects } from '../services/project-scanner.js';
-import { buildRepoSelectCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentClaudeVersion } from './worker-pool.js';
@@ -195,10 +195,12 @@ export async function handleCommand(
         if (ds) {
           if (ds.worker && !ds.worker.killed) {
             ds.worker.send({ type: 'restart' } as DaemonToWorker);
-            await sessionReply(rootId, '🔄 正在重启 Claude...');
+            const cliName = getCliDisplayName(config.daemon.cliId);
+            await sessionReply(rootId, `🔄 正在重启 ${cliName}...`);
           } else {
             killWorker(ds);
-            await sessionReply(rootId, 'Claude 进程已终止，下次发消息时将自动恢复。');
+            const cliName = getCliDisplayName(config.daemon.cliId);
+            await sessionReply(rootId, `${cliName} 进程已终止，下次发消息时将自动恢复。`);
           }
           logger.info(`[${t}] Restart by /restart command`);
         } else {
@@ -318,12 +320,13 @@ export async function handleCommand(
       }
 
       case '/help': {
+        const cliName = getCliDisplayName(config.daemon.cliId);
         const help = [
           '📌 会话管理：',
-          '/close      - 关闭当前会话，终止 Claude 进程',
-          '/clear      - 清除上下文，重启 Claude 进程',
-          '/restart    - 重启 Claude 进程（保留 session）',
-          '/cd <path>  - 切换工作目录并重启 Claude 进程',
+          `/close      - 关闭当前会话，终止 ${cliName} 进程`,
+          `/clear      - 清除上下文，重启 ${cliName} 进程`,
+          `/restart    - 重启 ${cliName} 进程（保留 session）`,
+          `/cd <path>  - 切换工作目录并重启 ${cliName} 进程`,
           '/repo       - 查看项目列表（交互式下拉 + 文本列表）',
           '/repo <N>   - 切换到第 N 个项目',
           '/cost       - 查看当前会话的 token 消耗和估算费用',
