@@ -6,22 +6,28 @@
  * Lifecycle:
  *   1. Daemon forks this process
  *   2. Receives 'init' message with session config
- *   3. Spawns Claude Code in node-pty (interactive mode)
+ *   3. Spawns CLI via CliAdapter + PtyBackend (interactive mode)
  *   4. Starts HTTP + WebSocket server for xterm.js
  *   5. Receives 'message' events from daemon, writes to PTY stdin
  *   6. On 'close', kills Claude and exits
  *   7. On 'restart', kills Claude and re-spawns with --resume
  */
-import * as pty from 'node-pty';
 import { randomBytes } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from './types.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
+import type { CliAdapter } from './adapters/cli/types.js';
+import { PtyBackend } from './adapters/backend/pty-backend.js';
+import type { SessionBackend } from './adapters/backend/types.js';
+import { IdleDetector } from './utils/idle-detector.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-let ptyProcess: pty.IPty | null = null;
+let cliAdapter: CliAdapter | null = null;
+let backend: SessionBackend | null = null;
+let idleDetector: IdleDetector | null = null;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
@@ -53,185 +59,74 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 const MAX_SCROLLBACK = 100_000; // chars
 let scrollback = '';
 
-// ─── Prompt & Trust Dialog Detection ────────────────────────────────────────
+// ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
-// Claude Code / Aiden TUI idle detection.
-// Detection strategies (in priority order):
-//   1. Completion marker ("✻ Worked for ...") → idle after 500ms
-//   2. PTY silence + no recent spinner → idle after QUIESCENCE_MS
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder/;
-/** Claude Code spinner frames — these animate while Claude is actively working */
-const SPINNER_CHARS_RE = /[·✢✳✶✻✽]/;
-/**
- * Claude Code TUI completion marker: "✻ Worked for 1m 2s", "✻ Crunched for 30s", etc.
- * The verb is randomly chosen from: Worked, Crunched, Cogitated, Cooked, Churned, Sautéed.
- * Must include ✻ prefix + time unit to avoid false positives from model output.
- */
-const COMPLETION_RE = /✻\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed) for \d+[smh]/;
-const QUIESCENCE_MS = 2_000;
-let outputTail = '';
 let trustHandled = false;
-let quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
-/** Timestamp of last spinner character seen — used to prevent premature idle detection */
-let lastSpinnerAt = 0;
-/** Whether the CLI is Aiden (multi-line paste needs extra Enter to confirm) */
-let useAiden = false;
 
-type CliKind = 'claude' | 'aiden' | 'trae' | 'unknown';
-
-function detectCliKind(cliPath: string): CliKind {
-  const p = cliPath.toLowerCase();
-  if (/\baiden\b/.test(p)) return 'aiden';
-  // Common names: trae / traecli / trae-cli
-  if (/\btrae\b|traecli|trae-cli/.test(p)) return 'trae';
-  if (/\bclaude\b/.test(p)) return 'claude';
-  return 'unknown';
-}
-
-function writeToPty(content: string): void {
-  if (!ptyProcess) return;
-  if (useAiden) {
-    // Aiden TUI treats a single write("content\r") as a paste where \r is just
-    // a newline.  To actually submit, we must send \r as a separate write after
-    // a short delay so it's interpreted as the Enter key.
-    ptyProcess.write(content);
-    setTimeout(() => {
-      ptyProcess?.write('\r');
-      // Multi-line pastes show "[Pasted text]" and need an extra Enter to confirm.
-      if (content.includes('\n')) {
-        setTimeout(() => { ptyProcess?.write('\r'); }, 200);
-      }
-    }, 200);
-  } else {
-    ptyProcess.write(content + '\r');
-  }
-}
-
-function markPromptReady(): void {
-  if (isPromptReady) return;
-  isPromptReady = true;
-  outputTail = '';
-  if (quiescenceTimer) { clearTimeout(quiescenceTimer); quiescenceTimer = null; }
-
-  // On first prompt after spawn/resume: reset the renderer baseline so history
-  // output (from --resume replay) is excluded from subsequent snapshots.
-  if (awaitingFirstPrompt) {
-    awaitingFirstPrompt = false;
-    renderer?.markNewTurn();
-  }
-
-  send({ type: 'prompt_ready' });
-  // Send a final screen snapshot so the card updates to "idle" immediately
-  if (renderer) {
-    const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, status: 'idle' });
-  }
-  flushPending();
-}
+// ─── Prompt Detection ────────────────────────────────────────────────────────
 
 function onPtyData(data: string): void {
-  // Feed data to headless terminal for screen capture
   renderer?.write(data);
 
-  // Buffer for late-connecting WS clients
   scrollback += data;
   if (scrollback.length > MAX_SCROLLBACK) {
     scrollback = scrollback.slice(-MAX_SCROLLBACK);
   }
 
-  // Broadcast to all connected WebSocket clients
   for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(data);
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+  }
+
+  // Trust dialog auto-accept
+  if (!trustHandled) {
+    const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+    if (TRUST_DIALOG_PATTERN.test(stripped)) {
+      trustHandled = true;
+      log('Trust dialog detected, auto-accepting...');
+      backend?.write('\r');
+      return;
     }
   }
 
-  // Track the tail of output for prompt/dialog detection.
-  // We strip ANSI escape codes for reliable matching.
-  const stripped = stripAnsi(data);
-  outputTail = (outputTail + stripped).slice(-500);
-
-  // Track spinner animation — spinner chars mean Claude is actively working.
-  // But "✻ Worked for Xm Ys" is a static completion marker, not animation.
-  if (SPINNER_CHARS_RE.test(stripped) && !COMPLETION_RE.test(outputTail)) {
-    lastSpinnerAt = Date.now();
-  }
-
-  // Auto-accept "trust this folder" dialog by sending Enter
-  if (!trustHandled && TRUST_DIALOG_PATTERN.test(outputTail)) {
-    trustHandled = true;
-    log('Trust dialog detected, auto-accepting...');
-    if (ptyProcess) ptyProcess.write('\r');
-    return;
-  }
-
-  // Strategy 1 — "✻ Worked for Xm Ys" completion marker.
-  // Check outputTail (not stripped) because PTY data arrives in arbitrary chunks.
-  if (!isPromptReady && COMPLETION_RE.test(outputTail)) {
-    if (quiescenceTimer) clearTimeout(quiescenceTimer);
-    quiescenceTimer = setTimeout(() => {
-      quiescenceTimer = null;
-      if (!isPromptReady) {
-        log('Prompt detected (completion marker)');
-        markPromptReady();
-      }
-    }, 500);
-    return;
-  }
-
-  // Strategy 2 — quiescence: PTY goes silent and no spinner activity.
-  // In TUI mode both Claude Code and Aiden render the prompt via cursor
-  // positioning, so we can't rely on seeing a specific prompt char at line end.
-  // Instead, once PTY is silent for QUIESCENCE_MS and no spinner was seen
-  // recently (3s guard), we assume the CLI is waiting for input.
-  if (quiescenceTimer) clearTimeout(quiescenceTimer);
-  if (!isPromptReady) {
-    quiescenceTimer = setTimeout(function quiescenceCheck() {
-      quiescenceTimer = null;
-      if (isPromptReady) return;
-      // If spinner was seen within the last 3s, CLI is still working —
-      // reschedule to check again after the guard expires (don't get stuck)
-      const sinceSpinner = Date.now() - lastSpinnerAt;
-      if (sinceSpinner < 3_000) {
-        quiescenceTimer = setTimeout(quiescenceCheck, 3_000 - sinceSpinner + 200);
-        return;
-      }
-      log('Prompt detected (quiescence)');
-      markPromptReady();
-    }, QUIESCENCE_MS);
-  }
+  // Delegate idle detection to IdleDetector
+  idleDetector?.feed(data);
 }
 
-function stripAnsi(str: string): string {
-  // Replace cursor-forward (CSI <n> C) with spaces so word boundaries are preserved,
-  // then strip remaining ANSI escape sequences.
-  // eslint-disable-next-line no-control-regex
-  return str
-    .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
+async function markPromptReady(): Promise<void> {
+  if (isPromptReady) return;  // guard against duplicate calls
+  isPromptReady = true;
+  if (awaitingFirstPrompt) {
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();  // exclude history replay from streaming card
+  }
+  send({ type: 'prompt_ready' });
+  // Send immediate idle snapshot so Lark card reflects idle status
+  if (renderer) {
+    const { content } = renderer.snapshot();
+    send({ type: 'screen_update', content, status: 'idle' });
+  }
+  await flushPending();
 }
 
-function flushPending(): void {
-  log(`flushPending: ${pendingMessages.length} pending, promptReady=${isPromptReady}, hasPty=${!!ptyProcess}`);
-  while (pendingMessages.length > 0 && isPromptReady && ptyProcess) {
+async function flushPending(): Promise<void> {
+  log(`flushPending: ${pendingMessages.length} pending, promptReady=${isPromptReady}, hasPty=${!!backend}`);
+  while (pendingMessages.length > 0 && isPromptReady && backend && cliAdapter) {
     const msg = pendingMessages.shift()!;
     isPromptReady = false;
-    outputTail = '';
-    lastSpinnerAt = Date.now();
+    idleDetector?.reset();
     log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-    writeToPty(msg);
+    await cliAdapter.writeInput(backend, msg);
   }
 }
 
-function sendToPty(content: string): void {
-  if (!ptyProcess) return;
-
+async function sendToPty(content: string): Promise<void> {
+  if (!backend || !cliAdapter) return;
   if (isPromptReady) {
     isPromptReady = false;
-    outputTail = '';
-    lastSpinnerAt = Date.now(); // Assume working immediately after sending input
+    idleDetector?.reset();
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
-    writeToPty(content);
+    await cliAdapter.writeInput(backend, content);
   } else {
     pendingMessages.push(content);
     log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — Claude is busy`);
@@ -259,71 +154,51 @@ function stopScreenUpdates(): void {
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
 function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  const args: string[] = [];
-  const kind = detectCliKind(cfg.claudePath);
-  useAiden = kind === 'aiden';
+  cliAdapter = createCliAdapterSync(cfg.cliId as any, process.env.CLAUDE_PATH);
+  backend = new PtyBackend();
 
-  // Default args are tuned for Claude Code / Aiden. For other CLIs (e.g. Trae),
-  // keep args minimal to avoid passing unsupported flags.
-  const disableDefaultArgs = process.env.CLI_DISABLE_DEFAULT_ARGS === '1';
+  const args = cliAdapter.buildArgs({
+    sessionId: cfg.sessionId,
+    resume: cfg.resume ?? false,
+  });
 
-  if (!disableDefaultArgs) {
-    if (cfg.resume) {
-      // Known CLIs that support --resume
-      if (kind === 'claude' || kind === 'aiden') {
-        args.push('--resume', cfg.sessionId);
-      }
-    } else {
-      if (kind === 'claude') {
-        // Claude Code supports --session-id for new sessions
-        args.push('--session-id', cfg.sessionId);
-      }
-      // Aiden auto-generates session id; Trae/unknown: do nothing by default
-    }
-
-    if (kind === 'aiden') {
-      args.push('--permission-mode', 'agentFull');
-    } else if (kind === 'claude') {
-      args.push('--dangerously-skip-permissions');
-    }
-  }
-
-  // Extra args for any CLI (simple whitespace split; avoid complex shell parsing)
+  // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
   const extra = (process.env.CLI_EXTRA_ARGS ?? '').trim();
-  if (extra) {
-    args.push(...extra.split(/\s+/).filter(Boolean));
-  }
+  if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
 
-  log(`Spawning: ${cfg.claudePath} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
+  log(`Spawning: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
 
-  ptyProcess = pty.spawn(cfg.claudePath, args, {
-    name: 'xterm-256color',
+  backend.spawn(cliAdapter.resolvedBin, args, {
+    cwd: cfg.workingDir,
     cols: PTY_COLS,
     rows: PTY_ROWS,
-    cwd: cfg.workingDir,
     env: { ...process.env, CLAUDECODE: undefined } as unknown as Record<string, string>,
   });
 
-  ptyProcess.onData(onPtyData);
+  // Set up idle detection
+  idleDetector = new IdleDetector(cliAdapter);
+  idleDetector.onIdle(() => {
+    log('Prompt detected (idle)');
+    markPromptReady();
+  });
 
-  ptyProcess.onExit(({ exitCode, signal }) => {
-    log(`Claude exited (code: ${exitCode}, signal: ${signal}), last output: ${JSON.stringify(outputTail.slice(-200))}`);
-    ptyProcess = null;
+  backend.onData(onPtyData);
+  backend.onExit((code, signal) => {
+    log(`Claude exited (code: ${code}, signal: ${signal})`);
+    backend = null;
     isPromptReady = false;
-    send({ type: 'claude_exit', code: exitCode, signal: signal !== undefined ? String(signal) : null });
+    send({ type: 'claude_exit', code, signal });
   });
 }
 
 function killClaude(): void {
-  if (quiescenceTimer) { clearTimeout(quiescenceTimer); quiescenceTimer = null; }
+  idleDetector?.dispose();
+  idleDetector = null;
   stopScreenUpdates();
-  if (ptyProcess) {
-    try { ptyProcess.kill(); } catch { /* already dead */ }
-    ptyProcess = null;
-  }
+  backend?.kill();
+  backend = null;
   isPromptReady = false;
   pendingMessages.length = 0;
-  outputTail = '';
   scrollback = '';
   trustHandled = false;
 }
@@ -357,14 +232,10 @@ function startWebServer(host: string): Promise<number> {
         try {
           const msg = JSON.parse(String(raw));
           if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-            if (ptyProcess) {
-              ptyProcess.resize(msg.cols, msg.rows);
-            }
+            backend?.resize(msg.cols, msg.rows);
           } else if (msg.type === 'input' && typeof msg.data === 'string') {
             if (!authedClients.has(ws)) return; // read-only
-            if (ptyProcess) {
-              ptyProcess.write(msg.data);
-            }
+            backend?.write(msg.data);
           }
         } catch { /* ignore non-JSON or bad messages */ }
       });
@@ -524,15 +395,14 @@ process.on('message', async (raw: unknown) => {
     case 'message': {
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
-      sendToPty(msg.content);
+      await sendToPty(msg.content);
       break;
     }
 
     case 'restart': {
       log('Restart requested');
       killClaude();
-      awaitingFirstPrompt = true; // suppress history during --resume replay
-      // Brief delay for PTY cleanup, then re-spawn with --resume
+      awaitingFirstPrompt = true;
       setTimeout(() => {
         if (lastInitConfig) {
           startScreenUpdates();
