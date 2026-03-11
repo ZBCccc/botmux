@@ -53,19 +53,24 @@ let scrollback = '';
 
 // ─── Prompt & Trust Dialog Detection ────────────────────────────────────────
 
-// Claude Code shows ❯ (U+276F) at the input prompt when ready.
-// In TUI mode, ❯ is rendered via cursor positioning — it won't appear at the
-// end of the data stream.  We combine two strategies:
-//   1. Instant: ❯ at the end of stripped output (non-TUI / simple mode)
-//   2. Quiescence: PTY silent for QUIESCENCE_MS + ❯ or TUI status bar detected
-const PROMPT_PATTERN = /❯\s*$/;
+// Claude Code TUI status detection.
+// Always runs in TUI mode (PTY), so ❯ prompt is rendered via cursor positioning
+// and never appears at the end of the data stream.
+//
+// Detection strategies (in priority order):
+//   1. "✻ Worked for" completion marker → idle after 500ms
+//   2. Spinner stops + quiescence → idle after QUIESCENCE_MS
 const PROMPT_ANYWHERE = /❯/;
 const TUI_STATUS_PATTERN = /bypass permissions|\/model/;
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder/;
 /** Claude Code spinner frames — these animate while Claude is actively working */
 const SPINNER_CHARS_RE = /[·✢✳✶✻✽]/;
-/** "✻ Worked for Xm Ys" — completion marker, NOT a spinner */
-const WORKED_FOR_RE = /Worked for \d/;
+/**
+ * Claude Code TUI completion marker: "✻ Worked for 1m 2s", "✻ Crunched for 30s", etc.
+ * The verb is randomly chosen from: Worked, Crunched, Cogitated, Cooked, Churned, Sautéed.
+ * Must include ✻ prefix + time unit to avoid false positives from model output.
+ */
+const COMPLETION_RE = /✻\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed) for \d+[smh]/;
 const QUIESCENCE_MS = 2_000;
 let outputTail = '';
 let trustHandled = false;
@@ -111,7 +116,7 @@ function onPtyData(data: string): void {
 
   // Track spinner animation — spinner chars mean Claude is actively working.
   // But "✻ Worked for Xm Ys" is a static completion marker, not animation.
-  if (SPINNER_CHARS_RE.test(stripped) && !WORKED_FOR_RE.test(outputTail)) {
+  if (SPINNER_CHARS_RE.test(stripped) && !COMPLETION_RE.test(outputTail)) {
     lastSpinnerAt = Date.now();
   }
 
@@ -123,21 +128,14 @@ function onPtyData(data: string): void {
     return;
   }
 
-  // Strategy 1 — instant: ❯ at end of stripped output (works in non-TUI mode)
-  if (!isPromptReady && PROMPT_PATTERN.test(outputTail)) {
-    log('Prompt detected (instant)');
-    markPromptReady();
-    return;
-  }
-
-  // Strategy 2 — "Worked for" completion marker: Claude prints this after finishing.
+  // Strategy 1 — "✻ Worked for Xm Ys" completion marker.
   // Check outputTail (not stripped) because PTY data arrives in arbitrary chunks.
-  if (!isPromptReady && WORKED_FOR_RE.test(outputTail)) {
+  if (!isPromptReady && COMPLETION_RE.test(outputTail)) {
     if (quiescenceTimer) clearTimeout(quiescenceTimer);
     quiescenceTimer = setTimeout(() => {
       quiescenceTimer = null;
       if (!isPromptReady) {
-        log('Prompt detected (Worked for)');
+        log('Prompt detected (completion marker)');
         markPromptReady();
       }
     }, 500);
