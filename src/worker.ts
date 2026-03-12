@@ -220,7 +220,7 @@ function killClaude(): void {
 
 // ─── HTTP + WebSocket Server ─────────────────────────────────────────────────
 
-function startWebServer(host: string): Promise<number> {
+function startWebServer(host: string, preferredPort?: number): Promise<number> {
   return new Promise((resolve, reject) => {
     httpServer = createHttpServer((_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -260,13 +260,27 @@ function startWebServer(host: string): Promise<number> {
       });
     });
 
-    httpServer.listen(0, host, () => {
+    const listenPort = preferredPort ?? 0;
+    httpServer.listen(listenPort, host, () => {
       const addr = httpServer!.address();
       const port = typeof addr === 'object' && addr ? addr.port : 0;
       log(`HTTP listening on ${host}:${port}`);
       resolve(port);
     });
-    httpServer.on('error', reject);
+    httpServer.on('error', (err: NodeJS.ErrnoException) => {
+      if (preferredPort && err.code === 'EADDRINUSE') {
+        // Preferred port in use — fall back to random
+        log(`Preferred port ${preferredPort} in use, falling back to random`);
+        httpServer!.listen(0, host, () => {
+          const addr = httpServer!.address();
+          const port = typeof addr === 'object' && addr ? addr.port : 0;
+          log(`HTTP listening on ${host}:${port} (fallback)`);
+          resolve(port);
+        });
+      } else {
+        reject(err);
+      }
+    });
   });
 }
 
@@ -390,7 +404,7 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}`);
 
       try {
-        const port = await startWebServer('0.0.0.0');
+        const port = await startWebServer('0.0.0.0', msg.webPort);
         startScreenUpdates();
         spawnClaude(msg);
 

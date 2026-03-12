@@ -202,7 +202,7 @@ tmux list-sessions | grep bmx-
 tmux attach -t bmx-<session-id-前8位>
 # Ctrl+B, D 退出 attach，不影响 CLI 继续运行
 
-# 强制回退到纯 pty 模式（不使用 tmux）
+# 强制降级到纯 pty 模式（不使用 tmux）
 BACKEND_TYPE=pty botmux start
 ```
 
@@ -220,7 +220,7 @@ BACKEND_TYPE=pty botmux start
 **注意事项：**
 - 切换 `CLI_ID`（如 `claude-code` → `coco`）后重启 daemon，所有旧 tmux session 会被自动清理，因为旧 CLI 的 idle detection pattern 与新适配器不兼容
 - 孤儿 tmux session（不在 active session 列表中的）会在 daemon 启动时自动清理
-- 如果不需要 tmux 常驻特性，设置 `BACKEND_TYPE=pty` 即可回退
+- 如果不需要 tmux 常驻特性，设置 `BACKEND_TYPE=pty` 即可降级
 
 ## MCP 工具
 

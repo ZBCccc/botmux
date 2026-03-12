@@ -92,12 +92,6 @@ export function killWorker(ds: DaemonSession): void {
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
-
-  // Also kill tmux session directly as a safety net:
-  // if worker is dead or doesn't handle 'close' in time, this ensures cleanup.
-  if (config.daemon.backendType === 'tmux') {
-    TmuxBackend.killSession(TmuxBackend.sessionName(ds.session.sessionId));
-  }
 }
 
 // ─── Fork worker ────────────────────────────────────────────────────────────
@@ -157,6 +151,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     prompt,
     resume,
     ownerOpenId: ds.ownerOpenId,
+    webPort: ds.session.webPort,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -167,6 +162,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       case 'ready': {
         ds.workerPort = msg.port;
         ds.workerToken = msg.token;
+        // Persist port so it can be reused after daemon restart
+        ds.session.webPort = msg.port;
+        sessionStore.updateSession(ds.session);
         const readOnlyUrl = `http://${config.web.externalHost}:${msg.port}`;
         const writeUrl = `${readOnlyUrl}?token=${msg.token}`;
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);

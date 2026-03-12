@@ -13,6 +13,7 @@ import { downloadMessageResource } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, killStalePids, getCurrentClaudeVersion } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import type { LarkAttachment, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { DaemonSession } from './types.js';
@@ -128,7 +129,18 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
     logger.debug(`Registered session ${session.sessionId} (thread: ${session.rootMessageId})`);
   }
 
-  logger.info(`Restored ${active.length} session(s), waiting for messages to resume`);
+  // Tmux mode: auto-fork workers for sessions with surviving tmux sessions
+  if (config.daemon.backendType === 'tmux') {
+    for (const [, ds] of activeSessions) {
+      const tmuxName = TmuxBackend.sessionName(ds.session.sessionId);
+      if (TmuxBackend.hasSession(tmuxName)) {
+        logger.info(`[${ds.session.sessionId.substring(0, 8)}] Tmux session alive, auto-forking worker to re-attach`);
+        forkWorker(ds, '', true);
+      }
+    }
+  }
+
+  logger.info(`Restored ${active.length} session(s)${config.daemon.backendType === 'tmux' ? '' : ', waiting for messages to resume'}`);
 }
 
 // ─── Scheduled task execution ────────────────────────────────────────────────

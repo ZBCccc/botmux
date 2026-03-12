@@ -398,7 +398,16 @@ export async function startDaemon(): Promise<void> {
     for (const [, ds] of activeSessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
-        killWorker(ds);
+        if (config.daemon.backendType === 'tmux') {
+          // Tmux mode: just kill the worker process — tmux session survives for re-attach.
+          // Worker's SIGTERM handler calls backend.kill() which only detaches.
+          try { ds.worker.kill('SIGTERM'); } catch { /* ignore */ }
+          ds.worker = null;
+          ds.workerPort = null;
+          ds.workerToken = null;
+        } else {
+          killWorker(ds);
+        }
       }
     }
     removePidFile();
