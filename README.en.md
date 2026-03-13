@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens for Lark messages and automatically spawns an independent CLI process (supporting Claude Code, Aiden, CoCo, Codex) for each new topic thread, with live streaming cards and a web-based terminal.
+Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens for Lark messages and automatically spawns an independent CLI process (supporting Claude Code, Aiden, CoCo, Codex, Gemini) for each new topic thread, with live streaming cards and a web-based terminal.
 
 ## Demo
 
@@ -11,7 +11,7 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 ## Features
 
 - **One topic = one AI coding session** — each Lark thread gets its own isolated CLI process
-- **Multi-CLI support** — adapter architecture supports Claude Code, Aiden, CoCo, Codex, and is extensible
+- **Multi-CLI support** — adapter architecture supports Claude Code, Aiden, CoCo, Codex, Gemini, and is extensible
 - **Live streaming cards** — real-time terminal output rendered in Feishu cards with markdown support, per-turn card lifecycle
 - **Web terminal (xterm.js)** — full PTY output in the browser with a mobile shortcut toolbar and on-demand write access via DM link
 - **Session persistence** — sessions survive daemon restarts; with tmux backend, CLI processes persist across restarts with zero interruption
@@ -23,7 +23,7 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 ## Prerequisites
 
 - **Node.js** >= 20
-- **AI coding CLI** installed and authenticated (`claude`, `aiden`, `coco`, or `codex` in PATH)
+- **AI coding CLI** installed and authenticated (`claude`, `aiden`, `coco`, `codex`, or `gemini` in PATH)
 - **Lark app** with Bot and Message permissions (WebSocket event subscription)
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 
@@ -79,7 +79,7 @@ Configuration is stored at `~/.botmux/.env`. Run `botmux setup` to create it int
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`) |
+| `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`, `gemini`) |
 | `CLI_PATH` | _(auto-detect by CLI_ID)_ | CLI binary path override |
 | `BACKEND_TYPE` | _(auto-detect)_ | Session backend: `tmux` if available, otherwise `pty` |
 | `WORKING_DIR` | `~` | Default working directory; supports comma-separated multiple dirs (e.g. `~/a,~/b`), `/repo` scans all |

@@ -6,6 +6,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'aiden': 'Aiden',
   'coco': 'CoCo',
   'codex': 'Codex',
+  'gemini': 'Gemini',
 };
 
 export function getCliDisplayName(cliId: CliId): string {

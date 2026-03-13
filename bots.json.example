@@ -12,5 +12,12 @@
     "cliId": "aiden",
     "allowedUsers": ["bob@company.com"],
     "workingDir": "~/work"
+  },
+  {
+    "larkAppId": "cli_xxx_bot3",
+    "larkAppSecret": "your_secret_3",
+    "cliId": "gemini",
+    "allowedUsers": ["charlie@company.com"],
+    "workingDir": "~/projects"
   }
 ]

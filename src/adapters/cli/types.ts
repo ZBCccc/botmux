@@ -17,11 +17,19 @@ export interface CliAdapter {
   readonly resolvedBin: string;
 
   /** Build spawn arguments (bin comes from resolvedBin).
-   *  Note: workingDir is NOT passed here — it's the backend's cwd, not a CLI arg. */
+   *  Note: workingDir is NOT passed here — it's the backend's cwd, not a CLI arg.
+   *  When initialPrompt is provided and the adapter supports it, the prompt
+   *  is baked into CLI args (e.g. Gemini's -i flag) instead of being written
+   *  to stdin after idle detection. */
   buildArgs(opts: {
     sessionId: string;
     resume: boolean;
+    initialPrompt?: string;
   }): string[];
+
+  /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
+   *  The worker skips queuing the prompt for stdin write. */
+  readonly passesInitialPromptViaArgs?: boolean;
 
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete. */
@@ -49,4 +57,4 @@ export interface CliAdapter {
   readonly altScreen: boolean;
 }
 
-export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex';
+export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'gemini';

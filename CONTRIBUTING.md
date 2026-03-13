@@ -32,7 +32,7 @@ Daemon (daemon.ts → core/ modules)
     |-- core/scheduler: cron scheduling
     |
 Worker (worker.ts) -- forked per session
-    |-- adapters/cli/*: CLI adapters (Claude Code / Aiden / CoCo / Codex)
+    |-- adapters/cli/*: CLI adapters (Claude Code / Aiden / CoCo / Codex / Gemini)
     |-- adapters/backend: PtyBackend or TmuxBackend
     |-- utils/idle-detector: idle detection
     |-- HTTP + WebSocket: xterm.js web terminal
@@ -65,6 +65,7 @@ src/
       aiden.ts              # Aiden adapter
       coco.ts               # CoCo adapter
       codex.ts              # Codex adapter
+      gemini.ts             # Gemini CLI adapter
     backend/
       types.ts              # SessionBackend interface
       pty-backend.ts        # node-pty backend
@@ -140,4 +141,5 @@ pnpm test                # Run all tests
 pnpm test:codex          # Codex input E2E test
 pnpm test:mcp            # Codex MCP E2E test
 pnpm test:claude-mcp     # Claude Code MCP E2E test
+pnpm test:gemini         # Gemini CLI input E2E test
 ```

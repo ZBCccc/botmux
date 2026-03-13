@@ -1,7 +1,8 @@
 import type { CliAdapter } from '../adapters/cli/types.js';
 
-/** Spinner frames — animate while CLI is working */
-const SPINNER_RE = /[·✢✳✶✻✽]/;
+/** Spinner frames — animate while CLI is working.
+ *  Includes Claude Code symbols and Ink dots braille chars (Gemini). */
+const SPINNER_RE = /[·✢✳✶✻✽⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
 
 /** Default quiescence timeout (ms) — idle if PTY silent + no recent spinner */
 const QUIESCENCE_MS = 2_000;

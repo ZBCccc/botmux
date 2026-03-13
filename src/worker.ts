@@ -41,7 +41,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', gemini: 'Gemini' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 const pendingMessages: string[] = [];
@@ -179,6 +179,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const args = cliAdapter.buildArgs({
     sessionId: cfg.sessionId,
     resume: cfg.resume ?? false,
+    initialPrompt: cfg.prompt || undefined,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -495,8 +496,10 @@ process.on('message', async (raw: unknown) => {
         startScreenUpdates();
         spawnCli(msg);
 
-        // Queue the initial prompt — flushed when CLI shows ❯
-        if (msg.prompt) {
+        // Queue the initial prompt — flushed when CLI shows idle.
+        // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the
+        // prompt into CLI args, so we skip queuing to avoid double-send.
+        if (msg.prompt && !cliAdapter?.passesInitialPromptViaArgs) {
           pendingMessages.push(msg.prompt);
         }
 

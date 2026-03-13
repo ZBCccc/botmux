@@ -108,9 +108,9 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   const appId = await ask(rl, 'LARK_APP_ID: ');
   const appSecret = await ask(rl, 'LARK_APP_SECRET: ');
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) gemini');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
-  const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex' };
+  const cliIdMap: Record<string, string> = { '1': 'claude-code', '2': 'aiden', '3': 'coco', '4': 'codex', '5': 'gemini' };
   const cliId = cliIdMap[cliChoice] ?? (cliChoice || 'claude-code');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
   const allowedUsers = await ask(rl, '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ');

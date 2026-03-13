@@ -2,7 +2,7 @@
 
 中文 | [English](README.en.md)
 
-飞书话题群与 AI 编程 CLI 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 CLI 进程（支持 Claude Code、Aiden、CoCo、Codex），提供实时流式卡片和 Web 终端。
+飞书话题群与 AI 编程 CLI 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 CLI 进程（支持 Claude Code、Aiden、CoCo、Codex、Gemini），提供实时流式卡片和 Web 终端。
 
 ## 演示
 
@@ -11,7 +11,7 @@
 ## 功能特性
 
 - **一个话题 = 一个 AI 编程会话** — 每个飞书话题线程对应一个独立的 CLI 进程
-- **多 CLI 支持** — 通过适配器架构支持 Claude Code、Aiden、CoCo、Codex，可扩展
+- **多 CLI 支持** — 通过适配器架构支持 Claude Code、Aiden、CoCo、Codex、Gemini，可扩展
 - **实时流式卡片** — 终端输出实时渲染到飞书卡片中，支持 Markdown 格式，每轮对话独立卡片
 - **Web 终端 (xterm.js)** — 浏览器查看完整 PTY 输出，移动端快捷键工具栏，按需获取可操作链接
 - **会话持久化** — 会话在 Daemon 重启后自动恢复；tmux 后端下 CLI 进程常驻，重启零中断
@@ -23,7 +23,7 @@
 ## 前置要求
 
 - **Node.js** >= 20
-- **AI 编程 CLI** 已安装并完成认证（`claude`、`aiden`、`coco` 或 `codex` 在 PATH 中）
+- **AI 编程 CLI** 已安装并完成认证（`claude`、`aiden`、`coco`、`codex` 或 `gemini` 在 PATH 中）
 - **飞书应用** 具备机器人和消息权限（WebSocket 事件订阅）
 - **tmux** >= 3.x（可选，安装后自动启用会话常驻）
 
@@ -79,7 +79,7 @@ botmux start
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`） |
+| `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`、`gemini`） |
 | `CLI_PATH` | _(按 CLI_ID 自动检测)_ | CLI 可执行文件路径覆盖 |
 | `BACKEND_TYPE` | _(自动检测)_ | 会话后端：有 tmux 则用 `tmux`，否则 `pty` |
 | `WORKING_DIR` | `~` | 默认工作目录，支持逗号分隔多个目录（如 `~/a,~/b`），`/repo` 会扫描所有目录 |
