@@ -1,19 +1,20 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { config, validateConfig } from './config.js';
-import { registerBot } from './bot-registry.js';
+import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
 import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
 
 export function createServer(): McpServer {
-  validateConfig();
-
-  // Register bot for MCP process (credentials from env)
-  if (config.lark.appId && config.lark.appSecret) {
-    registerBot({
-      larkAppId: config.lark.appId,
-      larkAppSecret: config.lark.appSecret,
-      cliId: (process.env.CLI_ID ?? 'claude-code') as any,
-    });
+  // Register all bots so MCP tools can send messages as any bot.
+  // loadBotConfigs() reads from bots.json / env vars — works regardless
+  // of whether the CLI passes LARK_APP_ID through to the MCP subprocess.
+  try {
+    const configs = loadBotConfigs();
+    for (const cfg of configs) {
+      registerBot(cfg);
+    }
+    logger.info(`MCP server registered ${configs.length} bot(s)`);
+  } catch (err: any) {
+    logger.warn(`MCP server: no bot configs found (${err.message}). Tools will fail at runtime.`);
   }
 
   const server = new McpServer({

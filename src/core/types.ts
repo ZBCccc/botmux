@@ -14,12 +14,12 @@ export interface DaemonSession {
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
   spawnedAt: number;
-  claudeVersion: string;
+  cliVersion: string;
   lastMessageAt: number;
-  hasHistory: boolean;   // true after Claude has run at least once for this session
+  hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: DaemonToWorker;   // stored for restart
-  pendingRepo?: boolean;         // waiting for repo selection before spawning Claude
+  pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   pendingPrompt?: string;        // original user message to send after repo is selected
   pendingAttachments?: LarkAttachment[];
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM

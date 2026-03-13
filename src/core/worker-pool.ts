@@ -8,8 +8,8 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
-import { updateMessage } from '../im/lark/client.js';
-import { buildStreamingCard, buildSessionCard } from '../im/lark/card-builder.js';
+import { updateMessage, MessageWithdrawnError } from '../im/lark/client.js';
+import { buildStreamingCard, buildSessionCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -27,6 +27,8 @@ export interface WorkerPoolCallbacks {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
+  /** Close a stale session (message withdrawn, etc.) */
+  closeSession: (ds: DaemonSession) => void;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -177,7 +179,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
         // Send streaming card to group thread (read-only link, will be PATCHed with live output)
         try {
-          const initTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
+          const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,
@@ -190,23 +192,39 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
         } catch (err) {
+          if (err instanceof MessageWithdrawnError) {
+            logger.warn(`[${t}] Root message withdrawn, closing stale session`);
+            killWorker(ds);
+            cb.closeSession(ds);
+            break;
+          }
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
           // Fallback: send static session card
-          const cardJson = buildSessionCard(
-            ds.session.sessionId,
-            ds.session.rootMessageId,
-            readOnlyUrl,
-            ds.session.title || 'Claude Code',
-            botCfg.cliId,
-          );
-          await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
+          try {
+            const cardJson = buildSessionCard(
+              ds.session.sessionId,
+              ds.session.rootMessageId,
+              readOnlyUrl,
+              ds.session.title || getCliDisplayName(botCfg.cliId),
+              botCfg.cliId,
+            );
+            await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
+          } catch (fallbackErr) {
+            if (fallbackErr instanceof MessageWithdrawnError) {
+              logger.warn(`[${t}] Root message withdrawn, closing stale session`);
+              killWorker(ds);
+              cb.closeSession(ds);
+              break;
+            }
+            throw fallbackErr;
+          }
         }
 
         break;
       }
 
       case 'prompt_ready': {
-        logger.info(`[${t}] Claude is ready for input`);
+        logger.info(`[${t}] ${getCliDisplayName(botCfg.cliId)} is ready for input`);
         break;
       }
 
@@ -215,7 +233,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = msg.status;
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           ds.session.rootMessageId,
@@ -232,10 +250,23 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           ds.streamCardPending = false;
           cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
             .then(msgId => { ds.streamCardId = msgId; })
-            .catch(err => logger.debug(`[${t}] Failed to create streaming card: ${err}`));
+            .catch(err => {
+              if (err instanceof MessageWithdrawnError) {
+                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
+                killWorker(ds);
+                cb.closeSession(ds);
+                return;
+              }
+              logger.debug(`[${t}] Failed to create streaming card: ${err}`);
+            });
         } else {
           // Same turn — PATCH existing card
           updateMessage(ds.larkAppId, ds.streamCardId, cardJson).catch(err => {
+            if (err instanceof MessageWithdrawnError) {
+              logger.warn(`[${t}] Stream card message withdrawn, clearing card reference`);
+              ds.streamCardId = undefined;
+              return;
+            }
             logger.debug(`[${t}] Failed to update streaming card: ${err}`);
             ds.streamCardId = undefined;
           });
@@ -244,7 +275,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       }
 
       case 'claude_exit': {
-        logger.info(`[${t}] Claude exited (code: ${msg.code}, signal: ${msg.signal})`);
+        logger.info(`[${t}] ${getCliDisplayName(botCfg.cliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
 
         // Rate-limit auto-restart to prevent crash loops
@@ -257,16 +288,24 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         restartCounts.set(key, rc);
 
         if (rc.count > 3) {
-          logger.warn(`[${t}] Claude crashed ${rc.count} times in 1 min, not auto-restarting`);
+          logger.warn(`[${t}] ${getCliDisplayName(botCfg.cliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           // Kill the worker process to free resources
           killWorker(ds);
-          await cb.sessionReply(ds.session.rootMessageId, `⚠️ Claude 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
+          const cliName = getCliDisplayName(botCfg.cliId);
+          try {
+            await cb.sessionReply(ds.session.rootMessageId, `⚠️ ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
+          } catch (replyErr) {
+            if (replyErr instanceof MessageWithdrawnError) {
+              logger.warn(`[${t}] Root message withdrawn, closing stale session`);
+              cb.closeSession(ds);
+            }
+          }
           break;
         }
 
-        // Auto-restart Claude within the same worker
+        // Auto-restart CLI within the same worker
         if (ds.worker && !ds.worker.killed) {
-          logger.info(`[${t}] Auto-restarting Claude...`);
+          logger.info(`[${t}] Auto-restarting ${getCliDisplayName(botCfg.cliId)}...`);
           ds.worker.send({ type: 'restart' } as DaemonToWorker);
         }
         break;
@@ -287,7 +326,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
-  ds.claudeVersion = currentClaudeVersion;
+  ds.cliVersion = currentCliVersion;
   sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
 }
@@ -301,7 +340,7 @@ export function killStalePids(activeSessions_: Session[]): void {
       // Check if process exists (signal 0 doesn't kill, just checks)
       process.kill(session.pid, 0);
       // Process exists — kill its process group
-      logger.info(`Killing stale Claude process (pid: ${session.pid}, session: ${session.sessionId})`);
+      logger.info(`Killing stale CLI process (pid: ${session.pid}, session: ${session.sessionId})`);
       try {
         process.kill(-session.pid, 'SIGTERM');
       } catch {
@@ -352,15 +391,15 @@ export function killStalePids(activeSessions_: Session[]): void {
   }
 }
 
-// ─── Claude version (shared with daemon) ────────────────────────────────────
+// ─── CLI version (shared with daemon) ─────────────────────────────────────
 
-/** Current CLI version, kept in sync by daemon via setCurrentClaudeVersion(). */
-let currentClaudeVersion = 'unknown';
+/** Current CLI version, kept in sync by daemon via setCurrentCliVersion(). */
+let currentCliVersion = 'unknown';
 
-export function setCurrentClaudeVersion(v: string): void {
-  currentClaudeVersion = v;
+export function setCurrentCliVersion(v: string): void {
+  currentCliVersion = v;
 }
 
-export function getCurrentClaudeVersion(): string {
-  return currentClaudeVersion;
+export function getCurrentCliVersion(): string {
+  return currentCliVersion;
 }

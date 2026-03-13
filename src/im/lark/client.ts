@@ -3,6 +3,23 @@ import { dirname } from 'node:path';
 import { getBotClient } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 
+// ─── Error types ──────────────────────────────────────────────────────────────
+
+/** Thrown when the target message has been withdrawn (Lark code 230011). */
+export class MessageWithdrawnError extends Error {
+  constructor(messageId: string) {
+    super(`Message ${messageId} has been withdrawn`);
+    this.name = 'MessageWithdrawnError';
+  }
+}
+
+/** Extract Lark error code from AxiosError or SDK error. */
+function getLarkErrorCode(err: any): number | undefined {
+  return err?.response?.data?.code ?? err?.code;
+}
+
+const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+
 export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text'): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
@@ -30,16 +47,25 @@ export async function replyMessage(larkAppId: string, messageId: string, content
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
-  const res = await c.im.v1.message.reply({
-    path: { message_id: messageId },
-    data: {
-      msg_type: msgType as any,
-      content: body,
-      ...(replyInThread ? { reply_in_thread: true } : {}),
-    },
-  });
+  let res: any;
+  try {
+    res = await c.im.v1.message.reply({
+      path: { message_id: messageId },
+      data: {
+        msg_type: msgType as any,
+        content: body,
+        ...(replyInThread ? { reply_in_thread: true } : {}),
+      },
+    });
+  } catch (err: any) {
+    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+      throw new MessageWithdrawnError(messageId);
+    }
+    throw err;
+  }
 
   if (res.code !== 0) {
+    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
     throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
   }
 
@@ -111,11 +137,20 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
 
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
   const c = getBotClient(larkAppId);
-  const res = await c.im.v1.message.patch({
-    path: { message_id: messageId },
-    data: { content: cardJson },
-  });
+  let res: any;
+  try {
+    res = await c.im.v1.message.patch({
+      path: { message_id: messageId },
+      data: { content: cardJson },
+    });
+  } catch (err: any) {
+    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+      throw new MessageWithdrawnError(messageId);
+    }
+    throw err;
+  }
   if (res.code !== 0) {
+    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
     throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
   }
 }

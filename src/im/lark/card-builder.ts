@@ -83,7 +83,7 @@ export function buildSessionCard(
 
 /**
  * Build a Feishu streaming card that shows live terminal output + controls.
- * This card is PATCHed in-place as Claude works.
+ * This card is PATCHed in-place as the CLI works.
  */
 export function buildStreamingCard(
   sessionId: string,

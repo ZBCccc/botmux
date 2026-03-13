@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, killStalePids, getCurrentClaudeVersion } from './worker-pool.js';
+import { forkWorker, killStalePids, getCurrentCliVersion } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
@@ -149,10 +149,10 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
     return;
   }
 
-  // Kill any stale Claude processes from previous daemon run
+  // Kill any stale CLI processes from previous daemon run
   killStalePids(active);
 
-  logger.info(`Registering ${active.length} active session(s) (no Claude spawn until new messages arrive)...`);
+  logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
 
   for (const session of active) {
     messageQueue.ensureQueue(session.rootMessageId);
@@ -167,9 +167,9 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
       spawnedAt: Date.now(),
-      claudeVersion: getCurrentClaudeVersion(),
+      cliVersion: getCurrentCliVersion(),
       lastMessageAt: Date.now(),
-      hasHistory: true,  // restored sessions have prior Claude history
+      hasHistory: true,  // restored sessions have prior CLI history
       workingDir: session.workingDir,
     });
 
@@ -195,7 +195,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
-  refreshClaudeVersion: (...args: any[]) => boolean,
+  refreshCliVersion: (...args: any[]) => boolean,
 ): Promise<void> {
   const defaultBot = getAllBots()[0];
   if (!defaultBot) { logger.warn('No bots configured, skipping scheduled task'); return; }
@@ -211,7 +211,7 @@ export async function executeScheduledTask(
   );
 
   // Create a session for this thread
-  refreshClaudeVersion(defaultBot.config.cliId, defaultBot.config.cliPathOverride);
+  refreshCliVersion(defaultBot.config.cliId, defaultBot.config.cliPathOverride);
   const session = sessionStore.createSession(task.chatId, rootMessageId, `[定时] ${task.name}`);
   session.larkAppId = larkAppId;
   sessionStore.updateSession(session);
@@ -228,7 +228,7 @@ export async function executeScheduledTask(
     chatId: task.chatId,
     chatType: 'group',
     spawnedAt: Date.now(),
-    claudeVersion: getCurrentClaudeVersion(),
+    cliVersion: getCurrentCliVersion(),
     lastMessageAt: Date.now(),
     hasHistory: false,
     workingDir: task.workingDir,

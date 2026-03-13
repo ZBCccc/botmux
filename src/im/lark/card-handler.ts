@@ -75,7 +75,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
     if (actionType === 'restart' && ds) {
       const botCfg = getBot(ds.larkAppId).config;
       if (ds.worker) {
-        // Worker alive — tell it to restart Claude
+        // Worker alive — tell it to restart CLI
         logger.info(`[${tag(ds)}] Restart via card button`);
         ds.worker.send({ type: 'restart' } as DaemonToWorker);
         const cliName = getCliDisplayName(botCfg.cliId);
@@ -106,7 +106,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
           ds.session.sessionId,
           ds.session.rootMessageId,
           writeUrl,
-          ds.session.title || 'Claude Code',
+          ds.session.title || getCliDisplayName(botCfg.cliId),
           botCfg.cliId,
         );
         sendUserMessage(ds.larkAppId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
@@ -124,7 +124,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
       // Immediately rebuild and PATCH the current streaming card
       if (ds.streamCardId && ds.workerPort) {
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           ds.session.rootMessageId,
@@ -144,7 +144,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
 
     if (actionType === 'skip_repo' && ds && ds.pendingRepo) {
       const botCfg = getBot(ds.larkAppId).config;
-      // Skip repo selection — spawn Claude with default working dir
+      // Skip repo selection — spawn CLI with default working dir
       ds.pendingRepo = false;
       const prompt = buildNewTopicPrompt(
         ds.pendingPrompt ?? '',
@@ -158,7 +158,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
       forkWorker(ds, prompt);
       const cwd = getSessionWorkingDir(ds);
       await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
-      logger.info(`[${tag(ds)}] Skip repo, spawning Claude in ${cwd}`);
+      logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
     }
     return;
   }
@@ -196,7 +196,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
 
   if (targetDs.pendingRepo) {
     const botCfg = getBot(targetDs.larkAppId).config;
-    // First-time repo selection — now spawn Claude with the original prompt
+    // First-time repo selection — now spawn CLI with the original prompt
     targetDs.pendingRepo = false;
     const prompt = buildNewTopicPrompt(
       targetDs.pendingPrompt ?? '',
@@ -209,7 +209,7 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
     targetDs.pendingAttachments = undefined;
     forkWorker(targetDs, prompt);
     await sessionReply(rootId, `✅ 已选择 ${displayName}`);
-    logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning Claude`);
+    logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);
   } else {
     // Mid-session repo switch — close old session, start fresh
     killWorker(targetDs);

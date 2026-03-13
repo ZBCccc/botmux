@@ -16,14 +16,14 @@ import { sessionKey } from './core/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildRepoSelectCard, buildStreamingCard } from './im/lark/card-builder.js';
+import { buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
   forkWorker,
   killWorker,
-  setCurrentClaudeVersion,
-  getCurrentClaudeVersion,
+  setCurrentCliVersion,
+  getCurrentCliVersion,
 } from './core/worker-pool.js';
 import { DAEMON_COMMANDS, handleCommand } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -99,7 +99,7 @@ function removePidFile(): void {
 
 // ─── Version tracking ────────────────────────────────────────────────────────
 
-function refreshClaudeVersion(cliId: CliId, cliPathOverride?: string): boolean {
+function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
   const now = Date.now();
   const cached = cliVersionCache.get(cliId);
   if (cached && now - cached.lastCheckAt < VERSION_CHECK_INTERVAL) return false;
@@ -116,8 +116,8 @@ function refreshClaudeVersion(cliId: CliId, cliPathOverride?: string): boolean {
 
     const oldVersion = cached?.version;
     cliVersionCache.set(cliId, { version: newVersion, lastCheckAt: now });
-    // Also update the shared version (used by forkWorker for ds.claudeVersion)
-    setCurrentClaudeVersion(newVersion);
+    // Also update the shared version (used by forkWorker for ds.cliVersion)
+    setCurrentCliVersion(newVersion);
 
     if (oldVersion && oldVersion !== newVersion) {
       logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${adapter.id})`);
@@ -186,7 +186,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         chatId,
         chatType,
         spawnedAt: Date.now(),
-        claudeVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+        cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
         lastMessageAt: Date.now(),
         hasHistory: false,
         ownerOpenId: senderOpenId,
@@ -202,9 +202,9 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     parsed.attachments = attachments;
   }
 
-  refreshClaudeVersion(botCfg.cliId, botCfg.cliPathOverride);
+  refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
-  // Create session in pending-repo state — don't spawn Claude yet
+  // Create session in pending-repo state — don't spawn CLI yet
   const session = sessionStore.createSession(chatId, messageId, parsed.content.substring(0, 50), chatType);
   session.larkAppId = larkAppId;
   sessionStore.updateSession(session);
@@ -220,7 +220,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     chatId,
     chatType,
     spawnedAt: Date.now(),
-    claudeVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+    cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
     lastMessageAt: Date.now(),
     hasHistory: false,
     pendingRepo: true,
@@ -315,7 +315,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     const chatType = (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     const botCfg = getBot(larkAppId).config;
     logger.info(`No active session for thread ${rootId}, auto-creating new session...`);
-    refreshClaudeVersion(botCfg.cliId, botCfg.cliPathOverride);
+    refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50), chatType);
     session.larkAppId = larkAppId;
     sessionStore.updateSession(session);
@@ -328,7 +328,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       chatId,
       chatType,
       spawnedAt: Date.now(),
-      claudeVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+      cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
       lastMessageAt: Date.now(),
       hasHistory: false,
       pendingRepo: true,
@@ -369,8 +369,8 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     // Freeze the previous turn's card at "idle" before starting a new turn
     if (ds.streamCardId && ds.workerPort) {
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-      const prevTitle = ds.currentTurnTitle || ds.session.title || 'Claude Code';
       const dsBotCfg = getBot(ds.larkAppId).config;
+      const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
       const frozenCard = buildStreamingCard(
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
         ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId, ds.streamExpanded,
@@ -405,6 +405,11 @@ export async function startDaemon(): Promise<void> {
     sessionReply,
     getSessionWorkingDir,
     getActiveCount,
+    closeSession(ds: DaemonSession) {
+      sessionStore.closeSession(ds.session.sessionId);
+      activeSessions.delete(sessionKey(ds.session.rootMessageId, ds.larkAppId));
+      logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
+    },
   });
 
   // Per-bot initialization
@@ -412,7 +417,7 @@ export async function startDaemon(): Promise<void> {
     const cfg = bot.config;
 
     // Refresh CLI version per bot's cliId
-    refreshClaudeVersion(cfg.cliId, cfg.cliPathOverride);
+    refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
 
     // Resolve allowed users per bot
     if (bot.resolvedAllowedUsers.length > 0) {
@@ -454,7 +459,7 @@ export async function startDaemon(): Promise<void> {
   restoreActiveSessions(activeSessions);
 
   // Start scheduled task scheduler
-  scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshClaudeVersion));
+  scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
   scheduler.startScheduler();
 
   // Graceful shutdown

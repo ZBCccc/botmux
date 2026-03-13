@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Worker process: manages a single Claude Code PTY session + web terminal.
+ * Worker process: manages a single CLI PTY session + web terminal.
  * Forked by the daemon, communicates via Node.js IPC.
  *
  * Lifecycle:
@@ -9,8 +9,8 @@
  *   3. Spawns CLI via CliAdapter + PtyBackend (interactive mode)
  *   4. Starts HTTP + WebSocket server for xterm.js
  *   5. Receives 'message' events from daemon, writes to PTY stdin
- *   6. On 'close', kills Claude and exits
- *   7. On 'restart', kills Claude and re-spawns with --resume
+ *   6. On 'close', kills CLI and exits
+ *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -38,13 +38,15 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex' };
+function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 const pendingMessages: string[] = [];
 /** Suppress screen updates until first prompt detected (avoids history replay in card on --resume) */
 let awaitingFirstPrompt = true;
 
 // ─── PTY Dimensions ──────────────────────────────────────────────────────────
-// Wide PTY so Claude Code positions right-aligned TUI overlays (timer, timeout)
+// Wide PTY so CLI positions right-aligned TUI overlays (timer, timeout)
 // far to the right. The snapshot reader only reads the first 160 columns,
 // cleanly excluding overlays without any regex hacking.
 const PTY_COLS = 300;
@@ -144,7 +146,7 @@ function sendToPty(content: string): void {
     cliAdapter.writeInput(backend, content);
   } else {
     pendingMessages.push(content);
-    log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — Claude is busy`);
+    log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} is busy`);
   }
 }
 
@@ -168,7 +170,7 @@ function stopScreenUpdates(): void {
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
-function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
   const useTmux = cfg.backendType === 'tmux';
   isTmuxMode = useTmux;
@@ -208,14 +210,14 @@ function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
   backend.onData(onPtyData);
   backend.onExit((code, signal) => {
-    log(`Claude exited (code: ${code}, signal: ${signal})`);
+    log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
     backend = null;
     isPromptReady = false;
     send({ type: 'claude_exit', code, signal });
   });
 }
 
-function killClaude(): void {
+function killCli(): void {
   idleDetector?.dispose();
   idleDetector = null;
   stopScreenUpdates();
@@ -300,7 +302,7 @@ function getTerminalHtml(): string {
 <head>
 <meta charset="utf-8">
 <meta id="vp" name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Claude Code - ${label}</title>
+<title>${cliName()} - ${label}</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -415,9 +417,9 @@ process.on('message', async (raw: unknown) => {
       try {
         const port = await startWebServer('0.0.0.0', msg.webPort);
         startScreenUpdates();
-        spawnClaude(msg);
+        spawnCli(msg);
 
-        // Queue the initial prompt — flushed when Claude shows ❯
+        // Queue the initial prompt — flushed when CLI shows ❯
         if (msg.prompt) {
           pendingMessages.push(msg.prompt);
         }
@@ -439,12 +441,12 @@ process.on('message', async (raw: unknown) => {
 
     case 'restart': {
       log('Restart requested');
-      killClaude();
+      killCli();
       awaitingFirstPrompt = true;
       setTimeout(() => {
         if (lastInitConfig) {
           startScreenUpdates();
-          spawnClaude({ ...lastInitConfig, resume: true, prompt: '' });
+          spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
         }
       }, 500);
       break;
@@ -454,7 +456,7 @@ process.on('message', async (raw: unknown) => {
       log('Close requested');
       // destroySession kills tmux session permanently; kill() only detaches
       backend?.destroySession?.();
-      killClaude();
+      killCli();
       cleanup();
       process.exit(0);
     }
@@ -470,9 +472,9 @@ function cleanup(): void {
   if (httpServer) { httpServer.close(); httpServer = null; }
 }
 
-process.on('SIGTERM', () => { killClaude(); cleanup(); process.exit(0); });
-process.on('SIGINT', () => { killClaude(); cleanup(); process.exit(0); });
+process.on('SIGTERM', () => { killCli(); cleanup(); process.exit(0); });
+process.on('SIGINT', () => { killCli(); cleanup(); process.exit(0); });
 // If parent daemon dies, IPC channel closes — clean up
-process.on('disconnect', () => { log('Daemon disconnected'); killClaude(); cleanup(); process.exit(0); });
+process.on('disconnect', () => { log('Daemon disconnected'); killCli(); cleanup(); process.exit(0); });
 
 log('Worker started, waiting for init...');

@@ -14,7 +14,7 @@ import { scanProjects, scanMultipleProjects } from '../services/project-scanner.
 import { buildRepoSelectCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
-import { killWorker, forkWorker, getCurrentClaudeVersion } from './worker-pool.js';
+import { killWorker, forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey } from './types.js';
@@ -175,7 +175,8 @@ export async function handleCommand(
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
           activeSessions.delete(sessionKey(rootId, larkAppId!));
-          await sessionReply(rootId, '会话已关闭，Claude 进程已终止。');
+          const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+          await sessionReply(rootId, `会话已关闭，${cliName} 进程已终止。`);
           logger.info(`[${t}] Session closed by /close command`);
         } else {
           await sessionReply(rootId, '当前话题没有活跃的会话。');
@@ -189,7 +190,7 @@ export async function handleCommand(
           sessionStore.closeSession(ds.session.sessionId);
           const newSession = sessionStore.createSession(ds.chatId, rootId, ds.session.title, ds.chatType);
           ds.session = newSession;
-          ds.claudeVersion = getCurrentClaudeVersion();
+          ds.cliVersion = getCurrentCliVersion();
           ds.hasHistory = false;
           await sessionReply(rootId, `上下文已清除，下次发消息时将使用新会话。\nNew Session: ${newSession.sessionId}`);
           logger.info(`[${t}] Context cleared by /clear command, new session: ${newSession.sessionId}`);
@@ -248,7 +249,7 @@ export async function handleCommand(
       }
 
       case '/repo': {
-        // If Claude is already running, warn user — switching repo means closing the session
+        // If CLI is already running, warn user — switching repo means closing the session
         if (ds?.worker && !ds.worker.killed) {
           await sessionReply(rootId, '⚠️ 当前会话已在运行中，切换仓库将关闭当前会话并创建新会话。\n如需切换，请在下方卡片中选择新仓库。');
         }
@@ -283,14 +284,15 @@ export async function handleCommand(
             `Status: ${alive ? '运行中' : '等待中'}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
-            `Claude: v${ds.claudeVersion}${ds.claudeVersion !== getCurrentClaudeVersion() ? ` (latest: v${getCurrentClaudeVersion()})` : ''}`,
+            `${getCliDisplayName(getBot(ds.larkAppId).config.cliId)}: v${ds.cliVersion}${ds.cliVersion !== getCurrentCliVersion() ? ` (latest: v${getCurrentCliVersion()})` : ''}`,
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {
-          await sessionReply(rootId, `当前话题没有活跃的会话。\nDaemon active sessions: ${getActiveCount()}\nClaude: v${getCurrentClaudeVersion()}`);
+          const fallbackCliName = larkAppId ? getCliDisplayName(getBot(larkAppId).config.cliId) : 'CLI';
+          await sessionReply(rootId, `当前话题没有活跃的会话。\nDaemon active sessions: ${getActiveCount()}\n${fallbackCliName}: v${getCurrentCliVersion()}`);
         }
         break;
       }
