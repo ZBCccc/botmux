@@ -209,16 +209,69 @@ describe('OpenCode first input submission', () => {
     expect(args).toEqual([]);
   });
 
-  it('adapter: buildArgs includes --continue on resume', () => {
-    const adapter = createOpenCodeAdapter();
-    const args = adapter.buildArgs({ sessionId: 'test', resume: true });
-    expect(args).toEqual(['--continue']);
-  });
+  it('bug: --continue causes crash loop when no prior session exists', async () => {
+    /**
+     * Reproduces the production crash loop:
+     * 1. First OpenCode session exits (for any reason)
+     * 2. Daemon auto-restarts with resume: true → worker spawns `opencode --continue`
+     * 3. No prior session exists → OpenCode exits immediately (code 0)
+     * 4. Daemon sees claude_exit → auto-restarts again → loop until crash guard
+     *
+     * This test verifies that `opencode --continue` in a clean directory either
+     * exits quickly (the original bug) or hangs without processing anything
+     * (no useful session to continue).  Either way, --continue is unreliable
+     * for the daemon's auto-restart path.
+     */
+    const spawnTime = Date.now();
+    let exitCode: number | null = null;
+    let exitAt: number | null = null;
+    let output = '';
 
-  it('adapter: buildArgs combines --continue and --prompt on resume with prompt', () => {
+    proc = pty.spawn(OPENCODE_BIN, ['--continue'], {
+      name: 'xterm-256color',
+      cols: PTY_COLS,
+      rows: PTY_ROWS,
+      cwd: tmpDir!,
+      env: { ...process.env } as Record<string, string>,
+    });
+
+    proc.onData((data) => { output += data; });
+    proc.onExit(({ exitCode: c }) => {
+      exitCode = c;
+      exitAt = Date.now();
+    });
+
+    // Wait up to 5s — if it exits quickly or hangs, both confirm the bug
+    await delay(5_000);
+
+    const elapsed = exitAt ? exitAt - spawnTime : Date.now() - spawnTime;
+
+    if (exitCode !== null) {
+      // Exited — matches the production crash (11ms exit in user's logs)
+      console.log(`>>> opencode --continue exited in ${elapsed}ms with code ${exitCode}`);
+      console.log('>>> This confirms the crash-loop: immediate exit → auto-restart → repeat');
+    } else {
+      // Didn't exit but also didn't do anything useful
+      const stripped = stripAnsi(output);
+      console.log(`>>> opencode --continue still running after ${elapsed}ms`);
+      console.log(`>>> Output length: ${stripped.length} chars`);
+      console.log('>>> No useful session to continue — --continue is unreliable for restart');
+    }
+
+    // The fix: buildArgs should NOT include --continue on resume
     const adapter = createOpenCodeAdapter();
+    const resumeArgs = adapter.buildArgs({ sessionId: 'test', resume: true });
+    expect(resumeArgs).not.toContain('--continue');
+    expect(resumeArgs, 'resume should produce empty args (start fresh)').toEqual([]);
+  }, 15_000);
+
+  it('adapter: resume starts fresh (no --continue)', () => {
+    const adapter = createOpenCodeAdapter();
+    // resume: true should NOT add --continue — always start fresh
+    expect(adapter.buildArgs({ sessionId: 'test', resume: true })).toEqual([]);
+    // resume with prompt should only have --prompt
     const args = adapter.buildArgs({ sessionId: 'test', resume: true, initialPrompt: 'hello' });
-    expect(args).toContain('--continue');
+    expect(args).not.toContain('--continue');
     expect(args).toContain('--prompt');
     expect(args).toContain('hello');
   });

@@ -14,13 +14,12 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     id: 'opencode',
     resolvedBin: bin,
 
-    buildArgs({ resume, initialPrompt }) {
+    buildArgs({ initialPrompt }) {
       // OpenCode manages sessions internally (SQLite store).
-      // --continue resumes the last session in the working directory.
+      // Resume not supported — always start fresh.  --continue exits
+      // immediately (code 0) when there is no prior session, causing a
+      // crash-loop in the daemon auto-restart path.
       const args: string[] = [];
-      if (resume) {
-        args.push('--continue');
-      }
       // Use --prompt for the initial prompt.  OpenCode's Bubble Tea TUI
       // has an async startup phase; writing to stdin during this window
       // may be lost.  --prompt injects it once the TUI is ready.
