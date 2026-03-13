@@ -6,7 +6,11 @@
 
 ## 演示
 
-<video src="https://github.com/user-attachments/assets/840d3bb6-3b98-465a-8662-b4beadeb48ce" width="100%" controls></video>
+
+
+https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65
+
+
 
 ## 功能特性
 
