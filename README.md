@@ -8,46 +8,17 @@
 
 [演示视频](https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65)
 
-
 ## 功能特性
 
 - **一个话题 = 一个 AI 编程会话** — 每个飞书话题线程对应一个独立的 CLI 进程
 - **多 CLI 支持** — 通过适配器架构支持 Claude Code、Aiden、CoCo、Codex，可扩展
 - **实时流式卡片** — 终端输出实时渲染到飞书卡片中，支持 Markdown 格式，每轮对话独立卡片
-- **Web 终端 (xterm.js)** — 浏览器查看完整 PTY 输出，按需获取可操作链接
+- **Web 终端 (xterm.js)** — 浏览器查看完整 PTY 输出，移动端快捷键工具栏，按需获取可操作链接
 - **会话持久化** — 会话在 Daemon 重启后自动恢复；tmux 后端下 CLI 进程常驻，重启零中断
 - **定时任务** — 基于 Cron 的周期性任务，支持中文自然语言配置
 - **项目管理** — 交互式仓库选择器，每个会话独立工作目录
 - **MCP 集成** — CLI 可通过 MCP 工具回复飞书话题、读取消息历史、添加表情回应
 - **权限控制** — 用户白名单、终端 Token 写入权限、卡片按钮操作限制
-
-## 架构
-
-```
-飞书 WebSocket 事件
-    |
-Daemon (daemon.ts → core/ 模块)
-    |-- im/lark/event-dispatcher: 飞书事件路由
-    |-- im/lark/card-handler: 卡片交互处理
-    |-- core/worker-pool: Worker 进程池管理
-    |-- core/command-handler: 斜杠命令处理
-    |-- core/session-manager: 会话生命周期
-    |-- core/scheduler: 定时任务调度
-    |
-Worker (worker.ts) -- 每个会话 fork 一个子进程
-    |-- adapters/cli/*: CLI 适配器 (Claude Code / Aiden / CoCo / Codex)
-    |-- adapters/backend: PtyBackend (node-pty) 或 TmuxBackend (tmux + node-pty)
-    |-- utils/idle-detector: 空闲检测（静默 + Spinner + 完成标记）
-    |-- HTTP + WebSocket: 提供 xterm.js Web 终端
-    |-- Headless xterm: 捕获屏幕内容用于流式卡片
-    |-- IPC: 与 Daemon 通信
-    |
-AI 编程 CLI (交互式 TTY 模式)
-    |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
-    |
-飞书 API
-    |-- 回复消息、表情回应、卡片更新、私聊
-```
 
 ## 前置要求
 
@@ -244,11 +215,11 @@ botmux setup
 - **只读链接** — 展示在群话题的流式卡片上
 - **可操作链接** — 按需获取（点击卡片上的「🔑 获取操作链接」通过私聊发送）
 
-特性：xterm.js + fit/unicode11/web-links 插件、TokyoNight 主题、滚动缓冲区、移动端适配。
+特性：xterm.js + fit/unicode11/web-links 插件、TokyoNight 主题、滚动缓冲区。移动端/平板通过悬浮快捷键工具栏提供 Esc、Ctrl+C、Tab、方向键等虚拟键盘缺失的控制键，工具栏自动避让虚拟键盘。
 
 ### Tmux 会话常驻
 
-安装 tmux 后，botmux 自动使用 tmux 后端（`pty-under-tmux` 架构）。CLI 进程运行在 tmux session 内，daemon 通过 node-pty attach 到 tmux 来捕获输出，现有的流式卡片、空闲检测、Web 终端等功能全部不受影响。
+安装 tmux 后，botmux 自动使用 tmux 后端。CLI 进程运行在 tmux session 内，daemon 通过 node-pty attach 到 tmux 来捕获输出，流式卡片、空闲检测、Web 终端等功能全部不受影响。
 
 **核心收益：Daemon 重启不中断 CLI。** `botmux restart` 时 worker 进程退出，但 tmux session（及其中的 CLI 进程）保持运行。下次收到消息时 worker 自动 re-attach，无需 `--resume` 重载上下文。
 
@@ -264,7 +235,7 @@ tmux attach -t bmx-<session-id-前8位>
 BACKEND_TYPE=pty botmux start
 ```
 
-**tmux 会话命名规则：** `bmx-<sessionId 前 8 位>`，由 session UUID 确定性派生。
+**tmux 会话命名规则：** `bmx-<sessionId 前 8 位>`
 
 **生命周期：**
 
@@ -273,92 +244,10 @@ BACKEND_TYPE=pty botmux start
 | `botmux restart` | 存活 | 存活（下次消息 re-attach） |
 | `/close` 或关闭按钮 | 销毁 | 终止（SIGHUP） |
 | CLI 自行退出 / 崩溃 | 随之关闭 | 已退出（自动重启用新 session） |
-| 切换 `CLI_ID` 后重启 | 全部销毁 | 全部终止（防止 pattern 不匹配） |
 
-**注意事项：**
-- 切换 `CLI_ID`（如 `claude-code` → `coco`）后重启 daemon，所有旧 tmux session 会被自动清理，因为旧 CLI 的 idle detection pattern 与新适配器不兼容
-- 孤儿 tmux session（不在 active session 列表中的）会在 daemon 启动时自动清理
-- 如果不需要 tmux 常驻特性，设置 `BACKEND_TYPE=pty` 即可降级
+## 贡献
 
-## MCP 工具
-
-Claude Code 可使用三个 MCP 工具与飞书交互：
-
-| 工具 | 说明 |
-|------|------|
-| `send_to_thread` | 向飞书话题发送消息（纯文本或富文本） |
-| `get_thread_messages` | 获取话题的消息历史 |
-| `react_to_message` | 添加或移除消息的表情回应 |
-
-## 开发
-
-```bash
-git clone <repo-url>
-cd botmux
-pnpm install
-pnpm build
-
-# 直接运行（不经 PM2）
-pnpm daemon
-
-# 或使用 PM2
-pnpm daemon:start
-pnpm daemon:logs
-```
-
-## 项目结构
-
-```
-src/
-  cli.ts                    # CLI 入口（setup/start/stop/restart/logs/list/delete）
-  daemon.ts                 # Daemon 编排入口（~400 行，调用各模块）
-  worker.ts                 # Worker 进程：使用适配器管理 CLI + PTY
-  bot-registry.ts           # 多机器人注册表（配置加载、per-bot 状态管理）
-  config.ts                 # 环境变量配置
-  server.ts                 # MCP Server
-  types.ts                  # IPC 消息类型
-  adapters/
-    cli/
-      types.ts              # CliAdapter 接口、CliId 类型
-      registry.ts           # 适配器工厂 + resolveCommand
-      claude-code.ts        # Claude Code 适配器
-      aiden.ts              # Aiden 适配器
-      coco.ts               # CoCo 适配器
-      codex.ts              # Codex 适配器
-    backend/
-      types.ts              # SessionBackend 接口
-      pty-backend.ts        # node-pty 后端
-      tmux-backend.ts       # tmux 后端（pty-under-tmux，会话常驻）
-  core/
-    types.ts                # DaemonSession 核心类型
-    worker-pool.ts          # Worker 进程池管理
-    command-handler.ts      # 斜杠命令处理
-    session-manager.ts      # 会话生命周期 + 路径解析
-    cost-calculator.ts      # Token 用量 & 费用估算
-    scheduler.ts            # 定时任务调度（自然语言解析）
-  im/
-    types.ts                # ImAdapter 接口定义（多 IM 抽象）
-    lark/
-      client.ts             # 飞书 API 封装
-      event-dispatcher.ts   # 飞书 WebSocket 事件路由
-      card-handler.ts       # 飞书卡片交互处理
-      card-builder.ts       # 飞书交互卡片构建
-      message-parser.ts     # 飞书事件消息解析
-  tools/
-    index.ts                # MCP 工具注册表
-    send-to-thread.ts       # MCP 工具：发送消息
-    get-thread-messages.ts  # MCP 工具：读取消息
-    react-to-message.ts     # MCP 工具：表情回应
-  services/
-    session-store.ts        # 会话持久化 (JSON)
-    schedule-store.ts       # 定时任务持久化
-    message-queue.ts        # 话题消息队列 (JSONL)
-    project-scanner.ts      # Git 仓库/Worktree 扫描
-  utils/
-    idle-detector.ts        # CLI 空闲检测（静默 + Spinner + 完成标记）
-    terminal-renderer.ts    # Headless xterm 渲染器（屏幕捕获 & TUI 过滤）
-    logger.ts               # 日志工具
-```
+参见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 

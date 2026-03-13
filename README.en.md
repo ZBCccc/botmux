@@ -13,40 +13,12 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 - **One topic = one AI coding session** — each Lark thread gets its own isolated CLI process
 - **Multi-CLI support** — adapter architecture supports Claude Code, Aiden, CoCo, Codex, and is extensible
 - **Live streaming cards** — real-time terminal output rendered in Feishu cards with markdown support, per-turn card lifecycle
-- **Web terminal (xterm.js)** — full PTY output in the browser with optional write access via on-demand DM link
+- **Web terminal (xterm.js)** — full PTY output in the browser with a mobile shortcut toolbar and on-demand write access via DM link
 - **Session persistence** — sessions survive daemon restarts; with tmux backend, CLI processes persist across restarts with zero interruption
 - **Scheduled tasks** — cron-based recurring prompts with natural language scheduling (Chinese supported)
 - **Project management** — interactive repo selector, per-session working directory
 - **MCP integration** — CLI can reply to Lark threads, read message history, and add reactions via MCP tools
 - **Access control** — allowlist for users, token-based write access for terminals, button restrictions on cards
-
-## Architecture
-
-```
-Lark WebSocket Events
-    |
-Daemon (daemon.ts → core/ modules)
-    |-- im/lark/event-dispatcher: Lark event routing
-    |-- im/lark/card-handler: card interaction handling
-    |-- core/worker-pool: worker process pool management
-    |-- core/command-handler: slash command processing
-    |-- core/session-manager: session lifecycle
-    |-- core/scheduler: cron task scheduling
-    |
-Worker (worker.ts) -- forked child process per session
-    |-- adapters/cli/*: CLI adapters (Claude Code / Aiden / CoCo / Codex)
-    |-- adapters/backend: PtyBackend (node-pty) or TmuxBackend (tmux + node-pty)
-    |-- utils/idle-detector: idle detection (quiescence + spinner + completion marker)
-    |-- HTTP + WebSocket server: serves xterm.js web terminal
-    |-- Headless xterm: captures screen for streaming cards
-    |-- IPC: communicates with daemon
-    |
-AI Coding CLI (interactive TTY mode)
-    |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
-    |
-Lark API
-    |-- Replies, reactions, card updates, DMs
-```
 
 ## Prerequisites
 
@@ -168,7 +140,7 @@ botmux setup
 | `allowedUsers` | No | Allowed user list |
 | `projectScanDir` | No | Directory to scan for git repos |
 
-**Config priority:** `BOTS_CONFIG` env var → `~/.botmux/bots.json` → `.env` single-bot mode
+**Config priority:** `BOTS_CONFIG` env var > `~/.botmux/bots.json` > `.env` single-bot mode
 
 ## File Locations
 
@@ -231,7 +203,7 @@ Manage tasks:
 Each conversation turn gets a live-updating Feishu card that shows:
 
 - Real-time terminal output (rendered via headless xterm + Feishu Card v2 markdown)
-- Status indicator: 🟡 Starting → 🔵 Working → 🟢 Idle
+- Status indicator: 🟡 Starting > 🔵 Working > 🟢 Idle
 - Action buttons: Open Terminal, Get Write Link, Restart Claude, Close Session
 
 The card content is captured from a headless xterm terminal that filters out TUI chrome (logo, status bar, prompts, box-drawing characters) and shows only Claude's actual work output.
@@ -243,11 +215,11 @@ Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
 - **Read-only link** — shown on the streaming card in the group thread
 - **Write-enabled link** — sent via DM on demand (click "🔑 Get Write Link" on the card)
 
-Features: xterm.js with fit/unicode11/web-links addons, TokyoNight theme, scrollback buffer, mobile-friendly viewport.
+Features: xterm.js with fit/unicode11/web-links addons, TokyoNight theme, scrollback buffer. On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow keys and other control keys missing from virtual keyboards, with automatic keyboard avoidance.
 
 ### Tmux Persistent Sessions
 
-When tmux is installed, botmux automatically uses the tmux backend (pty-under-tmux architecture). CLI processes run inside tmux sessions while the daemon attaches via node-pty to capture output — streaming cards, idle detection, and web terminal all work unchanged.
+When tmux is installed, botmux automatically uses the tmux backend. CLI processes run inside tmux sessions while the daemon attaches via node-pty to capture output — streaming cards, idle detection, and web terminal all work unchanged.
 
 **Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
 
@@ -263,7 +235,7 @@ tmux attach -t bmx-<first-8-chars-of-session-id>
 BACKEND_TYPE=pty botmux start
 ```
 
-**Session naming:** `bmx-<first 8 chars of session UUID>`, deterministically derived.
+**Session naming:** `bmx-<first 8 chars of session UUID>`
 
 **Lifecycle:**
 
@@ -272,92 +244,10 @@ BACKEND_TYPE=pty botmux start
 | `botmux restart` | Survives | Survives (re-attaches on next message) |
 | `/close` or close button | Destroyed | Terminated (SIGHUP) |
 | CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
-| `CLI_ID` changed + restart | All destroyed | All terminated (prevents pattern mismatch) |
 
-**Notes:**
-- Switching `CLI_ID` (e.g. `claude-code` → `coco`) and restarting the daemon will kill all existing tmux sessions, since the old CLI's idle detection patterns are incompatible with the new adapter
-- Orphaned tmux sessions (not in the active session list) are cleaned up automatically on daemon startup
-- Set `BACKEND_TYPE=pty` to opt out of tmux persistence
+## Contributing
 
-## MCP Tools
-
-Claude Code has access to three MCP tools for interacting with Lark:
-
-| Tool | Description |
-|------|-------------|
-| `send_to_thread` | Send a message (text or rich post) to the Lark thread |
-| `get_thread_messages` | Retrieve message history from the thread |
-| `react_to_message` | Add or remove emoji reactions on messages |
-
-## Development
-
-```bash
-git clone <repo-url>
-cd botmux
-pnpm install
-pnpm build
-
-# Run directly (no PM2)
-pnpm daemon
-
-# Or with PM2
-pnpm daemon:start
-pnpm daemon:logs
-```
-
-## Project Structure
-
-```
-src/
-  cli.ts                    # CLI entry point (setup/start/stop/restart/logs/list/delete)
-  daemon.ts                 # Daemon orchestrator (~400 lines, wires modules together)
-  worker.ts                 # Worker process: uses adapters to manage CLI + PTY
-  bot-registry.ts           # Multi-bot registry (config loading, per-bot state)
-  config.ts                 # Configuration from environment variables
-  server.ts                 # MCP server setup
-  types.ts                  # IPC message types
-  adapters/
-    cli/
-      types.ts              # CliAdapter interface, CliId type
-      registry.ts           # Adapter factory + resolveCommand
-      claude-code.ts        # Claude Code adapter
-      aiden.ts              # Aiden adapter
-      coco.ts               # CoCo adapter
-      codex.ts              # Codex adapter
-    backend/
-      types.ts              # SessionBackend interface
-      pty-backend.ts        # node-pty backend
-      tmux-backend.ts       # tmux backend (pty-under-tmux, persistent sessions)
-  core/
-    types.ts                # DaemonSession core type
-    worker-pool.ts          # Worker process pool management
-    command-handler.ts      # Slash command processing
-    session-manager.ts      # Session lifecycle + path resolution
-    cost-calculator.ts      # Token usage & cost estimation
-    scheduler.ts            # Cron scheduling with natural language parsing
-  im/
-    types.ts                # ImAdapter interface definitions (multi-IM abstraction)
-    lark/
-      client.ts             # Lark API wrapper
-      event-dispatcher.ts   # Lark WebSocket event routing
-      card-handler.ts       # Lark card interaction handling
-      card-builder.ts       # Lark interactive card builders
-      message-parser.ts     # Lark event message parsing
-  tools/
-    index.ts                # MCP tool registry
-    send-to-thread.ts       # MCP tool: send message
-    get-thread-messages.ts  # MCP tool: read messages
-    react-to-message.ts     # MCP tool: emoji reactions
-  services/
-    session-store.ts        # Session persistence (JSON)
-    schedule-store.ts       # Scheduled task persistence
-    message-queue.ts        # Per-thread JSONL message queue
-    project-scanner.ts      # Git repo/worktree discovery
-  utils/
-    idle-detector.ts        # CLI idle detection (quiescence + spinner + completion marker)
-    terminal-renderer.ts    # Headless xterm renderer for screen capture & TUI filtering
-    logger.ts               # Logging utility
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
