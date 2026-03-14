@@ -34,6 +34,22 @@ pnpm daemon:logs          # 查看日志
 每个 bot 独立配置 `larkAppId`、`larkAppSecret`、`cliId`、`allowedUsers` 等。
 不配置 `bots.json` 时，回退到 `LARK_APP_ID` + `LARK_APP_SECRET` 环境变量（单 bot 模式，完全兼容）。
 
+## Git 提交 & 发版规范
+
+- **日常提交**：正常 `git commit` + `git push`，不会触发发版
+- **发版**：打 `v*` tag 并 push 即可，GitHub Action 自动从 tag 提取版本号写入 `package.json` 后发布 npm + 创建 GitHub Release
+- **不要**手动修改 `package.json` 的 `version` 字段来发版，CI 会自动处理
+- commit message 遵循 commitlint：`type(scope): message`
+
+```bash
+# 日常开发
+git add <files> && git commit -m "fix(cli): description" && git push
+
+# 发版（仅在用户明确要求时执行）
+git tag -a v1.x.x -m "release description"
+git push origin v1.x.x
+```
+
 ## 添加新 CLI 适配器
 
 1. 在 `src/adapters/cli/` 下创建新文件，实现 `CliAdapter` 接口
