@@ -12,6 +12,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { deleteMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentCliVersion } from './worker-pool.js';
@@ -22,7 +23,7 @@ import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/cost', '/schedule']);
+export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/cost', '/schedule']);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -167,6 +168,7 @@ export async function handleCommand(
   const t = ds ? tag(ds) : rootId.substring(0, 12);
 
   logger.info(`[${t}] Command: ${cmd}`);
+  logger.debug(`repo command`, message);
 
   try {
     switch (cmd) {
@@ -249,12 +251,68 @@ export async function handleCommand(
       }
 
       case '/repo': {
-        // If CLI is already running, warn user — switching repo means closing the session
+        const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
+        const repoIndex = repoArg ? parseInt(repoArg, 10) : NaN;
+
+        // /repo <N> — quick select from last scan
+        if (!isNaN(repoIndex) && ds) {
+          const cached = lastRepoScan.get(ds.chatId);
+          if (!cached || cached.length === 0) {
+            await sessionReply(rootId, '请先执行 /repo 查看项目列表。');
+            break;
+          }
+          if (repoIndex < 1 || repoIndex > cached.length) {
+            await sessionReply(rootId, `序号超出范围，有效范围：1-${cached.length}`);
+            break;
+          }
+          const project = cached[repoIndex - 1];
+          const selectedPath = project.path;
+          const displayName = `${project.name} (${project.branch})`;
+          ds.workingDir = selectedPath;
+          ds.session.workingDir = selectedPath;
+          sessionStore.updateSession(ds.session);
+
+          if (ds.pendingRepo) {
+            const botCfg = getBot(ds.larkAppId).config;
+            ds.pendingRepo = false;
+            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+            const prompt = buildNewTopicPrompt(
+              ds.pendingPrompt ?? '',
+              ds.session.sessionId,
+              botCfg.cliId,
+              botCfg.cliPathOverride,
+              ds.pendingAttachments,
+              ds.pendingMentions,
+              await getAvailableBots(ds.larkAppId, ds.chatId),
+            );
+            ds.pendingPrompt = undefined;
+            ds.pendingAttachments = undefined;
+            ds.pendingMentions = undefined;
+            forkWorker(ds, prompt);
+            await sessionReply(rootId, `✅ 已选择 ${displayName}`);
+          } else {
+            killWorker(ds);
+            sessionStore.closeSession(ds.session.sessionId);
+            const session = sessionStore.createSession(ds.chatId, rootId, displayName, ds.chatType);
+            ds.session = session;
+            ds.hasHistory = false;
+            forkWorker(ds, '', false);
+            await sessionReply(rootId, `🔄 已切换到 ${displayName}`);
+          }
+          // Withdraw repo selection card
+          if (ds.repoCardMessageId) {
+            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
+            ds.repoCardMessageId = undefined;
+          }
+          logger.info(`[${t}] Repo selected via /repo ${repoIndex}: ${selectedPath}`);
+          break;
+        }
+
+        // /repo — show project list card
         if (ds?.worker && !ds.worker.killed) {
           await sessionReply(rootId, '⚠️ 当前会话已在运行中，切换仓库将关闭当前会话并创建新会话。\n如需切换，请在下方卡片中选择新仓库。');
         }
 
-        // Show project list card (works both for pending-repo and mid-session switch)
         const scanDirs = getProjectScanDirs(ds);
         const validDirs = scanDirs.filter(d => existsSync(d));
         if (validDirs.length === 0) {
@@ -269,8 +327,40 @@ export async function handleCommand(
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
         const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
-        await sessionReply(rootId, cardJson, 'interactive');
+        const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
+        if (ds) ds.repoCardMessageId = repoCardMsgId;
         logger.info(`[${t}] Sent repo card with ${projects.length} project(s)`);
+        break;
+      }
+
+      case '/skip': {
+        if (ds?.pendingRepo) {
+          const botCfg = getBot(ds.larkAppId).config;
+          ds.pendingRepo = false;
+          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+          const prompt = buildNewTopicPrompt(
+            ds.pendingPrompt ?? '',
+            ds.session.sessionId,
+            botCfg.cliId,
+            botCfg.cliPathOverride,
+            ds.pendingAttachments,
+            ds.pendingMentions,
+            await getAvailableBots(ds.larkAppId, ds.chatId),
+          );
+          ds.pendingPrompt = undefined;
+          ds.pendingAttachments = undefined;
+          ds.pendingMentions = undefined;
+          forkWorker(ds, prompt);
+          const cwd = getSessionWorkingDir(ds);
+          await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
+          if (ds.repoCardMessageId) {
+            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
+            ds.repoCardMessageId = undefined;
+          }
+          logger.info(`[${t}] Skip repo via /skip, spawning CLI in ${cwd}`);
+        } else {
+          await sessionReply(rootId, '当前没有待选择的仓库。');
+        }
         break;
       }
 

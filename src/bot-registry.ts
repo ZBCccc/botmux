@@ -20,6 +20,7 @@ export interface BotState {
   config: BotConfig;
   client: Lark.Client;
   botOpenId?: string;
+  botName?: string;       // Lark app display name (from /bot/v3/info)
   resolvedAllowedUsers: string[];
 }
 

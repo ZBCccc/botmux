@@ -7,14 +7,10 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getAllBots } from '../../bot-registry.js';
-import { getChatInfo, replyMessage } from './client.js';
+import { getChatInfo, listChatBotMembers, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
-
-export function getBotOpenId(larkAppId: string): string | undefined {
-  return getBot(larkAppId).botOpenId;
-}
 
 /** Set the bot's open_id. Callers should also call writeBotInfoFile() to persist. */
 export function setBotOpenId(larkAppId: string, id: string): void {
@@ -27,6 +23,7 @@ export function writeBotInfoFile(dataDir: string): void {
   const info = bots.map(b => ({
     larkAppId: b.config.larkAppId,
     botOpenId: b.botOpenId ?? null,
+    botName: b.botName ?? null,
     cliId: b.config.cliId,
   }));
   const filePath = join(dataDir, 'bots-info.json');
@@ -61,8 +58,10 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   }
 
   const openId = botData.bot?.open_id;
+  const appName = botData.bot?.app_name;
   if (openId) {
     bot.botOpenId = openId;
+    if (appName) bot.botName = appName;
     logger.info(`Bot open_id: ${bot.botOpenId}`);
   } else {
     throw new Error('No open_id in bot info response');
@@ -87,6 +86,24 @@ export async function getGroupUserCount(larkAppId: string, chatId: string): Prom
   } catch (err) {
     logger.debug(`Failed to get chat user count for ${chatId}: ${err}`);
     return cached?.count ?? 999; // fallback: assume multi-person
+  }
+}
+
+const chatBotCountCache = new Map<string, { count: number; fetchedAt: number }>();
+
+export async function getGroupBotCount(larkAppId: string, chatId: string): Promise<number> {
+  const cacheKey = `${larkAppId}:${chatId}`;
+  const cached = chatBotCountCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
+    return cached.count;
+  }
+  try {
+    const bots = await listChatBotMembers(larkAppId, chatId);
+    chatBotCountCache.set(cacheKey, { count: bots.length, fetchedAt: Date.now() });
+    return bots.length;
+  } catch (err) {
+    logger.warn(`Failed to get chat bot count for ${chatId}: ${err}`);
+    return cached?.count ?? 999; // fallback: assume multiple bots → require @mention
   }
 }
 
@@ -139,17 +156,22 @@ export async function checkGroupMessageAccess(
   const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
   const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
 
+  logger.debug(`Check group message access: ${mentioned}, ${isAllowed}`);
   if (mentioned) {
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
   // No @mention — only allow if sender is the sole human in the group
-  // AND there's only 1 bot registered. With multiple bots, require @mention
-  // to disambiguate (Lark user_count excludes bots, so userCount=1 even in
-  // a group with 1 user + N bots).
-  if (isAllowed && getAllBots().length <= 1) {
-    const userCount = await getGroupUserCount(larkAppId, chatId);
-    if (userCount <= 1) {
+  // AND this is the only bot in the chat. With multiple bots, require @mention
+  // to disambiguate.
+  // Note: Lark user_count excludes bots. botCount from isInChat includes self.
+  if (isAllowed) {
+    const [userCount, botCount] = await Promise.all([
+      getGroupUserCount(larkAppId, chatId),
+      getGroupBotCount(larkAppId, chatId),
+    ]);
+    logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
+    if (userCount <= 1 && botCount <= 1) {
       return 'allowed';
     }
   }
@@ -171,7 +193,7 @@ export interface EventHandlers {
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
  */
-export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers, dataDir?: string): Lark.WSClient {
+export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers): Lark.WSClient {
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     'card.action.trigger': async (data: any) => {
       try {
@@ -190,44 +212,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const sender = data.sender;
         if (!message) return;
 
-        // Bot-originated messages
-        if (sender?.sender_type === 'app') {
-          const senderOpenId = sender.sender_id?.open_id;
-          const myOpenId = getBotOpenId(larkAppId);
-
-          // Learn own open_id from outgoing messages
-          if (!myOpenId && senderOpenId) {
-            setBotOpenId(larkAppId, senderOpenId);
-            if (dataDir) writeBotInfoFile(dataDir);
-            logger.info(`Learned bot open_id from message event: ${getBotOpenId(larkAppId)}`);
-          }
-
-          const rootId = message.root_id;
-          if (!rootId) return;
-
-          // Check if this is our own message vs another bot's message
-          const isSelfMessage = senderOpenId === getBotOpenId(larkAppId);
-
-          if (isSelfMessage) {
-            // Own messages: only process /close commands
-            try {
-              const body = JSON.parse(message.content ?? '{}');
-              if (body.text?.trim() !== '/close') return;
-            } catch {
-              return;
-            }
-            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling message event: ${err}`));
-            return;
-          }
-
-          // Message from another bot: check if it @mentions this bot
-          const mentioned = isBotMentioned(larkAppId, message, undefined);
-          if (mentioned) {
-            logger.info(`Bot-to-bot @mention detected: routing to handleThreadReply`);
-            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling bot @mention: ${err}`));
-          }
-          return;
-        }
+        // Bot-originated messages: WSClient does not deliver these, skip.
+        // Bot-to-bot communication is handled via signal files (processBotMentionSignal).
+        if (sender?.sender_type === 'app') return;
 
         const rootId = message.root_id;
         const chatId = message.chat_id;
@@ -237,9 +224,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
         const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
 
+        console.log('Received message:', message);
         // Group new topics (no rootId): check @mention + permissions
         if (chatType === 'group' && !rootId) {
           const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
+          console.log('Group message access check:', access);
           if (access === 'not_allowed') {
             replyMessage(larkAppId, messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
               .catch(err => logger.debug(`Failed to send permission denied: ${err}`));

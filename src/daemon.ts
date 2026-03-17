@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { config } from './config.js';
@@ -35,6 +35,7 @@ import {
   downloadResources,
   formatAttachmentsHint,
   buildNewTopicPrompt,
+  getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
 } from './core/session-manager.js';
@@ -147,16 +148,6 @@ function getActiveCount(): number {
   return count;
 }
 
-/** Get available bots for prompt injection (excludes current bot). */
-function getAvailableBots(currentAppId: string): Array<{ name: string; openId: string; cliId: string }> {
-  return getAllBots()
-    .filter(b => b.botOpenId && b.config.larkAppId !== currentAppId)
-    .map(b => ({
-      name: getCliDisplayName(b.config.cliId),
-      openId: b.botOpenId!,
-      cliId: b.config.cliId,
-    }));
-}
 
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
@@ -180,7 +171,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   const content = parsed.content.trim();
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const botCfg = getBot(larkAppId).config;
-  logger.info(`New topic: ${messageId} "${content.substring(0, 60)}" (resources: ${resources.length}, active: ${getActiveCount()})`);
+  logger.info(`New topic: "${content.substring(0, 60)}" (resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId}`);
 
   // Intercept daemon commands in new topics (no session needed for some commands)
   if (content.startsWith('/')) {
@@ -238,6 +229,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     pendingRepo: true,
     pendingPrompt: content,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
+    pendingMentions: parsed.mentions,
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
   };
@@ -253,12 +245,12 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     lastRepoScan.set(chatId, projects);
     const currentCwd = getSessionWorkingDir(ds);
     const cardJson = buildRepoSelectCard(projects, currentCwd, messageId);
-    await sessionReply(messageId, cardJson, 'interactive', larkAppId);
+    ds.repoCardMessageId = await sessionReply(messageId, cardJson, 'interactive', larkAppId);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
-    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, getAvailableBots(larkAppId));
+    const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId));
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -343,6 +335,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       pendingRepo: true,
       pendingPrompt: parsed.content,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
+      pendingMentions: parsed.mentions,
       ownerOpenId: data.sender?.sender_id?.open_id,
       currentTurnTitle: parsed.content.substring(0, 50),
     };
@@ -358,12 +351,12 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       lastRepoScan.set(chatId, projects);
       const currentCwd = getSessionWorkingDir(newDs);
       const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
-      await sessionReply(rootId, cardJson, 'interactive', larkAppId);
+      newDs.repoCardMessageId = await sessionReply(rootId, cardJson, 'interactive', larkAppId);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, getAvailableBots(larkAppId));
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId));
       forkWorker(newDs, prompt);
     }
 
@@ -407,6 +400,86 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     forkWorker(ds, parsed.content, ds.hasHistory);
   }
+}
+
+// ─── Bot-to-bot mention routing ───────────────────────────────────────────────
+
+interface BotMentionSignal {
+  rootMessageId: string;
+  chatId: string;
+  chatType?: string;
+  senderAppId: string;
+  targetBotOpenId: string;
+  content: string;
+  messageId: string;
+  timestamp: number;
+}
+
+function processBotMentionSignal(signal: BotMentionSignal): void {
+  // Find the target bot by open_id
+  const targetBot = getAllBots().find(b => b.botOpenId === signal.targetBotOpenId);
+  if (!targetBot) {
+    logger.debug(`[bot-mention] No bot found for open_id ${signal.targetBotOpenId}`);
+    return;
+  }
+
+  const targetAppId = targetBot.config.larkAppId;
+  const ds = activeSessions.get(sessionKey(signal.rootMessageId, targetAppId));
+
+  if (ds && ds.worker && !ds.worker.killed) {
+    // Target bot has an active session in this thread — send the message
+    const senderBot = getAllBots().find(b => b.config.larkAppId === signal.senderAppId);
+    const senderName = senderBot?.botName ?? (senderBot ? getCliDisplayName(senderBot.config.cliId) : 'Bot');
+    const enrichedContent = `[来自 ${senderName} 的 @mention]\n${signal.content}`;
+    ds.lastMessageAt = Date.now();
+    ds.streamCardPending = true;
+    ds.currentTurnTitle = signal.content.substring(0, 50);
+    ds.worker.send({ type: 'message', content: enrichedContent } as DaemonToWorker);
+    logger.info(`[bot-mention] Routed message from ${signal.senderAppId} to ${targetAppId} in thread ${signal.rootMessageId}`);
+  } else {
+    logger.debug(`[bot-mention] Target bot ${targetAppId} has no active worker for thread ${signal.rootMessageId}`);
+  }
+}
+
+function startBotMentionWatcher(): void {
+  const signalDir = join(config.session.dataDir, 'bot-mentions');
+  if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
+
+  // Process any existing signal files (from before daemon started)
+  try {
+    for (const file of readdirSync(signalDir)) {
+      if (!file.endsWith('.json')) continue;
+      const filePath = join(signalDir, file);
+      try {
+        const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
+        unlinkSync(filePath);
+        processBotMentionSignal(signal);
+      } catch (err) {
+        logger.debug(`[bot-mention] Failed to process signal ${file}: ${err}`);
+        try { unlinkSync(join(signalDir, file)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // Watch for new signal files
+  watch(signalDir, (event, filename) => {
+    if (event !== 'rename' || !filename?.endsWith('.json')) return;
+    const filePath = join(signalDir, filename);
+    // Small delay to ensure the file is fully written
+    setTimeout(() => {
+      try {
+        if (!existsSync(filePath)) return; // already processed or deleted
+        const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
+        unlinkSync(filePath);
+        processBotMentionSignal(signal);
+      } catch (err) {
+        logger.debug(`[bot-mention] Failed to process signal ${filename}: ${err}`);
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    }, 50);
+  });
+
+  logger.info(`[bot-mention] Watching for signals in ${signalDir}`);
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -474,7 +547,7 @@ export async function startDaemon(): Promise<void> {
         }
         return true;
       },
-    }, config.session.dataDir);
+    });
   }
 
   // Restore active sessions from previous run
@@ -483,6 +556,11 @@ export async function startDaemon(): Promise<void> {
   // Start scheduled task scheduler
   scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
   scheduler.startScheduler();
+
+  // Watch for bot-to-bot mention signals from MCP send_to_thread tool.
+  // Lark WSClient does not deliver events for bot-sent messages, so the MCP
+  // tool writes signal files that the daemon picks up and routes internally.
+  startBotMentionWatcher();
 
   // Graceful shutdown
   const shutdown = () => {

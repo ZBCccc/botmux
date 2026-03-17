@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { replyMessage } from '../im/lark/client.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -90,6 +92,41 @@ export async function execute(args: z.infer<typeof schema>) {
     const replyInThread = session.chatType === 'p2p';
     const appId = session.larkAppId || config.lark.appId;
     const messageId = await replyMessage(appId, session.rootMessageId, content, 'post', replyInThread);
+
+    // Write signal files for bot-to-bot mentions.
+    // Lark WSClient does not deliver im.message.receive_v1 events for bot-sent messages,
+    // so the daemon uses these signal files to route messages to target bots internally.
+    if (args.mentions && args.mentions.length > 0) {
+      const botInfoPath = join(config.session.dataDir, 'bots-info.json');
+      let botOpenIds = new Set<string>();
+      try {
+        if (existsSync(botInfoPath)) {
+          const entries: Array<{ botOpenId: string | null }> = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
+          botOpenIds = new Set(entries.filter(e => e.botOpenId).map(e => e.botOpenId!));
+        }
+      } catch { /* ignore */ }
+
+      const signalDir = join(config.session.dataDir, 'bot-mentions');
+      if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
+
+      for (const m of args.mentions) {
+        if (botOpenIds.has(m.open_id)) {
+          const signal = {
+            rootMessageId: session.rootMessageId,
+            chatId: session.chatId,
+            chatType: session.chatType,
+            senderAppId: appId,
+            targetBotOpenId: m.open_id,
+            content: text,
+            messageId,
+            timestamp: Date.now(),
+          };
+          const filename = `${Date.now()}-${m.open_id.slice(-8)}.json`;
+          writeFileSync(join(signalDir, filename), JSON.stringify(signal));
+          logger.info(`Wrote bot-mention signal for ${m.open_id} in thread ${session.rootMessageId}`);
+        }
+      }
+    }
 
     return {
       success: true,

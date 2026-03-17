@@ -1,6 +1,6 @@
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { getBotClient } from '../../bot-registry.js';
+import { getBotClient, getAllBots } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 
 // ─── Error types ──────────────────────────────────────────────────────────────
@@ -133,6 +133,15 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
   }
   // user_count excludes bots, only real users
   return { userCount: Number(res.data?.user_count ?? 0) };
+}
+
+export async function deleteMessage(larkAppId: string, messageId: string): Promise<void> {
+  const c = getBotClient(larkAppId);
+  try {
+    await c.im.v1.message.delete({ path: { message_id: messageId } });
+  } catch (err) {
+    logger.debug(`Failed to delete message ${messageId}: ${err}`);
+  }
 }
 
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
@@ -280,38 +289,26 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
 }
 
 /**
- * List bot members of a chat. Returns array of { openId, name }.
+ * Check which registered bots are in a chat.
+ * Uses isInChat API per bot (chatMembers.get doesn't return bot members).
+ * Each bot's own client calls isInChat to check its presence.
  */
-export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
-  const c = getBotClient(larkAppId);
-  const bots: Array<{ openId: string; name: string }> = [];
-  let pageToken: string | undefined;
-
-  do {
-    const res = await (c as any).im.v1.chatMembers.list({
-      path: { chat_id: chatId },
-      params: {
-        member_id_type: 'open_id',
-        page_size: 100,
-        ...(pageToken ? { page_token: pageToken } : {}),
-      },
-    });
-
-    if (res.code !== 0) {
-      throw new Error(`Failed to list chat members: ${res.msg} (code: ${res.code})`);
-    }
-
-    for (const member of res.data?.items ?? []) {
-      if (member.member_type === 'bot') {
-        bots.push({
-          openId: member.member_id ?? '',
-          name: member.name ?? '',
+export async function listChatBotMembers(_larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
+  const allBots = getAllBots();
+  const results = await Promise.all(
+    allBots.map(async (bot) => {
+      try {
+        const res = await (bot.client as any).im.v1.chatMembers.isInChat({
+          path: { chat_id: chatId },
         });
+        if (res.code === 0 && res.data?.is_in_chat) {
+          return { openId: bot.botOpenId!, name: bot.botName ?? bot.config.cliId };
+        }
+      } catch (err) {
+        logger.debug(`isInChat check failed for ${bot.config.larkAppId}: ${err}`);
       }
-    }
-
-    pageToken = res.data?.page_token;
-  } while (pageToken);
-
-  return bots;
+      return null;
+    }),
+  );
+  return results.filter((r): r is { openId: string; name: string } => r !== null && !!r.openId);
 }

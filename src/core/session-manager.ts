@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
-import { downloadMessageResource } from '../im/lark/client.js';
+import { downloadMessageResource, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, killStalePids, getCurrentCliVersion } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -103,6 +103,37 @@ export async function downloadResources(larkAppId: string, messageId: string, re
 
 // ─── Prompts ─────────────────────────────────────────────────────────────────
 
+/** Get bots actually present in the chat (excludes current bot).
+ *  Calls Lark OpenAPI to list chat members, then cross-references with
+ *  registered bots to enrich with cliId. Falls back to empty on API error. */
+export async function getAvailableBots(
+  currentAppId: string,
+  chatId: string,
+): Promise<Array<{ name: string; openId: string; cliId?: string }>> {
+  try {
+    const currentBot = getBot(currentAppId);
+    const myOpenId = currentBot.botOpenId;
+    const chatBots = await listChatBotMembers(currentAppId, chatId);
+
+    // Build a lookup from openId → registered bot for cliId enrichment
+    const registeredByOpenId = new Map<string, string>();
+    for (const b of getAllBots()) {
+      if (b.botOpenId) registeredByOpenId.set(b.botOpenId, b.config.cliId);
+    }
+
+    return chatBots
+      .filter(b => b.openId !== myOpenId)
+      .map(b => ({
+        name: b.name,
+        openId: b.openId,
+        cliId: registeredByOpenId.get(b.openId),
+      }));
+  } catch (err) {
+    logger.warn(`Failed to list chat bot members, skipping bot section: ${err}`);
+    return [];
+  }
+}
+
 export function formatAttachmentsHint(attachments?: LarkAttachment[]): string {
   if (!attachments || attachments.length === 0) return '';
   const lines = attachments.map(a => `- ${a.path}`);
@@ -116,7 +147,7 @@ export function buildNewTopicPrompt(
   cliPathOverride?: string,
   attachments?: LarkAttachment[],
   mentions?: LarkMention[],
-  availableBots?: Array<{ name: string; openId: string; cliId: string }>,
+  availableBots?: Array<{ name: string; openId: string; cliId?: string }>,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
@@ -140,9 +171,10 @@ export function buildNewTopicPrompt(
   // Available bots section
   let botSection = '';
   if (availableBots && availableBots.length > 0) {
-    const botLines = availableBots.map(b =>
-      `- ${b.name} (open_id: ${b.openId}, CLI: ${b.cliId})`
-    );
+    const botLines = availableBots.map(b => {
+      const cli = b.cliId ? `, CLI: ${b.cliId}` : '';
+      return `- ${b.name} (open_id: ${b.openId}${cli})`;
+    });
     botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 send_to_thread 的 mentions 参数 @mention 它们协作，也可用 list_bots 工具查询。`;
   }
 

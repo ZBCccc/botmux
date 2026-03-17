@@ -5,12 +5,12 @@
  */
 import { config } from '../../config.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
-import { sendUserMessage, updateMessage } from './client.js';
+import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { forkWorker, killWorker, scheduleCardPatch } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicPrompt } from '../../core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots } from '../../core/session-manager.js';
 import type { DaemonToWorker } from '../../types.js';
 import { sessionKey } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -24,6 +24,16 @@ export interface CardHandlerDeps {
   lastRepoScan: Map<string, ProjectInfo[]>;
 }
 
+interface CardActionData {
+  operator?: { open_id?: string };
+  action?: {
+    value?: Record<string, string>;
+    option?: string;
+  };
+  context?: { open_message_id?: string };
+  open_message_id?: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 function tag(ds: DaemonSession): string {
@@ -32,17 +42,18 @@ function tag(ds: DaemonSession): string {
 
 // ─── Main handler ─────────────────────────────────────────────────────────
 
-export async function handleCardAction(data: any, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
+export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const { activeSessions, lastRepoScan } = deps;
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const action = data?.action;
   const value = action?.value;
+  const cardMessageId = data?.context?.open_message_id ?? data?.open_message_id;
 
   // Check ALLOWED_USERS for sensitive actions.
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
-  const operatorOpenId: string | undefined = data?.operator?.open_id;
+  const operatorOpenId = data?.operator?.open_id;
   const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
@@ -152,23 +163,33 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
       }
     }
 
-    if (actionType === 'skip_repo' && ds && ds.pendingRepo) {
-      const botCfg = getBot(ds.larkAppId).config;
-      // Skip repo selection — spawn CLI with default working dir
-      ds.pendingRepo = false;
-      const prompt = buildNewTopicPrompt(
-        ds.pendingPrompt ?? '',
-        ds.session.sessionId,
-        botCfg.cliId,
-        botCfg.cliPathOverride,
-        ds.pendingAttachments,
-      );
-      ds.pendingPrompt = undefined;
-      ds.pendingAttachments = undefined;
-      forkWorker(ds, prompt);
-      const cwd = getSessionWorkingDir(ds);
-      await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
-      logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
+    if (actionType === 'skip_repo' && ds) {
+      if (ds.pendingRepo) {
+        const botCfg = getBot(ds.larkAppId).config;
+        // Skip repo selection — spawn CLI with default working dir
+        ds.pendingRepo = false;
+        const prompt = buildNewTopicPrompt(
+          ds.pendingPrompt ?? '',
+          ds.session.sessionId,
+          botCfg.cliId,
+          botCfg.cliPathOverride,
+          ds.pendingAttachments,
+          ds.pendingMentions,
+          await getAvailableBots(ds.larkAppId, ds.chatId),
+        );
+        ds.pendingPrompt = undefined;
+        ds.pendingAttachments = undefined;
+        ds.pendingMentions = undefined;
+        forkWorker(ds, prompt);
+        const cwd = getSessionWorkingDir(ds);
+        await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
+        logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
+      } else {
+        // Mid-session: user cancelled repo switch
+        await sessionReply(rootId, `继续使用当前仓库：${getSessionWorkingDir(ds)}`);
+      }
+      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+      ds.repoCardMessageId = undefined;
     }
     return;
   }
@@ -214,9 +235,12 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
       botCfg.cliId,
       botCfg.cliPathOverride,
       targetDs.pendingAttachments,
+      targetDs.pendingMentions,
+      await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
     );
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
+    targetDs.pendingMentions = undefined;
     forkWorker(targetDs, prompt);
     await sessionReply(rootId, `✅ 已选择 ${displayName}`);
     logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);
@@ -228,7 +252,11 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
     targetDs.session = session;
     targetDs.hasHistory = false;
     forkWorker(targetDs, '', false);
-    await sessionReply(rootId, `🔄 已切换到 ${displayName}\n旧会话已关闭，新会话已创建。`);
+    await sessionReply(rootId, `🔄 已切换到 ${displayName}`);
     logger.info(`[${tag(targetDs)}] Repo switched to ${selectedPath}, new session created`);
   }
+
+  // Withdraw the repo selection card
+  if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+  targetDs.repoCardMessageId = undefined;
 }
