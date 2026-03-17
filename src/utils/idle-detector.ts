@@ -42,8 +42,9 @@ export class IdleDetector {
       }
     }
 
-    // Track spinner — but not if it's part of completion marker
-    if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(this.outputTail))) {
+    // Track spinner — but not if it's part of completion marker,
+    // and not after ready pattern is seen (status bar chars like · are not real spinners)
+    if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(this.outputTail)) && !this.readySeen) {
       this.lastSpinnerAt = Date.now();
     }
 
