@@ -48,7 +48,7 @@ npm install -g botmux
 ## 快速开始
 
 ```bash
-# 1. 交互式配置 — 创建 ~/.botmux/.env
+# 1. 交互式配置 — 创建 ~/.botmux/bots.json
 botmux setup
 
 # 2. 启动 daemon

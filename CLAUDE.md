@@ -50,4 +50,4 @@ git push origin v1.x.x
 4. `src/worker.ts` 的 `CLI_DISPLAY_NAMES` 添加显示名
 5. `src/im/lark/card-builder.ts` 的 `cliDisplayNames` 添加显示名
 6. `src/cli.ts` 的 setup 交互菜单添加选项
-7. `.env.example`、`README.md`、`README.en.md` 更新 CLI 列表
+7. `README.md`、`README.en.md` 更新 CLI 列表

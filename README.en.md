@@ -48,7 +48,7 @@ npm install -g botmux
 ## Quick Start
 
 ```bash
-# 1. Interactive setup — creates ~/.botmux/.env
+# 1. Interactive setup — creates ~/.botmux/bots.json
 botmux setup
 
 # 2. Start the daemon

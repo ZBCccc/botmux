@@ -72,7 +72,6 @@ function ecosystemConfig(): string {
       merge_logs: true,
       env: {
         SESSION_DATA_DIR: DATA_DIR,
-        // .env is loaded by dotenv from CWD (CONFIG_DIR)
       },
     }],
   };
@@ -148,8 +147,8 @@ function parseDotEnvToBotConfig(): Record<string, any> {
   return bot;
 }
 
-/** Write single-bot .env config (fresh install or reconfigure) */
-async function writeSingleBotEnv(): Promise<void> {
+/** Write single-bot config to bots.json (fresh install or reconfigure) */
+async function writeSingleBotConfig(): Promise<void> {
   console.log('── 飞书应用配置 ──\n');
   printLarkPermissions();
 
@@ -157,23 +156,8 @@ async function writeSingleBotEnv(): Promise<void> {
   const bot = await promptBotConfig(rl);
   rl.close();
 
-  const lines: string[] = [
-    '# Lark (Feishu) App Credentials',
-    `LARK_APP_ID=${bot.larkAppId}`,
-    `LARK_APP_SECRET=${bot.larkAppSecret}`,
-    '',
-    '# Session data directory',
-    `SESSION_DATA_DIR=${DATA_DIR}`,
-    '',
-    '# Daemon settings',
-    `CLI_ID=${bot.cliId}`,
-    `WORKING_DIR=${bot.workingDir || '~'}`,
-  ];
-
-  if (bot.allowedUsers?.length) lines.push(`ALLOWED_USERS=${bot.allowedUsers.join(',')}`);
-
-  writeFileSync(ENV_FILE, lines.join('\n') + '\n');
-  console.log(`\n✅ 配置已写入: ${ENV_FILE}`);
+  writeFileSync(BOTS_JSON_FILE, JSON.stringify([bot], null, 2) + '\n');
+  console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
   console.log(`\n下一步: botmux start`);
 }
 
@@ -202,10 +186,15 @@ async function cmdSetup(): Promise<void> {
     const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  (1/2) [1]: ');
 
     if (action === '2') {
-      rl.close();
       renameSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak\n`);
-      await writeSingleBotEnv();
+      console.log('\n── 重新配置 ──\n');
+      printLarkPermissions();
+      const newBot = await promptBotConfig(rl);
+      rl.close();
+      writeFileSync(BOTS_JSON_FILE, JSON.stringify([newBot], null, 2) + '\n');
+      console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
+      console.log(`\n下一步: botmux restart`);
       return;
     }
 
@@ -227,7 +216,9 @@ async function cmdSetup(): Promise<void> {
 
     if (action === '2') {
       rl.close();
-      await writeSingleBotEnv();
+      await writeSingleBotConfig();
+      renameSync(ENV_FILE, ENV_FILE + '.bak');
+      console.log(`   旧 .env 已备份: ${ENV_FILE}.bak`);
       return;
     }
 
@@ -236,7 +227,7 @@ async function cmdSetup(): Promise<void> {
     if (!existingBot.larkAppId || !existingBot.larkAppSecret) {
       console.log('\n⚠️  当前 .env 缺少 LARK_APP_ID 或 LARK_APP_SECRET，请先完成基础配置');
       rl.close();
-      await writeSingleBotEnv();
+      await writeSingleBotConfig();
       return;
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
@@ -255,7 +246,7 @@ async function cmdSetup(): Promise<void> {
 
   } else {
     // --- Fresh install ---
-    await writeSingleBotEnv();
+    await writeSingleBotConfig();
   }
 }
 

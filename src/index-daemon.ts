@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 
-// Load .env BEFORE any other module reads process.env
-// Try ~/.botmux/.env first (npm global install), then CWD/.env (dev)
+// Legacy: load .env for global settings (WEB_HOST, WEB_EXTERNAL_HOST, etc.)
+// Bot config now lives in bots.json; this is kept for backward compatibility.
 const globalEnv = join(homedir(), '.botmux', '.env');
 dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 
