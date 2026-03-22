@@ -54,7 +54,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
-| Installation | `npm install -g botmux`, 5-min setup | Clone repo, build, deploy full web service |
+| Installation | `npm install -g botmux`, 5-min Lark setup | Easy to install, but more configuration needed |
 
 ---
 
