@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerBot, loadBotConfigs, getAllBots } from './bot-registry.js';
+import * as sessionStore from './services/session-store.js';
 import { tools } from './tools/index.js';
 import { logger } from './utils/logger.js';
 
@@ -15,6 +16,13 @@ export function createServer(): McpServer {
     logger.info(`MCP server registered ${configs.length} bot(s)`);
   } catch (err: any) {
     logger.warn(`MCP server: no bot configs found (${err.message}). Tools will fail at runtime.`);
+  }
+
+  // Scope session store to the owning bot's per-bot file (sessions-{appId}.json).
+  // LARK_APP_ID is inherited from the worker process env.
+  const appId = process.env.LARK_APP_ID;
+  if (appId) {
+    sessionStore.init(appId);
   }
 
   const server = new McpServer({

@@ -16,7 +16,7 @@
  *   botmux delete all     — close all active sessions
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -56,25 +56,36 @@ function runPm2(args: string[], inherit = true): void {
     : execSync(`${pm2Bin()} ${args.join(' ')}`, { env: process.env });
 }
 
+function loadBotsJson(): any[] {
+  if (existsSync(BOTS_JSON_FILE)) {
+    try { return JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8')); } catch { return []; }
+  }
+  return [];
+}
+
 function ecosystemConfig(): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
-  const cfg = {
-    apps: [{
-      name: PM2_NAME,
-      script: daemonScript,
-      cwd: CONFIG_DIR,
-      autorestart: true,
-      max_restarts: 10,
-      restart_delay: 3000,
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-      error_file: join(LOG_DIR, 'daemon-error.log'),
-      out_file: join(LOG_DIR, 'daemon-out.log'),
-      merge_logs: true,
-      env: {
-        SESSION_DATA_DIR: DATA_DIR,
-      },
-    }],
+  const bots = loadBotsJson();
+
+  const baseApp = {
+    script: daemonScript,
+    cwd: CONFIG_DIR,
+    autorestart: true,
+    max_restarts: 10,
+    restart_delay: 3000,
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    merge_logs: true,
   };
+
+  const apps = bots.map((_bot: any, i: number) => ({
+    ...baseApp,
+    name: `${PM2_NAME}-${i}`,
+    error_file: join(LOG_DIR, `daemon-${i}-error.log`),
+    out_file: join(LOG_DIR, `daemon-${i}-out.log`),
+    env: { SESSION_DATA_DIR: DATA_DIR, BOTMUX_BOT_INDEX: String(i) },
+  }));
+
+  const cfg = { apps };
   const tmpFile = join(CONFIG_DIR, 'ecosystem.config.json');
   writeFileSync(tmpFile, JSON.stringify(cfg, null, 2));
   return tmpFile;
@@ -259,17 +270,38 @@ function cmdStart(): void {
   ensureConfigDir();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
-  console.log(`\n✅ daemon 已启动`);
+  const bots = loadBotsJson();
+  const count = bots.length || 1;
+  console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
   console.log(`   日志: botmux logs`);
   console.log(`   状态: botmux status`);
 }
 
-function cmdStop(): void {
+/** Delete all pm2 processes matching botmux / botmux-* */
+function deleteAllBotmuxProcesses(): void {
   try {
-    runPm2(['stop', PM2_NAME]);
-  } catch {
-    console.log('daemon 未在运行。');
-  }
+    const output = execSync(`${pm2Bin()} jlist`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const apps = JSON.parse(output) as any[];
+    for (const app of apps) {
+      if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
+        try { execSync(`${pm2Bin()} delete ${app.name}`, { stdio: ['pipe', 'pipe', 'pipe'] }); } catch { /* */ }
+      }
+    }
+  } catch { /* pm2 not running or no apps */ }
+}
+
+function cmdStop(): void {
+  let stopped = false;
+  try {
+    const output = execSync(`${pm2Bin()} jlist`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const apps = JSON.parse(output) as any[];
+    for (const app of apps) {
+      if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
+        try { runPm2(['stop', app.name]); stopped = true; } catch { /* */ }
+      }
+    }
+  } catch { /* */ }
+  if (!stopped) console.log('daemon 未在运行。');
 }
 
 function cmdRestart(): void {
@@ -279,8 +311,8 @@ function cmdRestart(): void {
     process.exit(1);
   }
   ensureConfigDir();
-  // Delete and re-start to ensure ecosystem config (log paths, env) is up to date
-  try { runPm2(['delete', PM2_NAME], false); } catch { /* not running */ }
+  // Delete all botmux processes (handles both old single-process and new multi-process)
+  deleteAllBotmuxProcesses();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
 }
@@ -289,8 +321,23 @@ function cmdLogs(): void {
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
     : '50';
+
+  const bots = loadBotsJson();
+  // Support --bot <index> to filter specific bot logs
+  const botIdx = process.argv.includes('--bot')
+    ? process.argv[process.argv.indexOf('--bot') + 1]
+    : undefined;
+
+  let target: string;
+  if (botIdx !== undefined) {
+    target = `${PM2_NAME}-${botIdx}`;
+  } else {
+    // Show all botmux logs via pm2 regex match
+    target = `/^${PM2_NAME}/`;
+  }
+
   // Use spawn for streaming output
-  const child = spawn(pm2Bin(), ['logs', PM2_NAME, '--lines', lines], {
+  const child = spawn(pm2Bin(), ['logs', target, '--lines', lines], {
     stdio: 'inherit',
     env: process.env,
   });
@@ -341,37 +388,64 @@ function resolveDataDir(): string {
   if (existsSync(breadcrumb)) {
     try {
       const dir = readFileSync(breadcrumb, 'utf-8').trim();
-      if (dir && existsSync(join(dir, 'sessions.json'))) return dir;
+      if (dir && existsSync(dir)) {
+        // Check for any session file (legacy or per-bot)
+        if (existsSync(join(dir, 'sessions.json'))) return dir;
+        try {
+          const files = readdirSync(dir);
+          if (files.some(f => f.startsWith('sessions-') && f.endsWith('.json'))) return dir;
+        } catch { /* ignore */ }
+      }
     } catch { /* ignore */ }
   }
 
   return DATA_DIR;
 }
 
-function getSessionsFilePath(): string {
-  return join(resolveDataDir(), 'sessions.json');
-}
-
+/** Load sessions from all session files (legacy + per-bot). */
 function loadSessions(): Map<string, SessionData> {
-  const fp = getSessionsFilePath();
-  if (!existsSync(fp)) return new Map();
-  try {
-    const data = JSON.parse(readFileSync(fp, 'utf-8'));
-    return new Map(Object.entries(data));
-  } catch {
-    console.error(`❌ 无法读取会话文件: ${fp}`);
-    return new Map();
+  const dataDir = resolveDataDir();
+  const sessions = new Map<string, SessionData>();
+
+  // Read legacy sessions.json
+  const legacyFp = join(dataDir, 'sessions.json');
+  if (existsSync(legacyFp)) {
+    try {
+      const data = JSON.parse(readFileSync(legacyFp, 'utf-8'));
+      for (const [k, v] of Object.entries(data)) sessions.set(k, v as SessionData);
+    } catch { /* ignore */ }
   }
+
+  // Read per-bot session files (sessions-{appId}.json)
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (file.startsWith('sessions-') && file.endsWith('.json')) {
+        try {
+          const data = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+          for (const [k, v] of Object.entries(data)) sessions.set(k, v as SessionData);
+        } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  return sessions;
 }
 
-function saveSessions(sessions: Map<string, SessionData>): void {
-  const fp = getSessionsFilePath();
-  const tmpFp = fp + '.tmp';
-  const obj: Record<string, SessionData> = {};
-  for (const [k, v] of sessions) {
-    obj[k] = v;
+/** Save a single session back to its appropriate file based on larkAppId. */
+function saveSession(session: SessionData): void {
+  const dataDir = resolveDataDir();
+  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
+  const fp = join(dataDir, fileName);
+
+  // Read current file, update session, write back
+  let data: Record<string, SessionData> = {};
+  if (existsSync(fp)) {
+    try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
   }
-  writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
+  data[session.sessionId] = session;
+
+  const tmpFp = fp + '.tmp';
+  writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
   renameSync(tmpFp, fp);
 }
 
@@ -685,7 +759,6 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     function deleteSession(idx: number): void {
       const r = rows[idx];
       const s = r.session;
-      const sessions = loadSessions();
 
       // Kill CLI process
       if (s.pid && isProcessAlive(s.pid)) {
@@ -700,8 +773,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       // Mark closed & persist
       s.status = 'closed';
       s.closedAt = new Date().toISOString();
-      sessions.set(s.sessionId, s);
-      saveSessions(sessions);
+      saveSession(s);
 
       // Remove from active list and TUI rows
       const activeIdx = active.indexOf(s);
@@ -858,11 +930,9 @@ function cmdDelete(): void {
     // Mark session as closed
     s.status = 'closed';
     s.closedAt = new Date().toISOString();
-    sessions.set(s.sessionId, s);
+    saveSession(s);
     console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}`);
   }
-
-  saveSessions(sessions);
   console.log(`\n已关闭 ${toDelete.length} 个会话`);
 }
 
@@ -875,7 +945,7 @@ botmux — IM ↔ AI 编程 CLI 桥接
   start       启动 daemon
   stop        停止 daemon
   restart     重启 daemon（自动恢复活跃会话）
-  logs        查看 daemon 日志（--lines N）
+  logs        查看 daemon 日志（--lines N, --bot <index>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
   list        列出活跃会话（交互式选择并连接 tmux）

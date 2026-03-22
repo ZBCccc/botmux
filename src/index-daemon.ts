@@ -13,8 +13,12 @@ async function main() {
   // Dynamic import so config.ts reads env vars AFTER dotenv has loaded them
   const { startDaemon } = await import('./daemon.js');
   const { logger } = await import('./utils/logger.js');
-  logger.info('Starting botmux daemon...');
-  await startDaemon();
+
+  const botIndexStr = process.env.BOTMUX_BOT_INDEX;
+  const botIndex = botIndexStr !== undefined ? parseInt(botIndexStr, 10) : undefined;
+
+  logger.info(`Starting botmux daemon...${botIndex !== undefined ? ` (bot index: ${botIndex})` : ''}`);
+  await startDaemon(botIndex);
 }
 
 main().catch((err) => {

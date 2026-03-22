@@ -23,6 +23,7 @@ import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { IdleDetector } from './utils/idle-detector.js';
+import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -489,6 +490,8 @@ process.on('message', async (raw: unknown) => {
       lastInitConfig = msg;
       sessionId = msg.sessionId;
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
+      // Scope session store to this bot's per-bot file
+      if (msg.larkAppId) sessionStore.init(msg.larkAppId);
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}`);
 
       try {

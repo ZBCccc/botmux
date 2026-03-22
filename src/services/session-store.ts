@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -7,9 +7,22 @@ import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
+let currentAppId: string | undefined;
+
+/**
+ * Initialise session store for a specific bot (multi-daemon mode).
+ * When appId is set, sessions are stored in `sessions-{appId}.json`.
+ * When unset, uses the legacy `sessions.json`.
+ */
+export function init(appId?: string): void {
+  currentAppId = appId;
+  loaded = false;
+  sessions = new Map();
+}
 
 function getFilePath(): string {
-  return join(config.session.dataDir, 'sessions.json');
+  const fileName = currentAppId ? `sessions-${currentAppId}.json` : 'sessions.json';
+  return join(config.session.dataDir, fileName);
 }
 
 function ensureDir(): void {
@@ -31,6 +44,27 @@ function load(): void {
     } catch (err) {
       logger.error(`Failed to load sessions: ${err}`);
       sessions = new Map();
+    }
+  } else if (currentAppId) {
+    // Per-bot file doesn't exist — migrate matching sessions from legacy sessions.json
+    const legacyFp = join(config.session.dataDir, 'sessions.json');
+    if (existsSync(legacyFp)) {
+      try {
+        const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
+        sessions = new Map();
+        for (const [k, v] of Object.entries(data)) {
+          if (v.larkAppId === currentAppId) {
+            sessions.set(k, v);
+          }
+        }
+        if (sessions.size > 0) {
+          save();
+          logger.info(`Migrated ${sessions.size} sessions from sessions.json to ${fp}`);
+        }
+      } catch (err) {
+        logger.error(`Failed to migrate sessions from legacy file: ${err}`);
+        sessions = new Map();
+      }
     }
   }
   loaded = true;
@@ -67,7 +101,32 @@ export function createSession(chatId: string, rootMessageId: string, title: stri
 
 export function getSession(sessionId: string): Session | undefined {
   load();
-  return sessions.get(sessionId);
+  return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
+}
+
+/**
+ * Search all session files for a session not found in the current file.
+ *
+ * The MCP server is a global singleton (one config in ~/.claude.json shared
+ * by all CLI instances). It may be spawned from a non-botmux context where
+ * LARK_APP_ID is unavailable, so it can't scope to the right per-bot file.
+ * Scanning all files is safe here because MCP tools only read sessions.
+ */
+function findInOtherFiles(sessionId: string): Session | undefined {
+  const dataDir = config.session.dataDir;
+  const currentFp = getFilePath();
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (!file.startsWith('sessions') || !file.endsWith('.json')) continue;
+      const fp = join(dataDir, file);
+      if (fp === currentFp) continue;
+      try {
+        const data: Record<string, Session> = JSON.parse(readFileSync(fp, 'utf-8'));
+        if (data[sessionId]) return data[sessionId];
+      } catch { continue; }
+    }
+  } catch { /* ignore */ }
+  return undefined;
 }
 
 export function closeSession(sessionId: string): void {

@@ -73,7 +73,9 @@ async function sessionReply(rootId: string, content: string, msgType: string = '
 // ─── PID file ────────────────────────────────────────────────────────────────
 
 function getPidFile(): string {
-  return join(config.session.dataDir, 'daemon.pid');
+  const botIndex = process.env.BOTMUX_BOT_INDEX;
+  const name = botIndex !== undefined ? `daemon-${botIndex}.pid` : 'daemon.pid';
+  return join(config.session.dataDir, name);
 }
 
 function writePidFile(): void {
@@ -484,12 +486,17 @@ function startBotMentionWatcher(): void {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-export async function startDaemon(): Promise<void> {
-  // Load and register all bots
+export async function startDaemon(botIndex?: number): Promise<void> {
+  // Load the assigned bot (one daemon per bot)
   const botConfigs = loadBotConfigs();
-  for (const cfg of botConfigs) {
-    registerBot(cfg);
+  const idx = botIndex ?? 0;
+  if (idx < 0 || idx >= botConfigs.length) {
+    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
   }
+  const cfg = botConfigs[idx];
+  registerBot(cfg);
+  sessionStore.init(cfg.larkAppId);
+  logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
 
   writePidFile();
 
@@ -553,9 +560,11 @@ export async function startDaemon(): Promise<void> {
   // Restore active sessions from previous run
   restoreActiveSessions(activeSessions);
 
-  // Start scheduled task scheduler
-  scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
-  scheduler.startScheduler();
+  // Start scheduled task scheduler (only on bot 0 to avoid duplicates)
+  if (idx === 0) {
+    scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
+    scheduler.startScheduler();
+  }
 
   // Watch for bot-to-bot mention signals from MCP send_to_thread tool.
   // Lark WSClient does not deliver events for bot-sent messages, so the MCP
