@@ -454,12 +454,17 @@ export function killStalePids(activeSessions_: Session[]): void {
         TmuxBackend.killSession(name);
       }
     } else {
-      // Multi-bot or same CLI_ID: clean orphaned tmux sessions not in active set
+      // Clean orphaned tmux sessions that belong to THIS bot only.
+      // In multi-bot mode each daemon only knows its own sessions — we must
+      // not kill tmux sessions that belong to other bots' daemons.
       const activeNames = new Set(
         activeSessions_.map(s => TmuxBackend.sessionName(s.sessionId)),
       );
+      const ownedNames = new Set(
+        sessionStore.listSessions().map(s => TmuxBackend.sessionName(s.sessionId)),
+      );
       for (const name of TmuxBackend.listBotmuxSessions()) {
-        if (!activeNames.has(name)) {
+        if (ownedNames.has(name) && !activeNames.has(name)) {
           logger.info(`Killing orphaned tmux session: ${name}`);
           TmuxBackend.killSession(name);
         }
