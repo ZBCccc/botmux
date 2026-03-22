@@ -52,15 +52,20 @@ export function createServer(): McpServer {
     },
   );
 
-  // Register all tools
-  for (const [name, tool] of Object.entries(tools)) {
-    server.tool(name, tool.description, tool.schema.shape, async (args: any) => {
-      logger.info(`Tool called: ${name}`, args);
-      const result = await tool.execute(args);
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
-      };
-    });
+  // Only register tools inside botmux sessions. Outside botmux (no LARK_APP_ID),
+  // tools would fail anyway and just waste tool-description context tokens.
+  if (appId) {
+    for (const [name, tool] of Object.entries(tools)) {
+      server.tool(name, tool.description, tool.schema.shape, async (args: any) => {
+        logger.info(`Tool called: ${name}`, args);
+        const result = await tool.execute(args);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
+        };
+      });
+    }
+  } else {
+    logger.info('MCP server: no LARK_APP_ID — running as empty shell (no tools, no instructions)');
   }
 
   return server;
