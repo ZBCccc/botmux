@@ -238,6 +238,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
 
+  // Adopt mode flags — computed once, used in all buildStreamingCard calls
+  const isAdopt = !!ds.adoptedFrom;
+  const showTakeover = isAdopt && !!ds.adoptedFrom?.sessionId;
+
   worker.on('message', async (msg: WorkerToDaemon) => {
     switch (msg.type) {
       case 'ready': {
@@ -267,6 +271,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             botCfg.cliId,
             ds.streamExpanded,
             ds.streamCardNonce,
+            isAdopt,
+            showTakeover,
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
         } catch (err) {
@@ -335,6 +341,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             botCfg.cliId,
             ds.streamExpanded,
             ds.streamCardNonce,
+            isAdopt,
+            showTakeover,
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -364,6 +372,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             botCfg.cliId,
             ds.streamExpanded,
             ds.streamCardNonce,
+            isAdopt,
+            showTakeover,
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -384,6 +394,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
+              isAdopt, showTakeover,
             );
             scheduleCardPatch(ds, frozenCard);
           }

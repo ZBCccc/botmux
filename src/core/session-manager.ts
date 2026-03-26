@@ -211,6 +211,12 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
 
   for (const session of active) {
+    // Skip adopt sessions — they are ephemeral and should be re-created via /adopt
+    if (session.title?.startsWith('Adopt:')) {
+      logger.debug(`Skipping adopt session ${session.sessionId} (ephemeral)`);
+      sessionStore.closeSession(session.sessionId);
+      continue;
+    }
     messageQueue.ensureQueue(session.rootMessageId);
 
     const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
