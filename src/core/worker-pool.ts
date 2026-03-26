@@ -2,7 +2,7 @@
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
  */
-import { fork } from 'node:child_process';
+import { fork, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -220,7 +220,24 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   worker.send(initMsg);
   ds.initConfig = initMsg;
 
-  // Handle IPC messages from worker
+  // Use shared handler for IPC messages and exit
+  setupWorkerHandlers(ds, worker);
+
+  ds.worker = worker;
+  ds.spawnedAt = Date.now();
+  ds.cliVersion = currentCliVersion;
+  sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+  logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
+}
+
+// ─── Shared worker IPC handler ──────────────────────────────────────────────
+
+function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
+  const cb = requireCallbacks();
+  const t = tag(ds);
+  const bot = getBot(ds.larkAppId);
+  const botCfg = bot.config;
+
   worker.on('message', async (msg: WorkerToDaemon) => {
     switch (msg.type) {
       case 'ready': {
@@ -357,6 +374,26 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         logger.info(`[${t}] ${getCliDisplayName(botCfg.cliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
 
+        // Do NOT auto-restart in adopt mode — there's nothing to restart
+        if (ds.adoptedFrom) {
+          logger.info(`[${t}] Adopted session ended`);
+          // Freeze the streaming card
+          if (ds.streamCardId && ds.workerPort) {
+            const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+            const frozenCard = buildStreamingCard(
+              ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
+              ds.lastScreenContent ?? '', 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
+            );
+            scheduleCardPatch(ds, frozenCard);
+          }
+          killWorker(ds);
+          try {
+            await cb.sessionReply(ds.session.rootMessageId, '\u23cf 已采纳的 CLI 会话已退出', 'text', ds.larkAppId);
+          } catch { /* best effort */ }
+          break;
+        }
+
         // Rate-limit auto-restart to prevent crash loops
         const key = ds.session.sessionId;
         const rc = restartCounts.get(key) ?? { count: 0, lastAt: 0 };
@@ -382,7 +419,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
           killWorker(ds);
           const cliName = getCliDisplayName(botCfg.cliId);
           try {
-            await cb.sessionReply(ds.session.rootMessageId, `⚠️ ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
+            await cb.sessionReply(ds.session.rootMessageId, `\u26a0\ufe0f ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
           } catch (replyErr) {
             if (replyErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -412,12 +449,87 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     ds.worker = null;
     ds.workerPort = null;
   });
+}
+
+// ─── Fork adopt worker ──────────────────────────────────────────────────────
+
+export function forkAdoptWorker(ds: DaemonSession): void {
+  const cb = requireCallbacks();
+  const workerPath = join(__dirname, '..', 'worker.js');
+  const t = tag(ds);
+  const adopted = ds.adoptedFrom;
+  if (!adopted) throw new Error('forkAdoptWorker called without adoptedFrom');
+
+  const bot = getBot(ds.larkAppId);
+  const botCfg = bot.config;
+
+  // Guard against double-fork
+  if (ds.worker && !ds.worker.killed) {
+    logger.warn(`[${t}] Worker already running, killing before adopt-fork`);
+    try { ds.worker.send({ type: 'close' } as DaemonToWorker); } catch {}
+    try { ds.worker.kill(); } catch {}
+    ds.worker = null;
+    ds.workerPort = null;
+    ds.workerToken = null;
+  }
+
+  // NO ensureMcpConfig — adopt mode has no MCP
+
+  const worker = fork(workerPath, [], {
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    cwd: adopted.cwd ?? ds.workingDir ?? process.cwd(),
+    env: {
+      ...process.env,
+      CLAUDECODE: undefined,
+      BOTMUX: '1',
+      LARK_APP_ID: botCfg.larkAppId,
+      LARK_APP_SECRET: botCfg.larkAppSecret,
+    },
+  });
+
+  // Pipe worker stdout/stderr
+  worker.stdout?.on('data', (data: Buffer) => {
+    for (const line of data.toString().split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) logger.info(`[${t}:out] ${trimmed}`);
+    }
+  });
+  worker.stderr?.on('data', (data: Buffer) => {
+    for (const line of data.toString().split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) logger.error(`[${t}:worker] ${trimmed}`);
+    }
+  });
+
+  const initMsg: DaemonToWorker = {
+    type: 'init',
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    rootMessageId: ds.session.rootMessageId,
+    workingDir: adopted.cwd,
+    cliId: adopted.cliId ?? 'claude-code',
+    backendType: 'tmux',
+    prompt: '',
+    resume: false,
+    ownerOpenId: ds.ownerOpenId,
+    webPort: ds.session.webPort,
+    larkAppId: botCfg.larkAppId,
+    larkAppSecret: botCfg.larkAppSecret,
+    adoptMode: true,
+    adoptTmuxTarget: adopted.tmuxTarget,
+    adoptPaneCols: adopted.paneCols,
+    adoptPaneRows: adopted.paneRows,
+  };
+  worker.send(initMsg);
+  ds.initConfig = initMsg;
+
+  // Use shared handler
+  setupWorkerHandlers(ds, worker);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
-  ds.cliVersion = currentCliVersion;
-  sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
-  logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
+  ds.cliVersion = '';
+  logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget})`);
 }
 
 // ─── Kill stale PIDs ────────────────────────────────────────────────────────

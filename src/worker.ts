@@ -178,6 +178,42 @@ function stopScreenUpdates(): void {
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  // ── Adopt mode: attach to an existing tmux pane (no CLI spawn) ──
+  if (cfg.adoptMode && cfg.adoptTmuxTarget) {
+    isTmuxMode = true;
+    const cols = cfg.adoptPaneCols ?? PTY_COLS;
+    const rows = cfg.adoptPaneRows ?? PTY_ROWS;
+    const tmuxBe = new TmuxBackend('adopt-' + cfg.sessionId.slice(0, 8), { ownsSession: false });
+    backend = tmuxBe;
+    tmuxBe.attachToExisting(cfg.adoptTmuxTarget, {
+      cwd: cfg.workingDir,
+      cols,
+      rows,
+      env: process.env as Record<string, string>,
+    });
+
+    // Minimal idle detection (output quiescence only)
+    idleDetector = new IdleDetector({ completionPattern: undefined, readyPattern: undefined } as any);
+    idleDetector.onIdle(() => {
+      log('Prompt detected (idle) — adopt mode');
+      markPromptReady();
+    });
+
+    backend.onData(onPtyData);
+    backend.onExit((code, signal) => {
+      log(`Adopted session exited (code: ${code}, signal: ${signal})`);
+      backend = null;
+      isPromptReady = false;
+      send({ type: 'claude_exit', code, signal });
+    });
+
+    // CLI is already running — unblock screen updates immediately
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();
+    log(`Adopt mode: attached to ${cfg.adoptTmuxTarget} (${cols}x${rows})`);
+    return;
+  }
+
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
   const useTmux = cfg.backendType === 'tmux';
   isTmuxMode = useTmux;
@@ -558,11 +594,25 @@ process.on('message', async (raw: unknown) => {
     case 'message': {
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
-      sendToPty(msg.content);
+      const content = msg.content;
+      if (lastInitConfig?.adoptMode) {
+        // Adopt mode: raw write to PTY (no adapter writeInput)
+        if (backend) {
+          backend.write(content + '\r');
+          isPromptReady = false;
+          idleDetector?.reset();
+        }
+      } else {
+        sendToPty(content);
+      }
       break;
     }
 
     case 'restart': {
+      if (lastInitConfig?.adoptMode) {
+        log('Restart ignored in adopt mode');
+        break;
+      }
       log('Restart requested');
       backend?.destroySession?.();
       killCli();
