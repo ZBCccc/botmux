@@ -330,8 +330,9 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // ── Tmux mode: per-client attach ──
         // Each WS client gets its own `tmux attach-session` PTY.
         // Scrollback is handled natively by tmux (history-limit).
-        const tmuxName = TmuxBackend.sessionName(sessionId);
-        const cp = pty.spawn('tmux', ['attach-session', '-t', tmuxName], {
+        // In adopt mode, attach to the user's original pane; otherwise use bmx-* session.
+        const tmuxTarget = lastInitConfig?.adoptTmuxTarget ?? TmuxBackend.sessionName(sessionId);
+        const cp = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
           name: 'xterm-256color',
           cols: 80,
           rows: 24,
