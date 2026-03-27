@@ -28,6 +28,8 @@
     "test:claude-mcp": "vitest run test/claude-code-mcp.e2e.ts",
     "test:mcp-detect": "vitest run test/mcp-session-detection.e2e.ts",
     "test:gemini": "vitest run test/gemini-input.e2e.ts",
+    "test:e2e-browser:setup": "tsx test/e2e-browser/setup-login.ts",
+    "test:e2e-browser": "vitest run test/e2e-browser/",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -43,9 +45,11 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@midscene/web": "^1.6.0",
     "@types/node": "^20.0.0",
     "@types/ws": "^8.18.1",
     "memfs": "^4.57.1",
+    "playwright": "^1.58.2",
     "tsx": "^4.20.5",
     "typescript": "^5.3.0",
     "vitest": "^4.0.18"

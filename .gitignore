@@ -6,3 +6,5 @@ log/
 .env
 .npmrc
 docs/superpowers/
+storageState.json
+midscene_run/
