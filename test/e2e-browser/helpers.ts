@@ -235,22 +235,23 @@ export async function waitForStreamingCard(
 
   // Wait for any bot card response
   await agent.aiWaitFor(
-    `页面上出现了${msgRef}来自机器人的新卡片（可能是"项目仓库管理"卡片，也可能是标题中包含"启动中"或"工作中"或"就绪"的流式卡片）`,
+    `页面上出现了${msgRef}来自机器人的新卡片`,
     { timeoutMs, checkIntervalMs: 3_000 },
   );
 
-  // Quick check: is it a repo selection card?
+  // Handle repo selection card if present
   const hasSkipButton = await agent.aiBoolean(
     '页面上可以看到"直接开启会话"按钮',
   );
   if (hasSkipButton) {
     await agent.aiAct('点击"▶️ 直接开启会话"按钮');
-    // Now wait for the actual streaming card
-    await agent.aiWaitFor(
-      `页面上出现了${msgRef}标题中包含"启动中"或"工作中"或"就绪"的流式卡片（标题格式类似"🖥️ ... — 状态"）`,
-      { timeoutMs, checkIntervalMs: 3_000 },
-    );
   }
+
+  // Always verify the streaming card is present (regardless of repo card)
+  await agent.aiWaitFor(
+    `页面上出现了${msgRef}标题中包含"启动中"或"工作中"或"就绪"的流式卡片（标题格式类似"🖥️ ... — 状态"）`,
+    { timeoutMs, checkIntervalMs: 3_000 },
+  );
 }
 
 /** Generate a unique test message with timestamp and optional label. */
