@@ -64,10 +64,25 @@ describe('group chat topic reply mode', () => {
 
     await page.waitForTimeout(5000);
 
-    // Verify topic reply mode
+    // Verify topic reply mode by checking the thread structure.
+    // In topic mode (reply_in_thread=true), bot replies are nested under
+    // the original message as a thread. Indicators include:
+    // - "查看更早 N 条话题回复" (when many replies)
+    // - "回复话题" input at bottom of thread
+    // - "N 条话题回复" counter
+    // - Bot replies shown indented under the original message, not as
+    //   separate top-level messages in the main chat
+    //
+    // We click into the message to open the thread panel, which confirms
+    // topic mode is active.
+    await agent.aiAct(
+      `点击消息"${msg}"区域或附近的话题入口，打开话题详情`,
+    );
+    await page.waitForTimeout(3000);
+
     await agent.aiAssert(
-      `消息"${msg}"所在区域可以看到包含"话题回复"的文字（例如"查看更早 N 条话题回复"或"N 条话题回复"），` +
-        '这说明机器人使用了话题模式回复',
+      '右侧打开了话题详情面板，里面包含了机器人的回复（如卡片或文本消息），' +
+        '这说明机器人的回复是以话题形式组织的',
     );
   }, 240_000);
 
