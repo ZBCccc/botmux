@@ -13,8 +13,7 @@
  * Per requirements: bots must use topic replies in ALL chat types
  * (private, regular group, topic group).
  *
- * BUG: Currently the daemon sets reply_in_thread=true only for P2P chats.
- * Group chats use reply_in_thread=false, causing inline replies instead of topics.
+ * Fixed: daemon now sets reply_in_thread=true for all chat types.
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
@@ -60,10 +59,7 @@ describe('group chat topic reply mode', () => {
     await browser?.close();
   });
 
-  // BUG: daemon uses reply_in_thread=false for group chats.
-  // Bot replies appear inline instead of as topic replies.
-  // This test documents expected behavior — will pass once fixed.
-  it.fails('bot uses topic replies (话题回复) in regular group, not inline replies', async () => {
+  it('bot uses topic replies (话题回复) in regular group, not inline replies', async () => {
     const msg = testMessage('topic-mode');
     await sendMentionMessage(page, agent, 'Claude', msg);
 

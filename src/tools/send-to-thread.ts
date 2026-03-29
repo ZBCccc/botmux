@@ -63,7 +63,7 @@ export async function execute(args: z.infer<typeof schema>) {
     const mentionUser = process.env.__OWNER_OPEN_ID
       || (config.daemon.allowedUsers[0]?.startsWith('ou_') ? config.daemon.allowedUsers[0] : undefined);
 
-    const replyInThread = session.chatType === 'p2p';
+    const replyInThread = true;  // Always reply in thread to create topics in all chat types
     const appId = session.larkAppId || config.lark.appId;
 
     // Validate that image/file paths exist before doing anything

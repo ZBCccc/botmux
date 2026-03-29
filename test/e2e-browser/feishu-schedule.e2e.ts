@@ -110,8 +110,23 @@ describe('scheduled task topic creation', () => {
       '话题面板中有来自 Claude 的回复（可能是流式卡片或文本消息）',
     );
 
-    // Clean up: remove the scheduled task
+    // Verify the scheduled task uses TOPIC replies (话题回复),
+    // not inline replies (条回复) — same as regular messages should.
+    // Go back to main chat to check thread indicator
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(2000);
+
+    await agent.aiAssert(
+      '包含"定时任务"的消息附近显示了"话题回复"或"条话题回复"字样，' +
+        '说明定时任务的回复使用了话题模式',
+    );
+
+    // Clean up: navigate back into setup thread to remove the task
+    await agent.aiAct(
+      `点击聊天中"${setupMsg}"消息区域，打开话题详情`,
+    );
+    await page.waitForTimeout(3000);
     await sendThreadReply(agent, `/schedule remove ${taskId}`);
     await page.waitForTimeout(3000);
-  }, 420_000); // 7 min — many steps
+  }, 480_000); // 8 min — many steps
 });

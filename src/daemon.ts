@@ -57,7 +57,8 @@ const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 
 /**
  * Reply to a message, automatically using reply_in_thread for p2p sessions.
- * In p2p chats, Lark needs reply_in_thread=true to create/continue a thread.
+ * Always reply in thread to create/continue a topic.
+ * This ensures topic-style replies in all chat types (p2p, group, topic group).
  */
 async function sessionReply(rootId: string, content: string, msgType: string = 'text', larkAppId?: string): Promise<string> {
   let ds: DaemonSession | undefined;
@@ -70,8 +71,7 @@ async function sessionReply(rootId: string, content: string, msgType: string = '
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
-  const inThread = ds?.chatType === 'p2p';
-  return replyMessage(appId, rootId, content, msgType, inThread);
+  return replyMessage(appId, rootId, content, msgType, true);
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
