@@ -3,7 +3,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, watch, 
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { config } from './config.js';
-import { replyMessage, resolveAllowedUsers, listMergeForwardMessages } from './im/lark/client.js';
+import { replyMessage, resolveAllowedUsers, getMessageDetail } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
@@ -178,18 +178,30 @@ const cardDeps: CardHandlerDeps = {
  */
 async function expandMergeForward(
   larkAppId: string, messageId: string, parsed: LarkMessage,
+  depth: number = 0,
 ): Promise<{ extraResources: MessageResource[] }> {
+  const MAX_DEPTH = 5;
   const extraResources: MessageResource[] = [];
   try {
-    const subMessages = await listMergeForwardMessages(larkAppId, messageId);
+    const detail = await getMessageDetail(larkAppId, messageId);
+    const subMessages = (detail?.items ?? []).filter((m: any) => m.upper_message_id === messageId);
     if (subMessages.length === 0) return { extraResources };
 
     const parts: string[] = ['[转发消息]'];
     for (const msg of subMessages) {
-      const sub = parseApiMessage(msg);
       const senderLabel = msg.sender?.sender_type === 'app' ? '机器人' : (msg.sender?.id ?? '未知');
       parts.push(`--- ${senderLabel} ---`);
-      parts.push(sub.content);
+
+      // Recursively expand nested merge_forward
+      if (msg.msg_type === 'merge_forward' && depth < MAX_DEPTH) {
+        const nested: LarkMessage = { content: '[合并转发消息]', msgType: 'merge_forward', messageId: msg.message_id, rootId: '', senderId: msg.sender?.id ?? '', senderType: msg.sender?.sender_type ?? '', createTime: msg.create_time ?? '', mentions: [] };
+        const { extraResources: nestedResources } = await expandMergeForward(larkAppId, msg.message_id, nested, depth + 1);
+        parts.push(nested.content);
+        extraResources.push(...nestedResources);
+      } else {
+        const sub = parseApiMessage(msg);
+        parts.push(sub.content);
+      }
 
       // Collect resources (images/files) from sub-messages for download
       const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '');
