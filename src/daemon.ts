@@ -241,6 +241,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     if (DAEMON_COMMANDS.has(cmd)) {
       const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
       session.larkAppId = larkAppId;
+      session.ownerOpenId = senderOpenId;
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(messageId, larkAppId), {
         session,
@@ -272,6 +273,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   // Create session in pending-repo state — don't spawn CLI yet
   const session = sessionStore.createSession(chatId, messageId, parsed.content.substring(0, 50), chatType);
   session.larkAppId = larkAppId;
+  session.ownerOpenId = senderOpenId;
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(messageId);
   messageQueue.appendMessage(messageId, parsed);
@@ -411,8 +413,10 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     const botCfg = getBot(larkAppId).config;
     logger.info(`No active session for thread ${rootId}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+    const senderOId = data.sender?.sender_id?.open_id;
     const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50), chatType);
     session.larkAppId = larkAppId;
+    session.ownerOpenId = senderOId;
     sessionStore.updateSession(session);
     const newDs: DaemonSession = {
       session,
@@ -430,7 +434,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       pendingPrompt: parsed.content,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
-      ownerOpenId: data.sender?.sender_id?.open_id,
+      ownerOpenId: senderOId,
       currentTurnTitle: parsed.content.substring(0, 50),
     };
     activeSessions.set(sessionKey(rootId, larkAppId), newDs);
@@ -526,9 +530,18 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
   const ds = activeSessions.get(sessionKey(signal.rootMessageId, targetAppId));
 
   if (ds && ds.worker && !ds.worker.killed) {
-    // Target bot has an active session in this thread — send the message
-    const senderBot = getAllBots().find(b => b.config.larkAppId === signal.senderAppId);
-    const senderName = senderBot?.botName ?? (senderBot ? getCliDisplayName(senderBot.config.cliId) : 'Bot');
+    // Target bot has an active session in this thread — send the message.
+    // Look up sender name from bots-info.json (each daemon only registers its own bot,
+    // so getAllBots() won't find other bots).
+    let senderName = 'Bot';
+    try {
+      const infoPath = join(config.session.dataDir, 'bots-info.json');
+      if (existsSync(infoPath)) {
+        const entries: Array<{ larkAppId: string; botName: string | null; cliId: string }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+        const sender = entries.find(e => e.larkAppId === signal.senderAppId);
+        if (sender) senderName = sender.botName ?? getCliDisplayName(sender.cliId as CliId);
+      }
+    } catch { /* ignore */ }
     const enrichedParts = [`[来自 ${senderName} 的 @mention]\n${signal.content}`];
     if (!ds.adoptedFrom) enrichedParts.push(`Session ID: ${ds.session.sessionId}`);
     const enrichedContent = enrichedParts.join('\n\n');

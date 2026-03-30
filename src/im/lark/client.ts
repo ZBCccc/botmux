@@ -1,8 +1,9 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { dirname, extname, basename } from 'node:path';
+import { dirname, extname, basename, join } from 'node:path';
 import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
+import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 
@@ -441,6 +442,20 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
  * multi-bot groups where each daemon only manages a single bot.
  */
 export async function listChatBotMembers(_larkAppId: string, chatId: string): Promise<Array<{ openId: string; name: string }>> {
+  // Read bots-info.json for larkAppId → botOpenId mapping.
+  // Each daemon process only registers its own bot, but bots-info.json
+  // is written by all daemon processes and has every bot's open_id.
+  const appIdToOpenId = new Map<string, string>();
+  try {
+    const infoPath = join(config.session.dataDir, 'bots-info.json');
+    if (existsSync(infoPath)) {
+      const entries: Array<{ larkAppId: string; botOpenId: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      for (const e of entries) {
+        if (e.botOpenId) appIdToOpenId.set(e.larkAppId, e.botOpenId);
+      }
+    }
+  } catch { /* ignore corrupt file */ }
+
   const clients = getAllBotClients();
   const results = await Promise.all(
     clients.map(async ({ appId, cliId, client }) => {
@@ -449,7 +464,8 @@ export async function listChatBotMembers(_larkAppId: string, chatId: string): Pr
           path: { chat_id: chatId },
         });
         if (res.code === 0 && res.data?.is_in_chat) {
-          return { openId: appId, name: cliId };
+          const openId = appIdToOpenId.get(appId) ?? appId;
+          return { openId, name: cliId };
         }
       } catch (err) {
         logger.debug(`isInChat check failed for ${appId}: ${err}`);

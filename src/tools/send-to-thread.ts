@@ -19,9 +19,49 @@ export const schema = z.object({
 
 export const description = 'Send a message to the Lark thread associated with a session. Supports plain text, images (embedded inline), and file attachments. Just send plain text — formatting is handled automatically. Use `images` to attach local image files (png/jpg/gif etc.) and `files` to attach documents.';
 
-/** Build a post content block from plain text, splitting by newlines into paragraphs */
-function textToPostContent(text: string): any[][] {
-  return text.split('\n').map(line => [{ tag: 'text', text: line }]);
+/** Build a post content block from plain text, splitting by newlines into paragraphs.
+ *  When mentions are provided, @Name patterns in the text are replaced with inline `at` tags. */
+function textToPostContent(text: string, mentions?: Array<{ open_id: string; name: string }>): any[][] {
+  // Build a regex that matches any @Name from the mentions list
+  let mentionPattern: RegExp | null = null;
+  const mentionMap = new Map<string, string>(); // lowercase name -> open_id
+  if (mentions && mentions.length > 0) {
+    const patterns: string[] = [];
+    for (const m of mentions) {
+      const escaped = m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      patterns.push(escaped);
+      mentionMap.set(m.name.toLowerCase(), m.open_id);
+    }
+    mentionPattern = new RegExp(`@(${patterns.join('|')})\\b`, 'gi');
+  }
+
+  return text.split('\n').map(line => {
+    if (!mentionPattern) return [{ tag: 'text', text: line }];
+
+    const nodes: any[] = [];
+    let lastIndex = 0;
+    for (const match of line.matchAll(mentionPattern)) {
+      const matchedName = match[1];
+      const openId = mentionMap.get(matchedName.toLowerCase());
+      if (!openId) continue;
+
+      // Add text before the match
+      if (match.index > lastIndex) {
+        nodes.push({ tag: 'text', text: line.slice(lastIndex, match.index) });
+      }
+      nodes.push({ tag: 'at', user_id: openId });
+      lastIndex = match.index + match[0].length;
+    }
+    // Add remaining text
+    if (lastIndex < line.length) {
+      nodes.push({ tag: 'text', text: line.slice(lastIndex) });
+    }
+    // If no matches were found in this line, return as plain text
+    if (nodes.length === 0) {
+      nodes.push({ tag: 'text', text: line });
+    }
+    return nodes;
+  });
 }
 
 /** Try to extract plain text from post JSON that Claude sometimes generates */
@@ -58,10 +98,10 @@ export async function execute(args: z.infer<typeof schema>) {
   }
 
   try {
-    // Prefer the session owner's open_id (set by worker from init message),
-    // fall back to first configured allowed user if it looks like an open_id.
-    const mentionUser = process.env.__OWNER_OPEN_ID
-      || (config.daemon.allowedUsers[0]?.startsWith('ou_') ? config.daemon.allowedUsers[0] : undefined);
+    // Read the session owner's open_id from the persisted session data.
+    // The MCP server runs in a separate process (spawned by the CLI) and
+    // does NOT inherit env vars from the worker, so we can't rely on __OWNER_OPEN_ID.
+    const mentionUser = session.ownerOpenId;
 
     const replyInThread = true;  // Always reply in thread to create topics in all chat types
     const appId = session.larkAppId || config.lark.appId;
@@ -89,19 +129,30 @@ export async function execute(args: z.infer<typeof schema>) {
       text = extracted;
     }
 
-    // Build post content: text paragraphs + inline images
-    const postContent = text ? textToPostContent(text) : [];
+    // Build post content: text paragraphs + inline images.
+    // Pass mentions so @Name in text gets replaced with proper `at` tags inline.
+    const postContent = text ? textToPostContent(text, args.mentions) : [];
 
     for (const key of imageKeys) {
       postContent.push([{ tag: 'img', image_key: key }]);
     }
 
-    // Append explicit mentions (e.g. @mention other bots)
+    // If there are mentions that weren't found in the text (e.g. no @Name in content),
+    // append them at the end as fallback
     if (args.mentions && args.mentions.length > 0) {
-      if (postContent.length === 0) postContent.push([]);
-      const lastLine = postContent[postContent.length - 1];
-      for (const m of args.mentions) {
-        lastLine.push({ tag: 'at', user_id: m.open_id });
+      const usedOpenIds = new Set<string>();
+      for (const para of postContent) {
+        for (const node of para) {
+          if (node.tag === 'at' && node.user_id) usedOpenIds.add(node.user_id);
+        }
+      }
+      const unusedMentions = args.mentions.filter(m => !usedOpenIds.has(m.open_id));
+      if (unusedMentions.length > 0) {
+        if (postContent.length === 0) postContent.push([]);
+        const lastLine = postContent[postContent.length - 1];
+        for (const m of unusedMentions) {
+          lastLine.push({ tag: 'at', user_id: m.open_id });
+        }
       }
     }
 

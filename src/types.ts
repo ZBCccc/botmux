@@ -11,6 +11,7 @@ export interface Session {
   workingDir?: string;
   webPort?: number;
   larkAppId?: string;
+  ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts. */
   adoptedFrom?: {
     tmuxTarget: string;
