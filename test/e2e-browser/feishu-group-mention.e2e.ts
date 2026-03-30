@@ -52,7 +52,7 @@ describe('feishu group @mention routing', () => {
     await agent?.destroy();
     await context?.close();
     await browser?.close();
-  }, 60_000);
+  }, 120_000);
 
   it('no @mention in multi-bot group → no bot responds', async () => {
     const msg = testMessage('no-mention');

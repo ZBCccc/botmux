@@ -54,7 +54,7 @@ export function createBotTest(botName: BotName): void {
       await agent?.destroy();
       await context?.close();
       await browser?.close();
-    }, 60_000);
+    }, 120_000);
 
     it(`sends hello, receives streaming card and actual reply from ${botName}`, async () => {
       await navigateToMessenger(page);
@@ -73,9 +73,7 @@ export function createBotTest(botName: BotName): void {
         { timeoutMs: 120_000, checkIntervalMs: 5_000 },
       );
 
-      // Verify the streaming card has actual output content (not just an empty card).
-      // Different CLIs respond differently — some send separate text replies,
-      // some only output through the streaming card. We check the card has content.
+      // --- Step A: Verify streaming card has output content ---
       await scrollThreadToBottom(agent);
       const needExpand = await agent.aiBoolean(
         '话题面板中的流式卡片里有"📖 展开输出"按钮',
@@ -87,6 +85,17 @@ export function createBotTest(botName: BotName): void {
       await agent.aiAssert(
         `话题面板中的流式卡片包含输出内容（展开后可见文本），` +
           `说明 ${botName} 已经处理了用户消息并产生了输出`,
+      );
+
+      // --- Step B: Verify bot sent an actual reply (with @user mention) ---
+      // The real "reply" is a text message from the bot that @mentions the user,
+      // not just the streaming card output. This proves the bot finished and
+      // posted its answer back to Feishu.
+      await scrollThreadToBottom(agent);
+      await agent.aiWaitFor(
+        `话题面板中有来自 ${botName} 的文本回复消息（包含"@"某用户的内容），` +
+          '这是机器人对用户问题的实际回答',
+        { timeoutMs: 60_000, checkIntervalMs: 5_000 },
       );
     }, 360_000);
   });
