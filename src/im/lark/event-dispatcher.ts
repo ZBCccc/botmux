@@ -176,38 +176,24 @@ export async function checkGroupMessageAccess(
   const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
   const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
   const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
-  const allBots = getAllBots();
-  const multipleBotsConfigured = allBots.length > 1;
-  const hasUnknownBotIdentity = allBots.some(bot => !bot.botOpenId);
 
-  logger.debug(`Check group message access: ${mentioned}, ${isAllowed}`);
+  logger.debug(`Check group message access: mentioned=${mentioned}, isAllowed=${isAllowed}`);
   if (mentioned) {
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
-  // No @mention:
-  // - Single-bot setup: keep the legacy "solo human in group" shortcut.
-  // - Multi-bot setup: only allow the shortcut when we can positively confirm
-  //   this bot is the only bot in the chat. If bot identities are not ready yet
-  //   (startup race before open_id probe), require @mention to avoid fan-out.
+  // No @mention — only allow if sender is the sole human in the group
+  // AND this is the only bot in the chat. With multiple bots, require @mention
+  // to disambiguate.
+  // Note: each daemon registers only 1 bot, so getAllBots().length is always 1.
+  // Use getGroupBotCount (API query) to get the real count of bots in the chat.
   if (isAllowed) {
-    const userCount = await getGroupUserCount(larkAppId, chatId);
-    if (userCount > 1) {
-      return 'ignore';
-    }
-
-    if (!multipleBotsConfigured) {
-      return 'allowed';
-    }
-
-    if (hasUnknownBotIdentity) {
-      logger.debug('Multiple bots configured but bot identity is incomplete, requiring @mention');
-      return 'ignore';
-    }
-
-    const botCount = await getGroupBotCount(larkAppId, chatId);
+    const [userCount, botCount] = await Promise.all([
+      getGroupUserCount(larkAppId, chatId),
+      getGroupBotCount(larkAppId, chatId),
+    ]);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
-    if (botCount === 1) {
+    if (userCount <= 1 && botCount <= 1) {
       return 'allowed';
     }
   }
