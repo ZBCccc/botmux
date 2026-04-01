@@ -33,6 +33,7 @@ describe('scheduled task topic creation', () => {
   let context: BrowserContext;
   let page: Page;
   let agent: PlaywrightAgent;
+  let createdTaskId: string | undefined;
 
   beforeAll(async () => {
     checkPrerequisites();
@@ -50,6 +51,19 @@ describe('scheduled task topic creation', () => {
   });
 
   afterAll(async () => {
+    // Clean up the scheduled task before closing the session
+    if (createdTaskId && agent && page) {
+      try {
+        await scrollThreadToBottom(agent);
+        await agent.aiAct('点击右侧话题面板最底部的回复输入框');
+        await page.waitForTimeout(500);
+        await page.keyboard.type(`/schedule remove ${createdTaskId}`, { delay: 30 });
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(3000);
+      } catch {
+        // Best-effort cleanup — don't fail teardown
+      }
+    }
     await closeSession(agent, page);
     await agent?.destroy();
     await context?.close();
@@ -94,6 +108,7 @@ describe('scheduled task topic creation', () => {
     const taskId = await agent.aiString(
       '话题面板中"定时任务已创建"消息里，"ID:"后面的值是什么（8个字符的ID）',
     );
+    createdTaskId = taskId;
 
     // Step 3: Trigger the task immediately
     await scrollThreadToBottom(agent);

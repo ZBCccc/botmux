@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { replyMessage, uploadImage, uploadFile } from '../im/lark/client.js';
 import { config } from '../config.js';
@@ -195,16 +195,38 @@ export async function execute(args: z.infer<typeof schema>) {
       }
     } catch { /* ignore */ }
 
-    // Collect target open_ids: explicit mentions + auto-detected from text
-    const targetOpenIds = new Set<string>();
-    const botOpenIds = new Set(botEntries.filter(e => e.botOpenId).map(e => e.botOpenId!));
-    // Find self open_id to exclude from targets (don't signal yourself)
-    const selfOpenId = botEntries.find(e => e.larkAppId === appId)?.botOpenId;
+    // Build a comprehensive open_id → larkAppId lookup that includes both
+    // self-reported IDs (from bots-info.json) and cross-ref IDs (per-app scoped).
+    // Lark open_ids are per-app: the open_id that list_bots returns for Bot B
+    // (as seen by Bot A) differs from Bot B's self-reported open_id.
+    const openIdToAppId = new Map<string, string>();
+    for (const entry of botEntries) {
+      if (entry.botOpenId) openIdToAppId.set(entry.botOpenId, entry.larkAppId);
+    }
+    // Read cross-ref files: bot-openids-{appId}.json maps botName → open_id in that app's context
+    try {
+      const dataDir = config.session.dataDir;
+      for (const file of readdirSync(dataDir)) {
+        if (!file.startsWith('bot-openids-') || !file.endsWith('.json')) continue;
+        try {
+          const crossRef: Record<string, string> = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+          for (const [botName, crossOpenId] of Object.entries(crossRef)) {
+            // Resolve botName → larkAppId via bots-info
+            const entry = botEntries.find(e => e.botName?.toLowerCase() === botName.toLowerCase());
+            if (entry) openIdToAppId.set(crossOpenId, entry.larkAppId);
+          }
+        } catch { /* ignore corrupt file */ }
+      }
+    } catch { /* ignore */ }
+
+    // Collect target larkAppIds: explicit mentions + auto-detected from text
+    const targetAppIds = new Set<string>();
 
     // 1. Explicit mentions (excluding self)
     if (args.mentions) {
       for (const m of args.mentions) {
-        if (m.open_id !== selfOpenId && botOpenIds.has(m.open_id)) targetOpenIds.add(m.open_id);
+        const targetApp = openIdToAppId.get(m.open_id);
+        if (targetApp && targetApp !== appId) targetAppIds.add(targetApp);
       }
     }
 
@@ -217,31 +239,35 @@ export async function execute(args: z.infer<typeof schema>) {
           // Match @Name with word boundary (handles "@Aiden", "@Claude Code", "@claude-code")
           const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           if (new RegExp(`@${escaped}\\b`, 'i').test(text)) {
-            targetOpenIds.add(entry.botOpenId);
+            targetAppIds.add(entry.larkAppId);
             break;
           }
         }
       }
     }
 
-    if (targetOpenIds.size > 0) {
+    if (targetAppIds.size > 0) {
       const signalDir = join(config.session.dataDir, 'bot-mentions');
       if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
 
-      for (const openId of targetOpenIds) {
+      for (const targetApp of targetAppIds) {
+        // Use the target bot's self-reported open_id for the signal
+        // (daemons match signals by their own botOpenId)
+        const targetEntry = botEntries.find(e => e.larkAppId === targetApp);
+        const targetOpenId = targetEntry?.botOpenId ?? targetApp;
         const signal = {
           rootMessageId: session.rootMessageId,
           chatId: session.chatId,
           chatType: session.chatType,
           senderAppId: appId,
-          targetBotOpenId: openId,
+          targetBotOpenId: targetOpenId,
           content: text,
           messageId,
           timestamp: Date.now(),
         };
-        const filename = `${Date.now()}-${openId.slice(-8)}.json`;
+        const filename = `${Date.now()}-${targetOpenId.slice(-8)}.json`;
         writeFileSync(join(signalDir, filename), JSON.stringify(signal));
-        logger.info(`Wrote bot-mention signal for ${openId} in thread ${session.rootMessageId}`);
+        logger.info(`Wrote bot-mention signal for ${targetApp} in thread ${session.rootMessageId}`);
       }
     }
 
