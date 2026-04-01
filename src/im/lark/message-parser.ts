@@ -97,15 +97,25 @@ export function extractResources(msgType: string, rawContent: string): MessageRe
     }
 
     if (msgType === 'interactive') {
-      // Lark API returns card elements as nested arrays: [[{tag:"img",image_key:"..."}, ...], ...]
       const resources: MessageResource[] = [];
       if (Array.isArray(parsed.elements)) {
-        for (const block of parsed.elements) {
-          const nodes = Array.isArray(block) ? block : [block];
-          for (const node of nodes) {
-            if ((node.tag === 'img' || node.tag === 'image') && node.image_key) {
-              resources.push({ type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
+        // Detect format: API returns elements as array-of-arrays (like post paragraphs)
+        const isApiFormat = parsed.elements.length > 0 && Array.isArray(parsed.elements[0]);
+        if (isApiFormat) {
+          // Format A: [[{tag:"img",image_key:"..."}, ...], ...]
+          for (const block of parsed.elements) {
+            if (!Array.isArray(block)) continue;
+            for (const node of block) {
+              const key = node.image_key ?? node.img_key;
+              if ((node.tag === 'img' || node.tag === 'image') && key) {
+                resources.push({ type: 'image', key, name: `${key}.jpg` });
+              }
             }
+          }
+        } else {
+          // Format B: original card JSON — recursively extract images
+          for (const el of parsed.elements) {
+            extractElementImages(el, resources);
           }
         }
       }
@@ -294,6 +304,32 @@ function extractCardContent(rawContent: string): string {
     return parts.join('\n') || '[卡片]';
   } catch {
     return '[卡片]';
+  }
+}
+
+/** Recursively extract image resources from an original-format card element. */
+function extractElementImages(el: any, resources: MessageResource[]): void {
+  if (!el || typeof el !== 'object') return;
+
+  const tag = el.tag;
+  const key = el.image_key ?? el.img_key;
+  if ((tag === 'img' || tag === 'image') && key) {
+    resources.push({ type: 'image', key, name: `${key}.jpg` });
+  }
+
+  // div.extra can contain an image
+  if (el.extra) extractElementImages(el.extra, resources);
+
+  // column_set / column — recurse into nested elements
+  if (Array.isArray(el.columns)) {
+    for (const col of el.columns) {
+      if (Array.isArray(col.elements)) {
+        for (const child of col.elements) extractElementImages(child, resources);
+      }
+    }
+  }
+  if (Array.isArray(el.elements)) {
+    for (const child of el.elements) extractElementImages(child, resources);
   }
 }
 

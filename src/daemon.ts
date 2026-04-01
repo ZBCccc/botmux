@@ -203,11 +203,11 @@ async function expandMergeForward(
         parts.push(sub.content);
       }
 
-      // Collect resources (images/files) from sub-messages for download
+      // Collect resources (images/files) from sub-messages for download.
+      // Do NOT override messageId — Lark requires the parent merge_forward's
+      // message_id to download resources (error 234003 if sub-message ID is used).
       const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '');
-      for (const r of subResources) {
-        extraResources.push({ ...r, messageId: msg.message_id });
-      }
+      extraResources.push(...subResources);
     }
     parsed.content = parts.join('\n');
     parsed.msgType = 'merge_forward_expanded';
@@ -263,9 +263,12 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   }
 
   // Download attachments
-  const attachments = await downloadResources(larkAppId, messageId, resources);
+  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
+  }
+  if (needLogin) {
+    sessionReply(messageId, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', larkAppId);
   }
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
@@ -370,9 +373,12 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
-  const attachments = await downloadResources(effectiveAppId, parsed.messageId, resources);
+  const { attachments, needLogin } = await downloadResources(effectiveAppId, parsed.messageId, resources);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
+  }
+  if (needLogin) {
+    sessionReply(rootId, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', effectiveAppId);
   }
 
   // Update last message time

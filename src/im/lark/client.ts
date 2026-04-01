@@ -217,8 +217,8 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret);
   if (!userToken) {
     throw new Error(
-      `App Token 无法下载此资源，且未找到 User Token。` +
-      `请运行 feishu-cli auth login 授权后重试。`
+      `App Token 无法下载此资源，且未找到可用的 User Token。` +
+      `请在话题中发送 /login 完成授权后重试。`
     );
   }
 
@@ -241,7 +241,8 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
     headers: { Authorization: `Bearer ${userToken}` },
   });
   if (!res.ok) {
-    throw new Error(`User Token download failed: HTTP ${res.status}`);
+    const body = await res.text().catch(() => '');
+    throw new Error(`User Token download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
   writeFileSync(savePath, buf);

@@ -83,11 +83,12 @@ export function getAttachmentsDir(messageId: string): string {
   return join(resolve(config.session.dataDir), 'attachments', messageId);
 }
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<LarkAttachment[]> {
-  if (resources.length === 0) return [];
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+  if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
   const dir = getAttachmentsDir(messageId);
+  let needLogin = false;
 
   for (const res of resources) {
     const savePath = join(dir, res.name);
@@ -97,10 +98,11 @@ export async function downloadResources(larkAppId: string, messageId: string, re
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       logger.warn(`Failed to download ${res.type} ${res.key}: ${err.message}`);
+      if (err.message?.includes('User Token')) needLogin = true;
     }
   }
 
-  return attachments;
+  return { attachments, needLogin };
 }
 
 // ─── Prompts ─────────────────────────────────────────────────────────────────

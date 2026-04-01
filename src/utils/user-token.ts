@@ -1,10 +1,9 @@
 /**
  * User Access Token — self-contained OAuth token management for botmux.
  *
- * Token storage priority (read):
+ * Token storage:
  *   1. FEISHU_USER_ACCESS_TOKEN env var
- *   2. ~/.botmux/data/user-token.json  (botmux's own)
- *   3. ~/.feishu-cli/token.json         (feishu-cli compatibility)
+ *   2. ~/.botmux/data/user-token.json
  *
  * OAuth login via /login command writes to botmux's own token file.
  * Auto-refreshes expired access_token using refresh_token.
@@ -18,7 +17,6 @@ import { logger } from './logger.js';
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
 const BOTMUX_TOKEN_PATH = join(homedir(), '.botmux', 'data', 'user-token.json');
-const FEISHU_CLI_TOKEN_PATH = join(homedir(), '.feishu-cli', 'token.json');
 const BUFFER_MS = 60_000; // 60s safety margin before expiry
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -76,14 +74,10 @@ function isValid(isoDate: string): boolean {
   return Date.now() + BUFFER_MS < new Date(isoDate).getTime();
 }
 
-/** Load token from botmux's own file, then feishu-cli as fallback. */
+/** Load token from botmux's own file. */
 function loadToken(): { token: TokenStore; source: string } | null {
-  const own = loadTokenFromPath(BOTMUX_TOKEN_PATH);
-  if (own) return { token: own, source: 'botmux' };
-
-  const cli = loadTokenFromPath(FEISHU_CLI_TOKEN_PATH);
-  if (cli) return { token: cli, source: 'feishu-cli' };
-
+  const token = loadTokenFromPath(BOTMUX_TOKEN_PATH);
+  if (token) return { token, source: 'botmux' };
   return null;
 }
 
@@ -165,6 +159,7 @@ const DEFAULT_PORT = 9768;
 const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
+  'offline_access',
 ].join(' ');
 
 /**
