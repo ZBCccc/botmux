@@ -1,12 +1,12 @@
 /**
  * Scheduled task test:
- *  1. In a bot private chat, create a scheduled task via /schedule
+ *  1. In a bot private chat, create a scheduled task via /schedule inside a thread
  *  2. Trigger it immediately via /schedule run <id>
- *  3. Verify a NEW topic thread is created with "🕐 定时任务" message
- *  4. Verify the bot responds within that thread
+ *  3. Verify the task replies INSIDE the ORIGINAL thread (no new top-level message
+ *     in main chat) — this is the behavior introduced April 2026.
  *
- * Per requirements: scheduled tasks MUST always create topics,
- * in any chat type (private, regular group, topic group).
+ * Per requirements: scheduled tasks MUST reply into the original topic thread so
+ * the user sees a coherent conversation, not a new thread per run.
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
@@ -28,7 +28,7 @@ import {
   closeSession,
 } from './helpers.js';
 
-describe('scheduled task topic creation', () => {
+describe('scheduled task thread continuity', () => {
   let browser: Browser;
   let context: BrowserContext;
   let page: Page;
@@ -70,10 +70,10 @@ describe('scheduled task topic creation', () => {
     await browser?.close();
   });
 
-  it('scheduled task creates a new topic thread when triggered', async () => {
+  it('scheduled task replies inside the original thread when triggered', async () => {
     const label = `sched-${Date.now()}`;
 
-    // Step 1: Start a session to have a thread for sending commands
+    // Step 1: Start a session to get a thread.
     const setupMsg = testMessage('sched-setup');
     await sendMessage(agent, setupMsg);
     await waitForStreamingCard(agent, {
@@ -81,26 +81,26 @@ describe('scheduled task topic creation', () => {
       msgHint: setupMsg,
     });
 
-    // Wait for bot to be ready so it can process commands
+    // Wait for bot to be ready so it can process /schedule commands.
     await agent.aiWaitFor('话题面板中的流式卡片标题包含"就绪"', {
       timeoutMs: 120_000,
       checkIntervalMs: 5_000,
     });
 
-    // Step 2: Create a scheduled task in the thread
-    // Use page.keyboard.type directly for the command to preserve the "/" prefix
+    // Step 2: Create a scheduled task inside this thread.
     await scrollThreadToBottom(agent);
     await agent.aiAct('点击右侧话题面板最底部的回复输入框');
     await page.waitForTimeout(500);
+    // Use "every 1h" (interval) — exercises the new one-shot/interval parsing path.
     await page.keyboard.type(`/schedule 每小时 ${label}`, { delay: 30 });
     await page.keyboard.press('Enter');
     await page.waitForTimeout(8000);
 
-    // Scroll thread panel to bottom to reveal the bot's response
+    // Scroll thread panel to bottom to reveal the bot's response.
     await scrollThreadToBottom(agent);
     await page.waitForTimeout(2000);
 
-    // Extract the task ID from the bot's response in the thread panel
+    // Extract the task ID from the "✅ 定时任务已创建" reply.
     await agent.aiWaitFor(
       '话题面板中出现了包含"✅ 定时任务已创建"或"定时任务已创建"的消息',
       { timeoutMs: 60_000, checkIntervalMs: 5_000 },
@@ -110,40 +110,37 @@ describe('scheduled task topic creation', () => {
     );
     createdTaskId = taskId;
 
-    // Step 3: Trigger the task immediately
+    // Step 3: Trigger the task immediately.
     await scrollThreadToBottom(agent);
     await agent.aiAct('点击右侧话题面板最底部的回复输入框');
     await page.waitForTimeout(500);
     await page.keyboard.type(`/schedule run ${taskId}`, { delay: 30 });
     await page.keyboard.press('Enter');
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(5000);
 
-    // Step 4: Go back to main chat to look for the new topic thread
-    // Close the current thread panel first
-    await page.keyboard.press('Escape');
-    await page.waitForTimeout(2000);
-
-    // Verify a NEW thread was created with the scheduled task marker
+    // Step 4: Verify the task executed INSIDE the current thread — the "🕐 定时任务
+    // 「<label>」开始执行" message should appear in the thread panel, and the bot
+    // should respond there, NOT in a new top-level message in the main chat.
+    await scrollThreadToBottom(agent);
     await agent.aiWaitFor(
-      '聊天中出现了包含"🕐 定时任务"或"定时任务"字样的新消息',
+      '话题面板（右侧）中出现了包含"🕐 定时任务"或"定时任务「' + label + '」开始执行"的消息',
       { timeoutMs: 60_000, checkIntervalMs: 5_000 },
     );
 
-    // Click into that thread to verify bot responded
-    await agent.aiAct(
-      '点击包含"定时任务"的消息或其"回复话题"链接，打开话题详情',
-    );
-    await page.waitForTimeout(3000);
-
-    // Verify the task created a topic with bot response
+    // The bot should produce a response in the same thread.
+    await scrollThreadToBottom(agent);
     await agent.aiAssert(
-      '页面上包含"定时任务"的消息区域有来自 Claude 的回复（流式卡片或文本消息）',
+      '话题面板中在"🕐 定时任务"提示消息之后，有来自机器人的回复内容（流式卡片或文本）',
     );
 
-    // Verify topic reply mode: the thread panel should be open with replies
+    // Negative assertion: the main chat (not thread panel) should NOT show a new
+    // top-level "🕐 定时任务" message — this is the thread-continuity fix.
+    // Close the thread panel temporarily to inspect main chat.
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(2000);
     await agent.aiAssert(
-      '右侧话题详情面板中有来自机器人的回复内容，' +
-        '说明定时任务的执行结果以话题形式组织',
+      '主聊天区域（非右侧话题面板）没有新的顶层"🕐 定时任务「' + label + '」开始执行"消息作为独立话题出现；' +
+        '即便有，它必须与最初创建任务的话题相同，而不是新开一个话题',
     );
   }, 480_000); // 8 min — many steps
 });

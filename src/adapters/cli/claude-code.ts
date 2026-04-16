@@ -95,6 +95,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /❯/,
     systemHints: [],
     altScreen: false,
+    skillsDir: '~/.claude/skills',
   };
 }
 

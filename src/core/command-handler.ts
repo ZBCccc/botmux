@@ -77,7 +77,8 @@ async function handleScheduleCommand(
       const next = t.enabled ? scheduler.getNextRun(t.id) : null;
       const nextStr = next ? ` → 下次: ${next.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : '';
       const lastStr = t.lastRunAt ? ` | 上次: ${new Date(t.lastRunAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : '';
-      return `${status} [${t.id}] ${t.schedule} | ${t.name}\n   prompt: ${t.prompt.substring(0, 50)}${t.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
+      const display = t.parsed?.display ?? t.schedule;
+      return `${status} [${t.id}] ${display} | ${t.name}\n   prompt: ${t.prompt.substring(0, 50)}${t.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
     });
     await sessionReply(rootId, `定时任务列表 (${tasks.length})：\n\n${lines.join('\n\n')}`);
     return;
@@ -138,15 +139,18 @@ async function handleScheduleCommand(
     const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
     const task = scheduler.addTask({
       name: parsed.name,
-      type: parsed.type,
-      schedule: parsed.cron,
+      schedule: trimmed, // raw user input (schedule + prompt blob, kept only for display)
+      parsed: parsed.parsed,
       prompt: parsed.prompt,
       workingDir,
       chatId,
+      rootMessageId: rootId,
+      chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
+      larkAppId,
     });
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : 'N/A';
-    await sessionReply(rootId, `✅ 定时任务已创建！\n\nID: ${task.id}\n名称: ${task.name}\nCron: ${task.schedule}\nPrompt: ${task.prompt}\n工作目录: ${expandHome(workingDir)}\n下次执行: ${nextStr}`);
+    await sessionReply(rootId, `✅ 定时任务已创建！\n\nID: ${task.id}\n名称: ${task.name}\n规则: ${parsed.parsed.display}\nPrompt: ${task.prompt}\n工作目录: ${expandHome(workingDir)}\n下次执行: ${nextStr}`);
     return;
   }
 

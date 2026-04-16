@@ -48,17 +48,51 @@ export interface LarkMessage {
   mentions?: LarkMention[];
 }
 
+/**
+ * Structured schedule form, computed once at creation time from the raw
+ * schedule string.  Parsed form is authoritative for runtime computation;
+ * the raw string is kept only for display/reconfigure.
+ */
+export interface ParsedSchedule {
+  kind: 'once' | 'interval' | 'cron';
+  /** For 'once': ISO timestamp of run time */
+  runAt?: string;
+  /** For 'interval': recurrence minutes */
+  minutes?: number;
+  /** For 'cron': cron expression (5 fields, minute/hour/dom/month/dow) */
+  expr?: string;
+  /** Human-friendly display text */
+  display: string;
+}
+
 export interface ScheduledTask {
   id: string;
   name: string;
-  type: 'cron' | 'interval' | 'once';
-  schedule: string;       // cron expression, milliseconds, or ISO datetime
+  /** Raw user input (e.g. "每日17:50" or "30m" or "0 9 * * *") */
+  schedule: string;
+  /** Structured form — authoritative for runtime */
+  parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
   chatId: string;
+  /** Root message id of the topic where the task was created. When set,
+   *  execution replies into this thread instead of creating a new one. */
+  rootMessageId?: string;
+  chatType?: 'group' | 'p2p' | 'topic_group';
+  larkAppId?: string;
   enabled: boolean;
   createdAt: string;
   lastRunAt?: string;
+  nextRunAt?: string;
+  lastStatus?: 'ok' | 'error';
+  lastError?: string;
+  lastDeliveryError?: string;
+  /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
+  repeat?: { times: number | null; completed: number };
+  /** Delivery target: 'origin' (original thread, default), 'local' (log only, no delivery) */
+  deliver?: 'origin' | 'local';
+  // DEPRECATED — kept only for backward-compat migration
+  type?: 'cron' | 'interval' | 'once';
 }
 
 // ─── Worker IPC Messages ─────────────────────────────────────────────────────

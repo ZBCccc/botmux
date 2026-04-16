@@ -114,6 +114,8 @@ export const restartCounts = new Map<string, { count: number; lastAt: number }>(
 
 /** Track which CLI adapters have had MCP config ensured this daemon lifecycle */
 const mcpConfiguredCliIds = new Set<string>();
+/** Track which CLI adapters have had skills installed this daemon lifecycle */
+const skillsInstalledCliIds = new Set<string>();
 
 /**
  * Ensure the botmux MCP server is registered globally for a given CLI.
@@ -134,6 +136,17 @@ export function ensureMcpConfig(cliId: CliId, cliPathOverride?: string): void {
     },
   });
   mcpConfiguredCliIds.add(cliId);
+
+  // Install built-in skills (schedule, thread-messages) into the CLI's skill dir.
+  // Idempotent per lifecycle.
+  if (!skillsInstalledCliIds.has(cliId) && adapter.skillsDir) {
+    import('../skills/installer.js')
+      .then(({ ensureSkills }) => {
+        ensureSkills(cliId, adapter.skillsDir);
+        skillsInstalledCliIds.add(cliId);
+      })
+      .catch(err => logger.warn(`[worker-pool] Failed to install skills for ${cliId}: ${err.message}`));
+  }
 }
 
 // ─── Kill worker ────────────────────────────────────────────────────────────

@@ -44,6 +44,12 @@ export interface CliAdapter {
   /** Install MCP server config. Idempotent — skips if up to date. */
   ensureMcpConfig(entry: McpServerEntry): void;
 
+  /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
+   *  skill directory.  When set, `ensureSkills` will write/refresh skill files
+   *  into `{skillsDir}/<skillName>/SKILL.md`.  Undefined = this CLI does not
+   *  support skills (or has a non-standard layout not yet integrated). */
+  readonly skillsDir?: string;
+
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
 

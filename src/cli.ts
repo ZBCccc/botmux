@@ -1143,9 +1143,276 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
 
+定时任务（可在 CLI 会话内自动推断 chat）:
+  schedule list                        列出所有任务
+  schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
+  schedule remove <id>                 删除任务
+  schedule pause|resume <id>           暂停/恢复
+  schedule run <id>                    标记立即执行
+
+会话消息（在会话内自动推断 session-id）:
+  thread messages [--limit N]          拉取当前 Lark 话题的消息历史 (JSON)
+
 配置目录: ~/.botmux/
 文档: https://github.com/deepcoldy/botmux
 `);
+}
+
+// ─── Schedule subcommands ────────────────────────────────────────────────────
+
+/**
+ * Walk the process tree looking for a CLI-pid marker written by the botmux
+ * worker. Returns the sessionId stored in the marker (or '' if empty/legacy).
+ *
+ * This mirrors server.ts:findAncestorCliMarker but is local to cli.ts so
+ * subcommands invoked from inside an agent session can auto-detect which
+ * session they belong to.
+ */
+function findAncestorSessionId(): string | null {
+  const dataDir = resolveDataDir();
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  if (!existsSync(markersDir)) return null;
+
+  let pid = process.ppid;
+  for (let depth = 0; depth < 8 && pid > 1; depth++) {
+    const markerPath = join(markersDir, String(pid));
+    if (existsSync(markerPath)) {
+      try { return readFileSync(markerPath, 'utf-8').trim(); } catch { return ''; }
+    }
+    try {
+      const out = execSync(`ps -o ppid= -p ${pid}`, { encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      pid = parseInt(out, 10);
+      if (isNaN(pid)) break;
+    } catch { break; }
+  }
+  return null;
+}
+
+interface CurrentSession {
+  sessionId: string;
+  chatId: string;
+  rootMessageId: string;
+  workingDir?: string;
+  larkAppId?: string;
+  chatType?: 'group' | 'p2p';
+}
+
+/** Detect current session info from ancestor marker + session files. */
+function detectCurrentSession(): CurrentSession | null {
+  const sid = findAncestorSessionId();
+  if (!sid) return null;
+  const sessions = loadSessions();
+  const s = sessions.get(sid);
+  if (!s) return null;
+  return {
+    sessionId: s.sessionId,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    workingDir: s.workingDir,
+    larkAppId: s.larkAppId,
+    chatType: s.chatType,
+  };
+}
+
+/** Pick a value from --flag <value> or --flag=value style args. */
+function argValue(args: string[], ...flags: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    for (const f of flags) {
+      if (a === f && i + 1 < args.length) return args[i + 1];
+      if (a.startsWith(f + '=')) return a.slice(f.length + 1);
+    }
+  }
+  return undefined;
+}
+
+function argFlag(args: string[], flag: string): boolean {
+  return args.includes(flag);
+}
+
+/** Extract positional args, skipping --flag and the value that follows it
+ *  (for --flag <value> style).  --flag=value style is self-contained. */
+function positionals(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      if (!a.includes('=') && i + 1 < args.length) i++; // skip value
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
+  // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
+  // writes to the right file even when invoked outside the daemon env.
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+
+  const scheduler = await import('./core/scheduler.js');
+  const scheduleStore = await import('./services/schedule-store.js');
+
+  if (!sub || sub === 'list' || sub === 'ls') {
+    const tasks = scheduleStore.listTasks();
+    if (tasks.length === 0) {
+      console.log('暂无定时任务。\n\n用法:\n  botmux schedule add "每日17:50" "帮我看AI新闻"\n  botmux schedule add "every 2h" "检查构建"\n  botmux schedule add "0 9 * * *" "每天早安"');
+      return;
+    }
+    const filter = argValue(rest, '--chat-id');
+    const filtered = filter ? tasks.filter(t => t.chatId === filter) : tasks;
+    console.log(`定时任务 (${filtered.length}${filter ? '/' + tasks.length : ''}):\n`);
+    for (const t of filtered) {
+      const status = t.enabled ? '✅' : '⏸️';
+      const next = t.nextRunAt ? new Date(t.nextRunAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '—';
+      const last = t.lastRunAt ? new Date(t.lastRunAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '—';
+      const display = t.parsed?.display ?? t.schedule;
+      const prompt = t.prompt ?? '';
+      const chatId = t.chatId ?? '—';
+      const rootId = t.rootMessageId ?? '—';
+      console.log(`${status} [${t.id}] ${display} | ${t.name}`);
+      console.log(`   prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
+      console.log(`   chat: ${chatId.slice(0, 12)}…   thread: ${rootId.slice(0, 16)}…`);
+      console.log(`   next: ${next}   last: ${last}${t.lastStatus === 'error' ? ' ❌' : ''}`);
+      console.log('');
+    }
+    return;
+  }
+
+  if (sub === 'add') {
+    const [rawSchedule, ...promptParts] = positionals(rest);
+    if (!rawSchedule) {
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR]');
+      process.exit(1);
+    }
+    // prompt may come from positional or --prompt flag
+    const promptArg = argValue(rest, '--prompt') ?? promptParts.join(' ');
+    if (!promptArg) {
+      console.error('缺少 prompt。用法: botmux schedule add <schedule> <prompt>');
+      process.exit(1);
+    }
+
+    const cur = detectCurrentSession();
+    const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
+    const rootMessageId = argValue(rest, '--root-msg-id') ?? cur?.rootMessageId;
+    const larkAppId = argValue(rest, '--lark-app-id') ?? cur?.larkAppId;
+    const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
+    const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
+    const deliver = (argValue(rest, '--deliver') as 'origin' | 'local' | undefined) ?? 'origin';
+
+    if (!chatId) {
+      console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
+      process.exit(1);
+    }
+
+    let parsed;
+    try { parsed = scheduler.parseSchedule(rawSchedule); }
+    catch (err: any) {
+      console.error(`无法解析 schedule "${rawSchedule}": ${err.message}`);
+      process.exit(1);
+    }
+
+    const task = scheduler.addTask({
+      name,
+      schedule: rawSchedule,
+      parsed,
+      prompt: promptArg,
+      workingDir,
+      chatId,
+      rootMessageId,
+      larkAppId,
+      chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
+      deliver,
+    });
+
+    const next = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '—';
+    console.log(`✅ 已创建定时任务 [${task.id}] ${task.name}`);
+    console.log(`   规则: ${parsed.display}`);
+    console.log(`   下次执行: ${next}`);
+    console.log(`   工作目录: ${workingDir}`);
+    console.log(`   话题: ${rootMessageId ?? '(将新开)'}`);
+    return;
+  }
+
+  const id = positionals(rest)[0];
+  if (!id) {
+    console.error(`用法: botmux schedule ${sub} <id>`);
+    process.exit(1);
+  }
+
+  switch (sub) {
+    case 'remove':
+    case 'rm':
+    case 'delete':
+    case 'del':
+      if (scheduler.removeTask(id)) console.log(`已删除任务 ${id}`);
+      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      break;
+    case 'pause':
+    case 'disable':
+      if (scheduler.disableTask(id)) console.log(`已暂停任务 ${id}`);
+      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      break;
+    case 'resume':
+    case 'enable':
+      if (scheduler.enableTask(id)) console.log(`已恢复任务 ${id}`);
+      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      break;
+    case 'run':
+      // Running requires the daemon (executeCallback is daemon-side).
+      // CLI can only mark a task to run ASAP; daemon's next tick picks it up.
+      {
+        const task = scheduleStore.getTask(id);
+        if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
+        scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
+        console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
+      }
+      break;
+    default:
+      console.error(`未知子命令: ${sub}\n可用: list | add | remove | pause | resume | run`);
+      process.exit(1);
+  }
+}
+
+async function cmdThreadMessages(rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const limit = parseInt(argValue(rest, '--limit') ?? '50', 10);
+  const sessionIdArg = argValue(rest, '--session-id');
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+
+  const sessions = loadSessions();
+  const s = sessions.get(sid);
+  if (!s) {
+    console.error(`未找到 session ${sid}`);
+    process.exit(1);
+  }
+
+  if (!s.larkAppId) {
+    console.error(`session ${sid} 缺少 larkAppId，无法获取消息`);
+    process.exit(1);
+  }
+
+  // Ensure bot is registered so getBotClient works
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  try {
+    for (const cfg of loadBotConfigs()) registerBot(cfg);
+  } catch { /* ignore */ }
+
+  const { listThreadMessages } = await import('./im/lark/client.js');
+  const { parseApiMessage } = await import('./im/lark/message-parser.js');
+  try {
+    const raw = await listThreadMessages(s.larkAppId, s.chatId, s.rootMessageId, limit);
+    const messages = raw.map(parseApiMessage);
+    console.log(JSON.stringify({ sessionId: sid, threadId: s.rootMessageId, messages, total: messages.length }, null, 2));
+  } catch (err: any) {
+    console.error(`获取话题消息失败: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -1177,5 +1444,12 @@ switch (command) {
   case 'delete':
   case 'del':
   case 'rm':      cmdDelete(); break;
+  case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'thread':   {
+    const sub = process.argv[3] ?? '';
+    if (sub === 'messages' || sub === 'msgs') await cmdThreadMessages(process.argv.slice(4));
+    else { console.error(`用法: botmux thread messages [--limit N] [--session-id ID]`); process.exit(1); }
+    break;
+  }
   default:        showHelp(); break;
 }

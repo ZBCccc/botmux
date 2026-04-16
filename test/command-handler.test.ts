@@ -73,7 +73,8 @@ vi.mock('../src/core/scheduler.js', () => ({
   enableTask: vi.fn(),
   disableTask: vi.fn(),
   runTaskNow: vi.fn(),
-  parseNaturalSchedule: vi.fn(),
+  parseNaturalSchedule: vi.fn().mockReturnValue(null),
+  parseSchedule: vi.fn(),
   getNextRun: vi.fn(),
   addTask: vi.fn(),
 }));
@@ -674,8 +675,8 @@ describe('handleCommand', () => {
         {
           id: 'task-1',
           name: 'Daily news',
-          type: 'cron',
           schedule: '50 17 * * *',
+          parsed: { kind: 'cron', expr: '50 17 * * *', display: '每日 17:50' },
           prompt: 'Check AI news',
           workingDir: '~/projects',
           chatId: CHAT_ID,

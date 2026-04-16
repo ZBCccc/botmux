@@ -331,27 +331,68 @@ export async function executeScheduledTask(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: (...args: any[]) => boolean,
 ): Promise<void> {
-  const defaultBot = getAllBots()[0];
-  if (!defaultBot) { logger.warn('No bots configured, skipping scheduled task'); return; }
-  const larkAppId = defaultBot.config.larkAppId;
+  // Resolve which bot to use — prefer the task's original bot so replies come from
+  // the same account the user set up the schedule with.
+  const allBots = getAllBots();
+  if (allBots.length === 0) { logger.warn('No bots configured, skipping scheduled task'); return; }
+  const bot =
+    (task.larkAppId && allBots.find(b => b.config.larkAppId === task.larkAppId)) ||
+    allBots[0];
+  const larkAppId = bot.config.larkAppId;
 
-  const { sendMessage } = await import('../im/lark/client.js');
+  const { sendMessage, replyMessage } = await import('../im/lark/client.js');
 
-  // Send a top-level message to create a thread
-  const rootMessageId = await sendMessage(
-    larkAppId,
-    task.chatId,
-    `🕐 定时任务「${task.name}」开始执行`,
-  );
+  // Decide where to route: preferred path is to reply inside the original thread.
+  // Fallback (legacy tasks without rootMessageId): post a new top-level message.
+  let threadRootId: string;
+  let isContinuation = false;
 
-  // Create a session for this thread
-  refreshCliVersion(defaultBot.config.cliId, defaultBot.config.cliPathOverride);
-  const session = sessionStore.createSession(task.chatId, rootMessageId, `[定时] ${task.name}`);
+  if (task.rootMessageId) {
+    try {
+      // Reply in the original thread — the returned reply message id is just an
+      // anchor for this run; the thread's root remains task.rootMessageId, which
+      // is what the session/card system keys off.
+      await replyMessage(
+        larkAppId,
+        task.rootMessageId,
+        `🕐 定时任务「${task.name}」开始执行`,
+        'text',
+        true, // reply_in_thread
+      );
+      threadRootId = task.rootMessageId;
+      isContinuation = true;
+    } catch (err: any) {
+      logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
+      threadRootId = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+    }
+  } else {
+    threadRootId = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+  }
+
+  refreshCliVersion(bot.config.cliId, bot.config.cliPathOverride);
+
+  // If a live session already exists for this thread (user was just chatting in it),
+  // inject the prompt as a follow-up message rather than spawning a fresh worker.
+  const existing = activeSessions.get(sessionKey(threadRootId, larkAppId));
+  if (isContinuation && existing?.worker && !existing.worker.killed) {
+    existing.lastMessageAt = Date.now();
+    try {
+      existing.worker.send({ type: 'message', content: task.prompt });
+      logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}`);
+      return;
+    } catch (err: any) {
+      logger.warn(`[scheduler] Failed to inject into live session (${err.message}); spawning fresh worker`);
+    }
+  }
+
+  // Otherwise create a new session bound to the original thread root so all the
+  // worker's replies continue to land under that topic in Lark.
+  const session = sessionStore.createSession(task.chatId, threadRootId, `[定时] ${task.name}`);
   session.larkAppId = larkAppId;
   sessionStore.updateSession(session);
-  messageQueue.ensureQueue(rootMessageId);
+  messageQueue.ensureQueue(threadRootId);
 
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, defaultBot.config.cliId, defaultBot.config.cliPathOverride);
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride);
 
   const ds: DaemonSession = {
     session,
@@ -360,15 +401,15 @@ export async function executeScheduledTask(
     workerToken: null,
     larkAppId,
     chatId: task.chatId,
-    chatType: 'group',
+    chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
     spawnedAt: Date.now(),
     cliVersion: getCurrentCliVersion(),
     lastMessageAt: Date.now(),
-    hasHistory: false,
+    hasHistory: isContinuation, // continuation sessions inherit the old thread's context
     workingDir: task.workingDir,
   };
-  activeSessions.set(sessionKey(rootMessageId, larkAppId), ds);
+  activeSessions.set(sessionKey(threadRootId, larkAppId), ds);
   forkWorker(ds, prompt);
 
-  logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId})`);
+  logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, thread: ${threadRootId}, continuation: ${isContinuation})`);
 }

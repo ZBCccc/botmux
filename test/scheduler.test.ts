@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/scheduler.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseNaturalSchedule } from '../src/core/scheduler.js';
+import { parseNaturalSchedule, parseSchedule, computeNextRun } from '../src/core/scheduler.js';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
@@ -16,9 +16,9 @@ import { parseNaturalSchedule } from '../src/core/scheduler.js';
 function expectParse(input: string, cron: string, prompt: string) {
   const result = parseNaturalSchedule(input);
   expect(result).not.toBeNull();
-  expect(result!.cron).toBe(cron);
+  expect(result!.parsed.kind).toBe('cron');
+  expect(result!.parsed.expr).toBe(cron);
   expect(result!.prompt).toBe(prompt);
-  expect(result!.type).toBe('cron');
 }
 
 // ─── 每天 / 每日 (daily) ─────────────────────────────────────────────────────
@@ -361,17 +361,142 @@ describe('WEEKDAY_MAP: all Chinese weekday names', () => {
 describe('Return value shape', () => {
   it('includes all expected fields', () => {
     const result = parseNaturalSchedule('每天9:00 检查服务');
-    expect(result).toEqual({
-      cron: '0 9 * * *',
-      type: 'cron',
-      prompt: '检查服务',
-      name: '检查服务',
-    });
+    expect(result).not.toBeNull();
+    expect(result!.parsed.kind).toBe('cron');
+    expect(result!.parsed.expr).toBe('0 9 * * *');
+    expect(result!.prompt).toBe('检查服务');
+    expect(result!.name).toBe('检查服务');
   });
 
-  it('type is always "cron"', () => {
+  it('recurring patterns are cron', () => {
     const result = parseNaturalSchedule('每30分钟 ping');
     expect(result).not.toBeNull();
-    expect(result!.type).toBe('cron');
+    expect(result!.parsed.kind).toBe('cron');
+    expect(result!.parsed.expr).toBe('*/30 * * * *');
+  });
+});
+
+// ─── New: Chinese one-shot patterns (N分钟后 / N小时后 / 明天X点) ─────────────
+
+describe('One-shot Chinese patterns', () => {
+  it('N分钟后 produces once schedule', () => {
+    const result = parseNaturalSchedule('30分钟后 提醒我喝水');
+    expect(result).not.toBeNull();
+    expect(result!.parsed.kind).toBe('once');
+    expect(result!.parsed.runAt).toBeTruthy();
+    const runAt = new Date(result!.parsed.runAt!).getTime();
+    const expected = Date.now() + 30 * 60_000;
+    expect(Math.abs(runAt - expected)).toBeLessThan(5_000);
+    expect(result!.prompt).toBe('提醒我喝水');
+  });
+
+  it('N小时后 produces once schedule', () => {
+    const result = parseNaturalSchedule('2小时后 检查部署');
+    expect(result).not.toBeNull();
+    expect(result!.parsed.kind).toBe('once');
+    const runAt = new Date(result!.parsed.runAt!).getTime();
+    const expected = Date.now() + 2 * 3600_000;
+    expect(Math.abs(runAt - expected)).toBeLessThan(5_000);
+  });
+
+  it('明天X点 produces once schedule at local tomorrow', () => {
+    const result = parseNaturalSchedule('明天9:00 看下邮件');
+    expect(result).not.toBeNull();
+    expect(result!.parsed.kind).toBe('once');
+    const runAt = new Date(result!.parsed.runAt!);
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    expect(runAt.getDate()).toBe(tomorrow.getDate());
+    expect(runAt.getHours()).toBe(9);
+    expect(runAt.getMinutes()).toBe(0);
+  });
+});
+
+// ─── New: parseSchedule() — bare schedule parser for CLI/MCP ─────────────────
+
+describe('parseSchedule (bare schedule strings)', () => {
+  it('cron expression', () => {
+    const p = parseSchedule('0 9 * * *');
+    expect(p.kind).toBe('cron');
+    expect(p.expr).toBe('0 9 * * *');
+  });
+
+  it('english "every 30m" → interval', () => {
+    const p = parseSchedule('every 30m');
+    expect(p.kind).toBe('interval');
+    expect(p.minutes).toBe(30);
+  });
+
+  it('english "every 2h" → interval 120m', () => {
+    const p = parseSchedule('every 2h');
+    expect(p.kind).toBe('interval');
+    expect(p.minutes).toBe(120);
+  });
+
+  it('duration "30m" → once in 30min', () => {
+    const p = parseSchedule('30m');
+    expect(p.kind).toBe('once');
+    const runAtMs = new Date(p.runAt!).getTime();
+    expect(Math.abs(runAtMs - (Date.now() + 30 * 60_000))).toBeLessThan(5_000);
+  });
+
+  it('ISO timestamp → once', () => {
+    const p = parseSchedule('2099-01-01T10:00:00');
+    expect(p.kind).toBe('once');
+    expect(new Date(p.runAt!).getFullYear()).toBe(2099);
+  });
+
+  it('chinese "每日17:50" → cron', () => {
+    const p = parseSchedule('每日17:50');
+    expect(p.kind).toBe('cron');
+    expect(p.expr).toBe('50 17 * * *');
+  });
+
+  it('throws on invalid', () => {
+    expect(() => parseSchedule('not a schedule')).toThrow();
+  });
+});
+
+// ─── New: computeNextRun() ───────────────────────────────────────────────────
+
+describe('computeNextRun', () => {
+  it('interval: first run is now + minutes', () => {
+    const next = computeNextRun({ kind: 'interval', minutes: 10, display: '每 10 分钟' });
+    expect(next).toBeTruthy();
+    const nextMs = new Date(next!).getTime();
+    expect(Math.abs(nextMs - (Date.now() + 10 * 60_000))).toBeLessThan(5_000);
+  });
+
+  it('interval: subsequent run is lastRun + minutes', () => {
+    const lastRun = new Date('2026-04-17T10:00:00Z').toISOString();
+    const next = computeNextRun({ kind: 'interval', minutes: 30, display: '每 30 分钟' }, lastRun);
+    expect(new Date(next!).toISOString()).toBe('2026-04-17T10:30:00.000Z');
+  });
+
+  it('once: returns runAt if still in future/grace', () => {
+    const future = new Date(Date.now() + 5 * 60_000).toISOString();
+    const next = computeNextRun({ kind: 'once', runAt: future, display: 'once' });
+    expect(next).toBe(future);
+  });
+
+  it('once: returns null once already run', () => {
+    const future = new Date(Date.now() + 5 * 60_000).toISOString();
+    const next = computeNextRun({ kind: 'once', runAt: future, display: 'once' }, new Date().toISOString());
+    expect(next).toBeNull();
+  });
+
+  it('once: returns null if runAt is past beyond grace', () => {
+    const past = new Date(Date.now() - 3600_000).toISOString();
+    const next = computeNextRun({ kind: 'once', runAt: past, display: 'once' });
+    expect(next).toBeNull();
+  });
+
+  it('cron: returns next wall-clock occurrence', () => {
+    // 0 9 * * * — daily at 09:00
+    const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
+    expect(next).toBeTruthy();
+    const nextDate = new Date(next!);
+    // Since timezone is Asia/Shanghai, getUTCHours should be 1 (09 - 08) except during DST (none in CN)
+    expect(nextDate.getTime()).toBeGreaterThan(Date.now());
   });
 });

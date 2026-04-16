@@ -72,6 +72,7 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,        // Ink TUI — '>' is too generic; rely on quiescence + spinner guard
     systemHints: [],
     altScreen: true,                // Ink renders in alternate screen buffer by default
+    skillsDir: '~/.gemini/skills',
   };
 }
 

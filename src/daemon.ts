@@ -686,11 +686,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore active sessions from previous run
   restoreActiveSessions(activeSessions);
 
-  // Start scheduled task scheduler (only on bot 0 to avoid duplicates)
-  if (idx === 0) {
-    scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
-    scheduler.startScheduler();
-  }
+  // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
+  // each filters to only execute tasks whose `larkAppId` matches its bot
+  // (unmatched tasks are handled by the owning bot's daemon instead; a
+  // missing larkAppId falls through to bot-0 as a legacy fallback).
+  scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
+  scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
+  scheduler.startScheduler();
 
   // Watch for bot-to-bot mention signals from MCP send_to_thread tool.
   // Lark WSClient does not deliver events for bot-sent messages, so the MCP

@@ -44,8 +44,8 @@ vi.mock('../src/utils/logger.js', () => ({
 
 const TASK_PARAMS = {
   name: 'Daily build',
-  type: 'cron' as const,
   schedule: '0 9 * * *',
+  parsed: { kind: 'cron' as const, expr: '0 9 * * *', display: '0 9 * * *' },
   prompt: 'Run the build pipeline',
   workingDir: '/workspace/project',
   chatId: 'oc_test_chat',
@@ -84,7 +84,8 @@ describe('schedule-store', () => {
       expect(task.id).toBeTypeOf('string');
       expect(task.id.length).toBe(8);
       expect(task.name).toBe(TASK_PARAMS.name);
-      expect(task.type).toBe(TASK_PARAMS.type);
+      expect(task.parsed.kind).toBe('cron');
+      expect(task.parsed.expr).toBe('0 9 * * *');
       expect(task.schedule).toBe(TASK_PARAMS.schedule);
       expect(task.prompt).toBe(TASK_PARAMS.prompt);
       expect(task.workingDir).toBe(TASK_PARAMS.workingDir);
@@ -280,13 +281,25 @@ describe('schedule-store', () => {
     it('should handle all three task types', async () => {
       const { createTask } = await freshImport();
 
-      const cron = createTask({ ...TASK_PARAMS, type: 'cron', schedule: '*/5 * * * *' });
-      const interval = createTask({ ...TASK_PARAMS, type: 'interval', schedule: '60000' });
-      const once = createTask({ ...TASK_PARAMS, type: 'once', schedule: '2026-12-31T23:59:59.000Z' });
+      const cron = createTask({
+        ...TASK_PARAMS,
+        schedule: '*/5 * * * *',
+        parsed: { kind: 'cron', expr: '*/5 * * * *', display: '*/5 * * * *' },
+      });
+      const interval = createTask({
+        ...TASK_PARAMS,
+        schedule: 'every 1m',
+        parsed: { kind: 'interval', minutes: 1, display: 'every 1m' },
+      });
+      const once = createTask({
+        ...TASK_PARAMS,
+        schedule: '2099-12-31T23:59:59.000Z',
+        parsed: { kind: 'once', runAt: '2099-12-31T23:59:59.000Z', display: 'once at 2099-12-31' },
+      });
 
-      expect(cron.type).toBe('cron');
-      expect(interval.type).toBe('interval');
-      expect(once.type).toBe('once');
+      expect(cron.parsed.kind).toBe('cron');
+      expect(interval.parsed.kind).toBe('interval');
+      expect(once.parsed.kind).toBe('once');
     });
 
     it('should create the data directory if it does not exist', async () => {

@@ -87,6 +87,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,        // Bubble Tea TUI — no reliable prompt indicator; rely on quiescence + spinner guard
     systemHints: [],
     altScreen: true,                // Bubble Tea renders in alternate screen buffer
+    skillsDir: '~/.config/opencode/skills',
   };
 }
 
