@@ -33,6 +33,7 @@ import {
   setCurrentCliVersion,
   getCurrentCliVersion,
   CARD_POSTING_SENTINEL,
+  closeSession as closeSessionHelper,
 } from './core/worker-pool.js';
 import { setBotName } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -808,8 +809,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getSessionWorkingDir,
     getActiveCount,
     closeSession(ds: DaemonSession) {
-      sessionStore.closeSession(ds.session.sessionId);
-      activeSessions.delete(sessionKey(ds.session.rootMessageId, ds.larkAppId));
+      // Route through the dashboard-aware helper so session.exited / session.update
+      // events fire for withdrawn-message / crash / adopt-exit teardown paths too,
+      // matching the dashboard-driven close.
+      void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent */ });
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
   });
