@@ -8,9 +8,15 @@ import { listActiveSessions, findActiveBySessionId, closeSession } from './worke
 import { replyMessage } from '../im/lark/client.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { DaemonSession } from './types.js';
-import type { Session, ScheduledTask, ParsedSchedule } from '../types.js';
-import type { CliId } from '../adapters/cli/types.js';
+import {
+  composeRowFromActive,
+  composeRowFromClosed,
+  feishuChatLink,
+  setBotName as setRowsBotName,
+  getBotName,
+  type SessionRow,
+} from './dashboard-rows.js';
+import type { ScheduledTask, ParsedSchedule } from '../types.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -58,78 +64,18 @@ ipcRoute('GET', '/__health', (_req, res) => {
 });
 
 // ─── Session list / detail ─────────────────────────────────────────────────
+// Row shape + composers live in dashboard-rows.ts so worker-pool can publish
+// SessionRow events without importing this module (which would create a cycle:
+// worker-pool → dashboard-ipc-server → worker-pool).
 
-export interface SessionRow {
-  sessionId: string;
-  larkAppId: string;
-  botName: string;
-  cliId: CliId | 'unknown';
-  status: 'starting' | 'working' | 'idle' | 'analyzing' | 'closed';
-  adopt: boolean;
-  spawnedAt: number;
-  lastMessageAt: number;
-  closedAt?: number;
-  workingDir?: string;
-  chatId: string;
-  rootMessageId: string;
-  threadId?: string;
-  title?: string;
-  ownerOpenId?: string;
-  webPort: number | null;
-  cliVersion?: string;
-  hasHistory?: boolean;
-  feishuChatLink: string;
-}
+export type { SessionRow };
+export { composeRowFromActive, composeRowFromClosed };
 
-function feishuChatLink(chatId: string): string {
-  return `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
-}
-
-let cachedBotName = '';
-export function setBotName(name: string): void { cachedBotName = name; }
-
-export function composeRowFromActive(ds: DaemonSession): SessionRow {
-  return {
-    sessionId: ds.session.sessionId,
-    larkAppId: ds.larkAppId,
-    botName: cachedBotName,
-    cliId: ds.session.cliId ?? 'unknown',
-    status: ds.lastScreenStatus ?? 'starting',
-    adopt: !!ds.adoptedFrom,
-    spawnedAt: ds.spawnedAt,
-    lastMessageAt: ds.lastMessageAt,
-    workingDir: ds.workingDir,
-    chatId: ds.chatId,
-    rootMessageId: ds.session.rootMessageId,
-    title: ds.session.title,
-    ownerOpenId: ds.ownerOpenId,
-    webPort: ds.workerPort ?? null,
-    cliVersion: ds.cliVersion,
-    hasHistory: ds.hasHistory,
-    feishuChatLink: feishuChatLink(ds.chatId),
-  };
-}
-
-export function composeRowFromClosed(s: Session): SessionRow {
-  return {
-    sessionId: s.sessionId,
-    larkAppId: s.larkAppId ?? '',
-    botName: cachedBotName,
-    cliId: s.cliId ?? 'unknown',
-    status: 'closed',
-    adopt: !!s.adoptedFrom,
-    spawnedAt: Date.parse(s.createdAt),
-    lastMessageAt: s.closedAt ? Date.parse(s.closedAt) : Date.parse(s.createdAt),
-    closedAt: s.closedAt ? Date.parse(s.closedAt) : undefined,
-    workingDir: s.workingDir,
-    chatId: s.chatId,
-    rootMessageId: s.rootMessageId,
-    title: s.title,
-    ownerOpenId: s.ownerOpenId,
-    webPort: s.webPort ?? null,
-    feishuChatLink: feishuChatLink(s.chatId),
-  };
-}
+// Re-export setBotName for backwards-compatible imports (daemon.ts).  Both
+// callers (this module's cachedBotName + dashboard-rows' cachedBotName) need
+// to be primed; here we forward to the rows module which is the canonical
+// holder.
+export function setBotName(name: string): void { setRowsBotName(name); }
 
 ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Active first (live state), closed appended (historical)
@@ -230,7 +176,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     chatId: t.chatId,
     rootMessageId: t.rootMessageId,
     larkAppId: t.larkAppId,
-    botName: cachedBotName,
+    botName: getBotName(),
     enabled: t.enabled,
     createdAt: t.createdAt,
     lastRunAt: t.lastRunAt,

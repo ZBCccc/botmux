@@ -348,11 +348,27 @@ async function tick(): Promise<void> {
     scheduleStore.updateTask(task.id, { lastRunAt: new Date().toISOString() });
 
     if (executeCallback) {
+      const taskId = task.id;
       executeCallback(task)
-        .then(() => scheduleStore.markRun(task.id, true))
+        .then(() => {
+          scheduleStore.markRun(taskId, true);
+          dashboardEventBus.publish({
+            type: 'schedule.fired',
+            body: { id: taskId, runAt: Date.now(), status: 'ok' },
+          });
+        })
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
-          scheduleStore.markRun(task.id, false, err.message);
+          scheduleStore.markRun(taskId, false, err.message);
+          dashboardEventBus.publish({
+            type: 'schedule.fired',
+            body: {
+              id: taskId,
+              runAt: Date.now(),
+              status: 'error',
+              error: err instanceof Error ? err.message : String(err),
+            },
+          });
         });
     }
   }

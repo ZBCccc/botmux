@@ -20,6 +20,7 @@ import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { composeRowFromActive } from './dashboard-rows.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, type DaemonSession } from './types.js';
@@ -298,10 +299,13 @@ export async function closeSession(
     killWorker(ds);
     activeSessionsRegistry?.delete(sessionKey(ds.session.rootMessageId, ds.larkAppId));
     killedLive = true;
-    dashboardEventBus.publish({
-      type: 'session.exited',
-      body: { sessionId, reason: 'dashboard_close' },
-    });
+    if (!ds.exitEventEmitted) {
+      ds.exitEventEmitted = true;
+      dashboardEventBus.publish({
+        type: 'session.exited',
+        body: { sessionId, reason: 'dashboard_close' },
+      });
+    }
   }
 
   // Persistence path — load → mark closed → save (delegated to sessionStore).
@@ -421,6 +425,15 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   }
   sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
+
+  // Reset the exit-emit flag for the freshly spawned worker so a subsequent
+  // exit publishes again (the previous lifecycle's flag would otherwise mask it).
+  ds.exitEventEmitted = false;
+  // Notify dashboard SSE subscribers a new session is live.
+  dashboardEventBus.publish({
+    type: 'session.spawned',
+    body: { session: composeRowFromActive(ds) },
+  });
 }
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
@@ -452,6 +465,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         const readOnlyUrl = `http://${config.web.externalHost}:${msg.port}`;
         const writeUrl = `${readOnlyUrl}?token=${msg.token}`;
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
+        // Dashboard: surface the new xterm port so the live terminal link works.
+        dashboardEventBus.publish({
+          type: 'session.update',
+          body: {
+            sessionId: ds.session.sessionId,
+            patch: { webPort: msg.port },
+          },
+        });
 
         // If a previous streaming card survived (e.g. daemon restart), try to
         // PATCH it with the new "starting" state instead of POSTing a fresh card.
@@ -567,6 +588,24 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = msg.status;
 
+        // Dashboard: publish a patch only when status truly transitioned, so
+        // SSE clients reflect real state changes (starting → working → idle)
+        // without flooding on every PTY tick. The screen analyzer is the
+        // upstream debouncer — by the time we get here, status flips are
+        // already coarse-grained.
+        if (prevStatus !== msg.status) {
+          dashboardEventBus.publish({
+            type: 'session.update',
+            body: {
+              sessionId: ds.session.sessionId,
+              patch: {
+                status: ds.lastScreenStatus,
+                lastMessageAt: ds.lastMessageAt,
+              },
+            },
+          });
+        }
+
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
@@ -677,7 +716,17 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         ds.tuiPromptOptions = msg.options;
         ds.tuiPromptMultiSelect = msg.multiSelect;
         ds.tuiToggledIndices = [];
+        const prevTuiTurnTitle = ds.currentTurnTitle;
         ds.currentTurnTitle = msg.description;  // store for card PATCH on toggle
+        if (prevTuiTurnTitle !== ds.currentTurnTitle) {
+          dashboardEventBus.publish({
+            type: 'session.update',
+            body: {
+              sessionId: ds.session.sessionId,
+              patch: { title: ds.currentTurnTitle },
+            },
+          });
+        }
         try {
           const cardJson = buildTuiPromptCard(
             ds.session.rootMessageId,
@@ -846,6 +895,19 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       ds.worker = null;
       ds.workerPort = null;
     }
+    // Notify dashboard, but only once per session lifecycle. The
+    // dashboard-driven `closeSession()` path also publishes; whichever
+    // fires first wins, the other's emit is suppressed.
+    if (!ds.exitEventEmitted) {
+      ds.exitEventEmitted = true;
+      dashboardEventBus.publish({
+        type: 'session.exited',
+        body: {
+          sessionId: ds.session.sessionId,
+          reason: code === 0 ? 'graceful' : `exit_code_${code}`,
+        },
+      });
+    }
   });
 }
 
@@ -1011,6 +1073,12 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     sessionStore.updateSession(ds.session);
   }
   logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget})`);
+
+  ds.exitEventEmitted = false;
+  dashboardEventBus.publish({
+    type: 'session.spawned',
+    body: { session: composeRowFromActive(ds) },
+  });
 }
 
 // ─── Kill stale PIDs ────────────────────────────────────────────────────────

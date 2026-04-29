@@ -71,6 +71,11 @@ export interface DaemonSession {
    *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
    *  the worker re-drains the transcript after a noisy idle). */
   lastBridgeEmittedUuid?: string;
+  /** Flag flipped to true once a `session.exited` dashboard event has been
+   *  published for this session. Both the dashboard-driven close path
+   *  (closeSession) and the worker-process exit handler may try to publish;
+   *  this guard prevents double-counting on the dashboard side. */
+  exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode). */
   adoptedFrom?: {
     tmuxTarget: string;       // e.g. "0:2.0" — user's original tmux pane
