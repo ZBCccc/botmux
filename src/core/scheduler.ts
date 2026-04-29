@@ -475,8 +475,18 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (!executeCallback) return { ok: false, error: 'not_initialised' };
-  // Don't block the caller — fire on next tick.
-  void executeCallback(task).then(
+  // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
+  // re-fire the same task while this manual run is still in flight.
+  const nowIso = new Date().toISOString();
+  const next = computeNextRun(task.parsed, nowIso);
+  scheduleStore.updateTask(id, {
+    lastRunAt: nowIso,
+    nextRunAt: next ?? undefined,
+  });
+  // Don't block the caller — fire on next tick. `Promise.resolve().then`
+  // coerces a synchronous throw from executeCallback into a rejection so the
+  // error path always runs and we don't leak a 500 to the IPC client.
+  void Promise.resolve().then(() => executeCallback!(task)).then(
     () => {
       scheduleStore.markRun(task.id, true);
       dashboardEventBus.publish({
