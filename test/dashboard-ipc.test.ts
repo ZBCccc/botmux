@@ -1,13 +1,17 @@
 // test/dashboard-ipc.test.ts
-import { describe, it, expect, afterEach } from 'vitest';
-import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { startIpcServer, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import * as groupsStore from '../src/services/groups-store.js';
 
 let handle: IpcServerHandle | null = null;
 
 afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
+  // Reset module-level larkAppId between tests so groups endpoints don't
+  // leak state across describes.
+  setLarkAppId('');
 });
 
 describe('dashboard IPC server', () => {
@@ -127,4 +131,62 @@ describe('SSE /api/events', () => {
     reader.releaseLock();
     await res.body!.cancel();
   }, 5_000);
+});
+
+describe('GET /api/groups (Phase B)', () => {
+  it('returns 503 when larkAppId not set', async () => {
+    setLarkAppId('');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error).toBe('larkAppId_not_set');
+  });
+
+  it('lists chats from groups-store when larkAppId set', async () => {
+    setLarkAppId('test-app');
+    const spy = vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
+      { chatId: 'oc_1', name: 'team' },
+    ]);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team' }]);
+    spy.mockRestore();
+  });
+});
+
+describe('POST /api/groups/:chatId/add-bots (Phase B)', () => {
+  it('rejects bad body', async () => {
+    setLarkAppId('test-app');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/oc_1/add-bots`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('forwards to groups-store and returns per-id result', async () => {
+    setLarkAppId('test-app');
+    const spy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([
+      { id: 'cli_X', ok: true },
+      { id: 'cli_Y', ok: false, error: 'invalid_id' },
+    ]);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/oc_1/add-bots`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ larkAppIds: ['cli_X', 'cli_Y'] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.result).toEqual([
+      { id: 'cli_X', ok: true },
+      { id: 'cli_Y', ok: false, error: 'invalid_id' },
+    ]);
+    spy.mockRestore();
+  });
 });

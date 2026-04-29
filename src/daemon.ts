@@ -36,7 +36,7 @@ import {
   CARD_POSTING_SENTINEL,
   closeSession as closeSessionHelper,
 } from './core/worker-pool.js';
-import { setBotName, startIpcServer } from './core/dashboard-ipc-server.js';
+import { setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -826,6 +826,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // /bot/v3/info is wired into the registry descriptor (above) but the IPC server
   // also needs its own copy for SessionRow.botName.
   setBotName(cfg.larkAppId);
+  setLarkAppId(cfg.larkAppId);
 
   // Bind dashboard IPC HTTP server. Binds to 127.0.0.1 only — the dashboard
   // sibling process is the sole consumer and runs on the same host.

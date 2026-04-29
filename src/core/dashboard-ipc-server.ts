@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { logger } from '../utils/logger.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import * as groupsStore from '../services/groups-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession } from './worker-pool.js';
 import { replyMessage } from '../im/lark/client.js';
@@ -76,6 +77,11 @@ export { composeRowFromActive, composeRowFromClosed };
 // to be primed; here we forward to the rows module which is the canonical
 // holder.
 export function setBotName(name: string): void { setRowsBotName(name); }
+
+// The daemon's own larkAppId, primed at startup. Required for the groups
+// endpoints below which proxy calls into groups-store on this bot's behalf.
+let cachedLarkAppId = '';
+export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
 
 ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Active first (live state), closed appended (historical)
@@ -199,6 +205,47 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
+
+// ─── Groups (Phase B) ──────────────────────────────────────────────────────
+
+ipcRoute('GET', '/api/groups', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const chats = await groupsStore.listChats(cachedLarkAppId);
+    jsonRes(res, 200, { chats });
+  } catch (e) {
+    jsonRes(res, 502, { error: String(e) });
+  }
+});
+
+ipcRoute('GET', '/api/groups/:chatId/membership', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const inChat = await groupsStore.isInChat(cachedLarkAppId, p.chatId);
+    jsonRes(res, 200, { inChat });
+  } catch (e) {
+    jsonRes(res, 502, { error: String(e) });
+  }
+});
+
+ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { larkAppIds?: unknown };
+  try {
+    body = await readJsonBody<{ larkAppIds?: string[] }>(req);
+  } catch {
+    return jsonRes(res, 400, { error: 'bad_json' });
+  }
+  if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
+    return jsonRes(res, 400, { error: 'larkAppIds_required' });
+  }
+  try {
+    const result = await groupsStore.addBotToChat(cachedLarkAppId, p.chatId, body.larkAppIds as string[]);
+    jsonRes(res, 200, { result });
+  } catch (e) {
+    jsonRes(res, 502, { error: String(e) });
+  }
+});
 
 // ─── SSE event stream ──────────────────────────────────────────────────────
 
