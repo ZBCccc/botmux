@@ -30,6 +30,8 @@ export interface Session {
   currentTurnTitle?: string;
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
+  /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
+  cliId?: import('./adapters/cli/types.js').CliId;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts. */
   adoptedFrom?: {
     tmuxTarget: string;

@@ -339,6 +339,13 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   ds.worker = worker;
   ds.spawnedAt = Date.now();
   ds.cliVersion = currentCliVersion;
+  // Stamp cliId on the persisted session so the dashboard can show a CLI badge
+  // even after the session is closed. Subsequent updateSession spreads carry
+  // this field forward for free.
+  if (ds.session.cliId !== botCfg.cliId) {
+    ds.session.cliId = botCfg.cliId;
+    sessionStore.updateSession(ds.session);
+  }
   sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
 }
@@ -923,6 +930,13 @@ export function forkAdoptWorker(ds: DaemonSession): void {
   ds.worker = worker;
   ds.spawnedAt = Date.now();
   ds.cliVersion = '';
+  // Stamp cliId on the persisted session so the dashboard can show a CLI badge
+  // even after the session is closed. Adopt sessions inherit the adopted CLI's id.
+  const adoptedCliIdTyped = adoptedCliId as CliId;
+  if (ds.session.cliId !== adoptedCliIdTyped) {
+    ds.session.cliId = adoptedCliIdTyped;
+    sessionStore.updateSession(ds.session);
+  }
   logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget})`);
 }
 

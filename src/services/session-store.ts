@@ -33,6 +33,7 @@ function ensureDir(): void {
   }
 }
 
+// Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
   ensureDir();
