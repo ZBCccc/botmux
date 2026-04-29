@@ -2,12 +2,20 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>botmux dashboard</title>
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-  <h1>botmux dashboard</h1>
-  <p>Frontend bundle pending — Tasks 21/22.</p>
+  <header class="topbar">
+    <strong>botmux</strong>
+    <nav>
+      <a href="#/" data-route="sessions">Sessions</a>
+      <a href="#/schedules" data-route="schedules">Schedules</a>
+    </nav>
+    <span id="status" class="status"></span>
+  </header>
+  <main id="root"></main>
   <script src="/assets/app.js"></script>
 </body>
 </html>
