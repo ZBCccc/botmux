@@ -1,0 +1,79 @@
+import { readdirSync, readFileSync, watch, type FSWatcher } from 'node:fs';
+import { join } from 'node:path';
+
+export interface DaemonInfo {
+  larkAppId: string;
+  botName: string;
+  botIndex: number;
+  ipcPort: number;
+  pid: number;
+  startedAt: number;
+  lastHeartbeat: number;
+}
+
+const STALE_MS = 90_000;
+
+export type RegistryListener = (online: DaemonInfo[]) => void;
+
+/**
+ * Watches the dashboard-daemons descriptor directory and exposes the
+ * currently-online daemons (filtered by 90s heartbeat staleness).
+ */
+export class DaemonRegistry {
+  private items = new Map<string, DaemonInfo>();
+  private listeners = new Set<RegistryListener>();
+  private watcher?: FSWatcher;
+
+  constructor(private dir: string) {}
+
+  async start(): Promise<void> {
+    this.refresh();
+    try {
+      this.watcher = watch(this.dir, { persistent: true }, () => this.refresh());
+    } catch {
+      // Directory may not exist yet — caller is expected to ensure it exists
+      // or the dashboard runs with an empty registry until the daemon writes.
+    }
+  }
+
+  stop(): void {
+    this.watcher?.close();
+    this.watcher = undefined;
+  }
+
+  list(): DaemonInfo[] {
+    const now = Date.now();
+    return [...this.items.values()].filter(d => now - d.lastHeartbeat <= STALE_MS);
+  }
+
+  getByAppId(id: string): DaemonInfo | undefined {
+    const d = this.items.get(id);
+    if (!d) return undefined;
+    return Date.now() - d.lastHeartbeat > STALE_MS ? undefined : d;
+  }
+
+  on(fn: RegistryListener): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private refresh(): void {
+    let names: string[] = [];
+    try { names = readdirSync(this.dir); } catch { return; }
+    const next = new Map<string, DaemonInfo>();
+    for (const n of names) {
+      if (!n.endsWith('.json')) continue;
+      try {
+        const d = JSON.parse(readFileSync(join(this.dir, n), 'utf8')) as DaemonInfo;
+        next.set(d.larkAppId, d);
+      } catch {
+        // Skip malformed / partially-written files
+      }
+    }
+    this.items = next;
+    const online = this.list();
+    for (const fn of this.listeners) {
+      try { fn(online); } catch { /* swallow */ }
+    }
+  }
+}
