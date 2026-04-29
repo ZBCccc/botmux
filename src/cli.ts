@@ -23,6 +23,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
+import { createHmac, randomBytes } from 'node:crypto';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -573,6 +574,47 @@ function cmdUpgrade(): void {
     console.error('❌ 升级失败，请手动运行: npm install -g botmux@latest');
     process.exit(1);
   }
+}
+
+/**
+ * Print a fresh dashboard URL by HMAC-authing to the dashboard process's
+ * loopback rotation endpoint. Each call invalidates the previously-issued
+ * token, so sharing a URL is the same as sharing a one-shot session.
+ */
+async function cmdDashboard(): Promise<void> {
+  const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
+  if (!existsSync(SECRET_PATH)) {
+    console.error('Dashboard not initialised. Run `pnpm daemon:restart` first.');
+    process.exit(1);
+  }
+  const secret = readFileSync(SECRET_PATH, 'utf8').trim();
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const nonce = randomBytes(8).toString('hex');
+  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
+  const port = process.env.BOTMUX_DASHBOARD_PORT ?? '7891';
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}/__cli/rotate`, {
+      method: 'POST',
+      headers: {
+        'X-Botmux-Cli-Ts': ts,
+        'X-Botmux-Cli-Nonce': nonce,
+        'X-Botmux-Cli-Auth': sig,
+      },
+    });
+  } catch {
+    console.error(
+      `dashboard process not reachable on 127.0.0.1:${port} — \`pnpm daemon:restart\` will start it`,
+    );
+    process.exit(1);
+  }
+  if (!res.ok) {
+    console.error('Rotation failed:', res.status, await res.text());
+    process.exit(1);
+  }
+  const body = await res.json() as { url: string };
+  console.log(body.url);
 }
 
 // ─── Session helpers ──────────────────────────────────────────────────────────
@@ -1257,6 +1299,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   logs        查看 daemon 日志（--lines N, --bot <index>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
+  dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -2148,6 +2191,7 @@ switch (command) {
   case 'logs':    cmdLogs(); break;
   case 'status':  cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
+  case 'dashboard': await cmdDashboard(); break;
   case 'list':
   case 'ls':      await cmdList(); break;
   case 'delete':
