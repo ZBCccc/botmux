@@ -714,6 +714,10 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
     }
     const enrichedContent = enrichedParts.join('\n\n');
     ds.lastMessageAt = Date.now();
+    // Park the current streaming card so the new turn's POST can recall it.
+    // Without this the bot-to-bot mention path leaves old cards stranded —
+    // it bypasses the user-message freeze block in handleThreadReply.
+    parkStreamCard(ds);
     ds.streamCardPending = true;
     ds.currentTurnTitle = signal.content.substring(0, 50);
     persistStreamCardState(ds);
