@@ -1970,7 +1970,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       // be the session owner), plus a `cc` line listing oncall owners so they
       // stay informed. Non-oncall: keep owner-only behaviour.
       const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-      const addressing = buildFooterAddressing(s, oncallEntry);
+      // Top-level publish has no specific recipient — drop "发送给/cc" addressing
+      // so the message doesn't @ the session owner who isn't even in the target chat.
+      const addressing = sendTopLevel
+        ? { sendTo: undefined as string | undefined, cc: [] as string[] }
+        : buildFooterAddressing(s, oncallEntry);
       if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
       if (addressing.cc.length > 0) {
         footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
@@ -2019,8 +2023,11 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       // Footer: mirror the card layout — a blank paragraph separates the body
       // from the addressing line(s). `发送给: @<caller>` always; oncall groups
-      // additionally get `cc: @<owners>` on the next line.
-      const addressing = buildFooterAddressing(s, oncallEntry);
+      // additionally get `cc: @<owners>` on the next line. Top-level publish
+      // has no specific recipient — skip addressing entirely.
+      const addressing = sendTopLevel
+        ? { sendTo: undefined as string | undefined, cc: [] as string[] }
+        : buildFooterAddressing(s, oncallEntry);
       if (addressing.sendTo || addressing.cc.length > 0) {
         if (postContent.length > 0) postContent.push([{ tag: 'text', text: '' }]);
         if (addressing.sendTo) {
