@@ -34,6 +34,7 @@ import {
   setCurrentCliVersion,
   getCurrentCliVersion,
   CARD_POSTING_SENTINEL,
+  parkStreamCard,
   closeSession as closeSessionHelper,
 } from './core/worker-pool.js';
 import { setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
@@ -653,6 +654,12 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     // card instead of PATCHing the previous turn's card in place.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     ds.currentTurnTitle = parsed.content.substring(0, 50);
+    // The cosmetic freeze step (above) is gated on a live worker. With no
+    // worker we just park the current card in frozenCards — the upcoming
+    // new POST will recall it. Parking instead of deleting preserves the
+    // "old card stays until a new one is live" invariant: if fork /
+    // worker_ready / POST fails, the user still sees the previous card.
+    parkStreamCard(ds);
     ds.streamCardId = undefined;
     ds.streamCardNonce = undefined;
     persistStreamCardState(ds);

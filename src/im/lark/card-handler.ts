@@ -12,7 +12,7 @@ import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromp
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, killWorker, scheduleCardPatch } from '../../core/worker-pool.js';
+import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState } from '../../core/session-manager.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, frozenDisplayMode } from '../../core/types.js';
@@ -562,12 +562,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     await sessionReply(rootId, `✅ 已选择 ${displayName}`);
     logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);
   } else {
-    // Mid-session repo switch — close old session, start fresh
+    // Mid-session repo switch — close old session, start fresh.
     killWorker(targetDs);
+    // Park the current card in `frozenCards` so the next POST under the new
+    // session sweeps it via recall. closeSession() wipes the on-disk
+    // frozen-cards file under the OLD sessionId, but the in-memory Map
+    // travels with `targetDs` into the new session and still carries the
+    // old messageId for deletion. If fork or POST fails, the parked card
+    // stays in the thread instead of vanishing prematurely.
+    parkStreamCard(targetDs);
     sessionStore.closeSession(targetDs.session.sessionId);
     const session = sessionStore.createSession(targetDs.chatId, rootId, displayName, targetDs.chatType);
     targetDs.session = session;
     targetDs.hasHistory = false;
+    // Re-persist the parked card under the NEW sessionId so a daemon crash
+    // before the next POST doesn't strand it. closeSession() above wiped
+    // the on-disk file under the OLD sessionId; without this re-save, the
+    // in-memory Map only survives in process memory.
+    if (targetDs.frozenCards && targetDs.frozenCards.size > 0) {
+      saveFrozenCards(targetDs.session.sessionId, targetDs.frozenCards);
+    }
     // Drop the old turn's streaming-card reference so worker_ready POSTs a
     // fresh card for the new session instead of PATCHing the previous one.
     targetDs.streamCardId = undefined;

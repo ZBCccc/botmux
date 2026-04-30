@@ -12,8 +12,9 @@ import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
-import { updateMessage, MessageWithdrawnError } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
@@ -87,6 +88,71 @@ function tag(ds: DaemonSession): string {
 // the first POST returns a real message_id.
 export const CARD_POSTING_SENTINEL = '__posting__';
 
+/**
+ * Move the current streaming card into `frozenCards` without freezing it
+ * cosmetically. The next successful card POST will sweep it via
+ * `recallFrozenCards`. Used on paths that bypass the normal freeze step
+ * (worker dead before a new turn, repo switch tearing down the session) so
+ * we never delete the only visible card before its successor exists — if
+ * fork / worker_ready / POST fails, the parked card stays in the thread.
+ *
+ * Lazy-loads `frozenCards` from disk if the in-memory Map is missing
+ * (post daemon-restart, before any card-handler action has loaded it).
+ * Without this, parking would synthesize an empty Map and the subsequent
+ * `saveFrozenCards` would overwrite earlier turns' entries on disk —
+ * stranding their cards in the thread with no way to recall them.
+ *
+ * No-op when there is no live card to park.
+ */
+export function parkStreamCard(ds: DaemonSession): void {
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) return;
+  if (!ds.streamCardNonce) return;
+  if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
+  ds.frozenCards.set(ds.streamCardNonce, {
+    messageId: ds.streamCardId,
+    content: ds.lastScreenContent ?? '',
+    title: ds.currentTurnTitle ?? '',
+    displayMode: ds.displayMode ?? 'hidden',
+    imageKey: ds.currentImageKey,
+  });
+  saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+}
+
+/**
+ * Delete previously-frozen streaming cards from Lark and clear the cache.
+ * Called whenever a new streaming card becomes the active one — old turns'
+ * cards just add visual clutter when scrolling thread history.
+ *
+ * Lazy-loads `frozenCards` from disk if the in-memory Map is missing
+ * (post daemon-restart). Best-effort delete; failures (already withdrawn,
+ * expired) are non-fatal.
+ *
+ * Skips any entry whose messageId matches `ds.streamCardId` — guards the
+ * daemon-restart window where a turn was frozen (entry persisted to disk)
+ * but a new card was never POSTed before the crash. After restart the same
+ * messageId is the live `streamCardId` again, and recalling it would delete
+ * the only card the user can see.
+ */
+export function recallFrozenCards(ds: DaemonSession): void {
+  if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
+  if (ds.frozenCards.size === 0) return;
+  const activeId = ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL
+    ? ds.streamCardId
+    : undefined;
+  const targets: string[] = [];
+  for (const [nonce, fc] of [...ds.frozenCards.entries()]) {
+    if (activeId && fc.messageId === activeId) continue;
+    targets.push(fc.messageId);
+    ds.frozenCards.delete(nonce);
+  }
+  if (targets.length === 0) return;
+  saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+  for (const messageId of targets) {
+    deleteMessage(ds.larkAppId, messageId).catch(() => { /* best-effort */ });
+  }
+  logger.info(`[${tag(ds)}] Recalled ${targets.length} previous streaming card(s)`);
+}
+
 // ─── Card PATCH serialization queue ─────────────────────────────────────────
 // Only one PATCH in-flight at a time per session. New PATCHes queue on
 // ds.pendingCardJson (latest wins). When the in-flight PATCH completes,
@@ -122,9 +188,20 @@ function flushCardPatch(ds: DaemonSession): void {
   updateMessage(ds.larkAppId, cardId, json)
     .catch(err => {
       if (err instanceof MessageWithdrawnError) {
-        logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
-        ds.streamCardId = undefined;
-        persistStreamCardState(ds);
+        // Only clear streamCardId when the withdrawn message is still the
+        // active one. With auto-recall a new turn may have advanced
+        // ds.streamCardId past `cardId` while this PATCH was in flight (the
+        // recall on the new POST deletes the previous card, which surfaces
+        // here as MessageWithdrawnError). Clearing unconditionally would
+        // forget the live new card and trigger a duplicate POST on the next
+        // screen_update.
+        if (ds.streamCardId === cardId) {
+          logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
+          ds.streamCardId = undefined;
+          persistStreamCardState(ds);
+        } else {
+          logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} withdrawn (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
+        }
         return;
       }
       logger.debug(`[${tag(ds)}] Failed to update streaming card: ${err}`);
@@ -507,6 +584,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
               ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
             }
+            // The restored card is now the active one — withdraw any cards
+            // frozen before the daemon went down so they don't pile up in the
+            // thread on each restart.
+            recallFrozenCards(ds);
             logger.info(`[${t}] Reused existing streaming card ${restoredCardId.substring(0, 12)} after worker (re)start`);
             break;
           } catch (err) {
@@ -540,6 +621,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
           persistStreamCardState(ds);
+          // New card is live — recall any cards frozen by previous turns.
+          // Done after `streamCardId` is committed so we never delete the old
+          // card without a successor visible to the user.
+          recallFrozenCards(ds);
         } catch (err) {
           if (err instanceof MessageWithdrawnError) {
             logger.warn(`[${t}] Root message withdrawn, closing stale session`);
