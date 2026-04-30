@@ -388,7 +388,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         currentTurnTitle: session.currentTurnTitle,
       };
       activeSessions.set(sessionKey(session.rootMessageId, larkAppId), ds);
-      forkAdoptWorker(ds);
+      forkAdoptWorker(ds, { restoredFromMetadata: true });
       logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adopted.tmuxTarget})`);
       continue;
     }

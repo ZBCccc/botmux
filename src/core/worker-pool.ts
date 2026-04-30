@@ -1052,7 +1052,7 @@ export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
-export function forkAdoptWorker(ds: DaemonSession): void {
+export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
@@ -1140,6 +1140,13 @@ export function forkAdoptWorker(ds: DaemonSession): void {
     // session-discovery couldn't probe sessionId up-front).
     adoptCliPid: (adoptedCliId === 'claude-code' || adoptedCliId === 'codex') ? adopted.originalCliPid : undefined,
     adoptCwd: (adoptedCliId === 'claude-code' || adoptedCliId === 'codex') ? adopted.cwd : undefined,
+    // Restored-from-metadata: this fork is recreating an /adopt session after
+    // a daemon restart, NOT a fresh /adopt command. The Lark thread already
+    // has every prior turn pushed as cards, so the worker should skip the
+    // "📜 /adopt 前最后一轮" preamble (it would surface a stale turn from
+    // whichever jsonl was current at the original /adopt time, which may be
+    // way out of date if the user has /clear'd since).
+    adoptRestoredFromMetadata: opts?.restoredFromMetadata === true ? true : undefined,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

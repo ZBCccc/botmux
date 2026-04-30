@@ -1,4 +1,4 @@
-import { existsSync, statSync, openSync, readSync, closeSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, readFileSync, readdirSync, readlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
@@ -122,6 +122,54 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string): { path: s
     path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd),
     cliSessionId: parsed.sessionId,
   };
+}
+
+/** Linux-only: probe `/proc/<pid>/fd` for any signal that reveals Claude's
+ *  CURRENT sessionId — not the spawn-time one the pid file records. Two
+ *  signals are checked:
+ *    1. Direct `.jsonl` symlinks under `~/.claude/projects/...` — Claude
+ *       opens-writes-closes per event, so this only hits if the probe
+ *       lands during a write window.
+ *    2. `~/.claude/tasks/<sessionId>(/...)` symlinks — Claude holds the
+ *       tasks directory and its `.lock` file open continuously for the
+ *       duration of the active session, so this signal is reliable even
+ *       between writes. This is the path that catches in-pane `/clear`
+ *       rotations the pid file can't see (pid file's `sessionId` is set
+ *       once at process start; tasks dir tracks every rotation).
+ *  Returns deduplicated sessionIds in arbitrary order; caller picks one
+ *  (typically by mtime of the corresponding jsonl). Returns [] on
+ *  non-Linux platforms or if /proc lookup fails. */
+export function findOpenClaudeSessionIds(pid: number): string[] {
+  if (!Number.isInteger(pid) || pid <= 0) return [];
+  if (process.platform !== 'linux') return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(`/proc/${pid}/fd`);
+  } catch {
+    return [];
+  }
+  const tasksPrefix = join(homedir(), '.claude', 'tasks') + '/';
+  const projectsInfix = '/.claude/projects/';
+  const out = new Set<string>();
+  for (const name of entries) {
+    let target: string;
+    try {
+      target = readlinkSync(`/proc/${pid}/fd/${name}`);
+    } catch {
+      continue;
+    }
+    if (target.startsWith(tasksPrefix)) {
+      const sid = target.slice(tasksPrefix.length).split('/')[0];
+      if (sid && SESSION_UUID_RE.test(sid)) out.add(sid);
+      continue;
+    }
+    if (target.endsWith('.jsonl') && target.includes(projectsInfix)) {
+      const base = target.split('/').pop() ?? '';
+      const sid = base.endsWith('.jsonl') ? base.slice(0, -'.jsonl'.length) : '';
+      if (sid && SESSION_UUID_RE.test(sid)) out.add(sid);
+    }
+  }
+  return [...out];
 }
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed|Baked|Brewed) for \d+[smh]/;

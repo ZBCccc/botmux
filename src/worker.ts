@@ -44,7 +44,7 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
-import { claudeJsonlPathForSession, resolveJsonlFromPid } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
 import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -271,6 +271,12 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
   // Lark thread (every turn was already pushed there as a card), so
   // surfacing the last turn again on daemon restart is just noise.
   if (!lastInitConfig?.adoptMode) return;
+  // Same logic for /adopt sessions restored after a daemon restart: the
+  // Lark thread already has every prior turn pushed as cards, AND the
+  // baseline jsonl persisted in session metadata may be stale (Claude
+  // could have /clear'd since the original /adopt), so a preamble here
+  // would surface old, out-of-context content.
+  if (lastInitConfig?.adoptRestoredFromMetadata) return;
   if (bridgePreambleSent) return;
   const turn = extractLastAssistantTurn(events);
   if (!turn) return;
@@ -876,10 +882,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // Claude was launched with `--resume` (or the adopt scan picked a
   // stale jsonl), the pid file points at the actual current sessionId
   // and we swap to it before baseline so we don't waste a baseline on
-  // a frozen file. Note: in-pane `/clear` between adopt and worker
-  // spawn would NOT show up here (pid file's `sessionId` is set once
-  // at process start) — that case is recovered later by the
-  // fingerprint fallback once a Lark turn arrives.
+  // a frozen file.
   if (bridgeCliPid && bridgeCliCwd) {
     const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
     if (resolved) {
@@ -889,6 +892,40 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
         log(`Bridge transcript adjusted at start (pid resolver): ${bridgeJsonlPath} → ${resolved.path}`);
         bridgeJsonlPath = resolved.path;
         bridgeJsonlDir = dirname(resolved.path);
+      }
+    }
+  }
+  // fd probe at start: the pid file's `sessionId` is set ONCE at Claude's
+  // process start and is NOT refreshed by in-pane `/clear`. So if the user
+  // /clear'd between the original /adopt and this worker spawn (most
+  // commonly: daemon restart that restored a long-lived adopt session),
+  // pid resolver still points at the spawn-time jsonl while Claude has
+  // rotated to a new one. `/proc/<pid>/fd` shows what Claude *currently*
+  // has open — bound to our pid, so no sibling-pane hijack risk.
+  //
+  // Two signals matter: direct `.jsonl` fd (only present during a write
+  // window — Claude opens-writes-closes per event) and `~/.claude/tasks/
+  // <sid>` symlinks (Claude holds the tasks dir + its .lock file open
+  // continuously for the active session, so this catches the rotation
+  // even between writes). `findOpenClaudeSessionIds` unions both.
+  if (bridgeCliPid !== undefined && bridgeJsonlDir && bridgeCliCwd) {
+    const sids = findOpenClaudeSessionIds(bridgeCliPid);
+    const candidates: string[] = [];
+    for (const sid of sids) {
+      const path = claudeJsonlPathForSession(sid, bridgeCliCwd);
+      bridgeRememberSessionIdForPath(path);
+      if (existsSyncSafe(path)) candidates.push(path);
+    }
+    if (candidates.length > 0) {
+      const newest = newestPath(candidates);
+      if (newest && newest !== bridgeJsonlPath) {
+        log(`Bridge transcript adjusted at start (pid fd probe — Claude rotated since worker spawn): ${bridgeJsonlPath} → ${newest}`);
+        bridgeJsonlPath = newest;
+        bridgeJsonlDir = dirname(newest);
+        // Pid file's sessionId disagrees with the path Claude actually has
+        // open — record it as stale so the per-tick pid resolver doesn't
+        // pull us back to the spawn-time jsonl on every poll.
+        bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(newest));
       }
     }
   }
