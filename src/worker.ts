@@ -224,6 +224,22 @@ function formatLocalTurnContent(userText: string, assistantText: string): string
   ].join('\n');
 }
 
+/** Compose a `final_output` payload for a HEADLESS local turn — assistant
+ *  text arrived without a known user side. Typically: daemon restart cut
+ *  off an in-flight model stream; the original user event was absorbed
+ *  at baseline so we have no userUuid to resolve, but the rest of the
+ *  reply still deserves to land in Lark. */
+function formatHeadlessLocalTurnContent(assistantText: string): string | null {
+  const a = truncatePreambleText(assistantText.trim(), LOCAL_TURN_ASSISTANT_MAX);
+  if (!a) return null;
+  return [
+    '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）',
+    '',
+    `🤖 ${cliName()}：`,
+    a,
+  ].join('\n');
+}
+
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
 //
 // `botmux send` (cli.ts cmdSend) appends a line `{sentAtMs, messageId}\n` to
@@ -1071,16 +1087,21 @@ function emitReadyTurns(): void {
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
     if (turn.isLocal) {
-      // Local turn (adopt mode only): also surface the user prompt so the
-      // Lark thread shows both sides of the exchange. User text comes from
-      // the same drained transcript via the userUuid stamped at start time.
-      const userEv = turn.userUuid
-        ? drained.events.find(e => e.uuid === turn.userUuid)
-        : undefined;
-      const userText = userEv ? stringifyUserContent(userEv.message?.content) : '';
-      const content = formatLocalTurnContent(userText, assistantText);
-      if (!content) continue;
-      send({ type: 'final_output', content, lastUuid, turnId: turn.turnId });
+      if (turn.userUuid) {
+        // Local turn (adopt mode only): also surface the user prompt so the
+        // Lark thread shows both sides of the exchange. User text comes from
+        // the same drained transcript via the userUuid stamped at start time.
+        const userEv = drained.events.find(e => e.uuid === turn.userUuid);
+        const userText = userEv ? stringifyUserContent(userEv.message?.content) : '';
+        const content = formatLocalTurnContent(userText, assistantText);
+        if (!content) continue;
+        send({ type: 'final_output', content, lastUuid, turnId: turn.turnId });
+        continue;
+      }
+      // Headless local turn — see formatHeadlessLocalTurnContent for context.
+      const headlessContent = formatHeadlessLocalTurnContent(assistantText);
+      if (!headlessContent) continue;
+      send({ type: 'final_output', content: headlessContent, lastUuid, turnId: turn.turnId });
       continue;
     }
 

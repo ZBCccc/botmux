@@ -162,6 +162,56 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].assistantUuids).toEqual(['a-final']);
   });
 
+  it('synthesises a headless local turn when assistant text arrives without any preceding user event (daemon restart mid-stream)', () => {
+    // Reproduces: daemon restart cut off an in-flight model stream. Baseline
+    // absorbs the original user event and any assistant text written before
+    // the restart cutoff; subsequent assistant events arrive with no
+    // `collecting`. Without headless synthesis they're dropped silently and
+    // the user never sees the rest of the reply in Lark.
+    const q = new BridgeTurnQueue();
+    // Baseline absorbs pre-restart events as history. Note: bridgeAbsorbBaseline
+    // calls absorb(), which only adds uuids to the seen set — collecting stays null.
+    q.absorb([user('absorbed-u', 'pre-restart input'), assistant('absorbed-a', 'partial reply')]);
+    // Post-restart: model continues streaming new assistant text.
+    q.ingest([assistant('continued', 'rest of the reply')]);
+    const ready = q.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].isLocal).toBe(true);
+    expect(ready[0].userUuid).toBeUndefined();
+    expect(ready[0].assistantUuids).toEqual(['continued']);
+  });
+
+  it('subsequent assistant events keep collecting on the headless turn until the next user event', () => {
+    const q = new BridgeTurnQueue();
+    q.ingest([
+      assistant('a1', 'chunk one'),
+      assistant('a2', 'chunk two'),
+      assistant('a3', 'chunk three'),
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].isLocal).toBe(true);
+    expect(ready[0].userUuid).toBeUndefined();
+    expect(ready[0].assistantUuids).toEqual(['a1', 'a2', 'a3']);
+  });
+
+  it('headless local turn does not block a Lark turn that arrives next', () => {
+    const q = new BridgeTurnQueue();
+    // In-flight assistant text after a daemon restart — synthesises a headless turn.
+    q.ingest([assistant('headless-a', 'continuation')]);
+    // User then sends a new Lark message normally.
+    q.mark('t1');
+    q.ingest([user('u1', 'new question'), assistant('a1', 'fresh answer')]);
+    const ready = q.drainEmittable();
+    // Both emit, headless first (chronologically older).
+    expect(ready).toHaveLength(2);
+    expect(ready[0].isLocal).toBe(true);
+    expect(ready[0].userUuid).toBeUndefined();
+    expect(ready[0].assistantUuids).toEqual(['headless-a']);
+    expect(ready[1].turnId).toBe('t1');
+    expect(ready[1].assistantUuids).toEqual(['a1']);
+  });
+
   it('drops a started Lark turn that produced no assistant text when a new Lark turn arrives', () => {
     // Reproduces the post-/clear silence pattern: user sends "good", model
     // emits ZERO assistant events (no tool_use, no thinking, no text), then
@@ -307,13 +357,18 @@ describe('BridgeTurnQueue', () => {
     expect(dropped.map(t => t.turnId)).toEqual(['t1', 't2']);
     expect(q.size()).toBe(0);
     // Subsequent ingest with assistant must NOT crash trying to push to a
-    // collecting that was just dropped
+    // collecting that was just dropped. The orphan is preserved as a
+    // headless local turn (the post-/clear / post-restart recovery path).
     q.ingest([assistant('a1', 'orphan')]);
     q.mark('t3');
     q.ingest([user('u3'), assistant('a3', 'ok')]);
     const ready = q.drainEmittable();
-    expect(ready[0].turnId).toBe('t3');
-    expect(ready[0].assistantUuids).toEqual(['a3']);
+    expect(ready).toHaveLength(2);
+    expect(ready[0].isLocal).toBe(true);
+    expect(ready[0].userUuid).toBeUndefined();
+    expect(ready[0].assistantUuids).toEqual(['a1']);
+    expect(ready[1].turnId).toBe('t3');
+    expect(ready[1].assistantUuids).toEqual(['a3']);
   });
 
   describe('sourceJsonlPath stamping', () => {

@@ -226,9 +226,33 @@ export class BridgeTurnQueue {
         }
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
-        if (this.collecting && assistantHasVisibleText(ev.message?.content)) {
-          this.collecting.assistantUuids.push(uuid);
+        if (!assistantHasVisibleText(ev.message?.content)) continue;
+        if (!this.collecting) {
+          // Headless local turn: assistant text arrived without any
+          // collecting context. Typical trigger: daemon restart cut off
+          // an in-flight model stream — baseline absorbed the original
+          // user event (uuid added to `seen`) and the worker process lost
+          // its in-memory `collecting` pointer. Without this synthesis the
+          // continuation would be silently dropped (assistantHasVisibleText
+          // events with no `collecting` were just skipped before).
+          // Headless turns have no userUuid; emit-side formatting omits
+          // the user block. Inserted at the head of the unstarted region
+          // so a subsequent normal turn doesn't get reordered ahead of it.
+          const headless: BridgePendingTurn = {
+            turnId: `local-headless-${uuid}`,
+            started: true,
+            isLocal: true,
+            userUuid: undefined,
+            assistantUuids: [],
+            sourceJsonlPath,
+            markTimeMs: Date.now(),
+          };
+          const insertAt = this.queue.findIndex(t => !t.started);
+          if (insertAt === -1) this.queue.push(headless);
+          else this.queue.splice(insertAt, 0, headless);
+          this.collecting = headless;
         }
+        this.collecting.assistantUuids.push(uuid);
       }
     }
   }
