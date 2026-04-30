@@ -74,6 +74,38 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
 }
 
 /**
+ * Create a brand-new chat with `bot_id_list` as initial bot members.  The
+ * `creatorLarkAppId` bot becomes the chat's owner and an implicit member; the
+ * other bots in `botIds` are added in the same call.  Used by the dashboard's
+ * "Create new group" flow.
+ *
+ * Returns the new chatId on success.  Throws on any non-zero Lark response so
+ * the route can surface a real error.  We deliberately don't soften failures
+ * here (unlike `isInChat`) because the caller wants to know whether the chat
+ * actually got created.
+ */
+export async function createChat(
+  creatorLarkAppId: string,
+  opts: { name?: string; botIds: string[] },
+): Promise<{ chatId: string; invalidBotIds: string[] }> {
+  const client = getBotClient(creatorLarkAppId);
+  // Filter out the creator from bot_id_list — Lark errors if the inviter
+  // appears in their own invite list.
+  const otherBots = opts.botIds.filter(id => id !== creatorLarkAppId);
+  const data: Record<string, unknown> = {};
+  if (opts.name) data.name = opts.name;
+  if (otherBots.length > 0) data.bot_id_list = otherBots;
+  const res: any = await (client as any).im.v1.chat.create({ data });
+  if (res.code !== 0 && res.code !== undefined) {
+    throw new Error(`Failed to create chat: ${res.msg ?? 'unknown'} (code: ${res.code})`);
+  }
+  return {
+    chatId: res.data?.chat_id,
+    invalidBotIds: res.data?.invalid_bot_id_list ?? [],
+  };
+}
+
+/**
  * Add bot apps to a chat using a "proxy" bot that's already a member.
  * Uses /open-apis/im/v1/chats/:chat_id/members with member_id_type=app_id.
  * Returns per-id result derived from the API's invalid_id_list.
