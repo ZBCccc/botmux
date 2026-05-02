@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { getChatInfo, listChatBotMembers, replyMessage } from './client.js';
+import { getChatInfo, getChatMode, listChatBotMembers, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
@@ -291,12 +291,69 @@ export async function checkGroupMessageAccess(
 
 // ─── Event callbacks ─────────────────────────────────────────────────────
 
+/** Routing context computed from the incoming message — describes the
+ *  conversational unit (`scope`) and the addressing key (`anchor`) used
+ *  throughout the rest of the system. The dispatcher computes this once
+ *  per message and hands it to the daemon's session handlers, so the
+ *  daemon never has to re-derive it. */
+export interface RoutingContext {
+  chatId: string;
+  /** message_id of the inbound message that triggered this routing. */
+  messageId: string;
+  chatType: 'group' | 'p2p';
+  /** 'thread' → reply_in_thread to a (real or freshly seeded) thread root.
+   *  'chat'   → plain message to the chat (no threading). */
+  scope: 'thread' | 'chat';
+  /** Routing key. `chatId` for chat-scope, the thread root id for
+   *  thread-scope (an existing rootMessageId, or this messageId when
+   *  it's the seed of a brand-new thread). */
+  anchor: string;
+  larkAppId: string;
+}
+
 export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
-  handleNewTopic: (data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p', larkAppId: string) => Promise<void>;
-  handleThreadReply: (data: any, rootId: string, larkAppId: string) => Promise<void>;
-  /** Check if this bot owns an active session for the given rootId. */
-  isSessionOwner?: (rootId: string, larkAppId: string) => boolean;
+  handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
+  handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** Check if this bot owns an active session anchored at the given id
+   *  (rootMessageId for thread-scope, chatId for chat-scope). */
+  isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
+}
+
+/** Compute the scope + anchor for an inbound message:
+ *   - has root_id            → thread-scope, anchor = root_id
+ *   - 话题群 + no root_id    → thread-scope, anchor = message_id (thread seed)
+ *   - p2p + no root_id        → thread-scope, anchor = message_id (each DM
+ *                               top-level message starts a fresh topic; a
+ *                               reply inside an existing thread carries a
+ *                               root_id and threads into its session)
+ *   - 普通群 + no root_id      → chat-scope, anchor = chat_id (entire group
+ *                               is one session; user-initiated thread replies
+ *                               still carry root_id and become thread-scope)
+ *  Exported for unit tests. */
+export async function decideRouting(
+  larkAppId: string,
+  message: any,
+): Promise<{ scope: 'thread' | 'chat'; anchor: string }> {
+  const rootId: string | undefined = message.root_id;
+  if (rootId) return { scope: 'thread', anchor: rootId };
+
+  const chatType: string = message.chat_type ?? 'group';
+  const messageId: string = message.message_id;
+  const chatId: string = message.chat_id;
+
+  // 私聊：每条 top-level DM 都视为新话题 — 跟话题群同款，匹配 Lark DM 的话题
+  // 化默认行为，避免无限把 1:1 对话塞进同一个 CLI 进程里。
+  if (chatType === 'p2p') {
+    return { scope: 'thread', anchor: messageId };
+  }
+
+  // Group chat — fetch chat_mode (cached) to disambiguate 话题群 from 普通群.
+  const mode = await getChatMode(larkAppId, chatId);
+  if (mode === 'topic') {
+    return { scope: 'thread', anchor: messageId };
+  }
+  return { scope: 'chat', anchor: chatId };
 }
 
 /**
@@ -328,86 +385,91 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, message.mentions);
         }
 
-        // Bot-originated messages
+        const chatId = message.chat_id;
+        const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
+        const messageId = message.message_id;
+
+        // Bot-originated messages — bots historically only post inside threads
+        // (their own thread replies). With chat-scope sessions a bot can also
+        // post top-level (its first reply in a chat-scope group), so we still
+        // route them through `decideRouting` rather than gating on root_id.
         if (sender?.sender_type === 'app') {
           const senderOpenId = sender.sender_id?.open_id;
-          const rootId = message.root_id;
-          if (!rootId) return; // ignore bot messages outside threads
-
           const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
-
+          // Self messages: only echoed `/close` commands matter.
           if (isSelfMessage) {
-            // Own messages: only process /close commands
             try {
               const body = JSON.parse(message.content ?? '{}');
               if (body.text?.trim() !== '/close') return;
             } catch {
               return;
             }
-            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling message event: ${err}`));
+            const ctx = await decideRouting(larkAppId, message);
+            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId })
+              .catch(err => logger.error(`Error handling message event: ${err}`));
             return;
           }
-
-          // Message from another bot: check if it @mentions this bot
-          if (isBotMentioned(larkAppId, message, undefined)) {
-            logger.info(`Bot-to-bot @mention detected: routing to handleThreadReply`);
-            handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling bot @mention: ${err}`));
+          // Foreign bot: only route on @mention of us.
+          if (!isBotMentioned(larkAppId, message, undefined)) return;
+          const ctx = await decideRouting(larkAppId, message);
+          // Chat-scope foreign-bot @mention without an existing session would
+          // let other bots silently spawn chat-scope sessions in 普通群/p2p —
+          // require an existing session as the trigger gate. Thread-scope
+          // mentions still flow through unconditionally (auto-create at
+          // handleThreadReply) to preserve the existing cross-bot review flow.
+          if (ctx.scope === 'chat') {
+            const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
+            if (!ownsSession) return;
           }
+          logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
+          handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId })
+            .catch(err => logger.error(`Error handling bot @mention: ${err}`));
           return;
         }
 
-        const rootId = message.root_id;
-        const chatId = message.chat_id;
-        const chatType = message.chat_type;  // 'group' or 'p2p'
-        const messageId = message.message_id;
         const senderOpenId = sender?.sender_id?.open_id as string | undefined;
         const isAllowed = canTalk(larkAppId, chatId, senderOpenId);
 
         logger.debug('Received message:', message);
-        // Group new topics (no rootId): check @mention + permissions
-        if (chatType === 'group' && !rootId) {
-          const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
-          logger.debug('Group message access check:', access);
-          if (access === 'not_allowed') {
-            replyMessage(larkAppId, messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
-              .catch(err => logger.debug(`Failed to send permission denied: ${err}`));
-            return;
-          }
-          if (access === 'ignore') {
-            logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
-            return;
-          }
-        } else if (chatType === 'group' && rootId) {
-          // Group thread replies:
-          // - 1v1-style chat (sole real user + sole bot) + owns session → respond without @mention
-          // - Multi-user OR multi-bot group → always require @mention, even for session owners
-          // - Non-owner bots → require @mention to join/take over
-          const ownsSession = handlers.isSessionOwner?.(rootId, larkAppId) ?? false;
-          const stats = ownsSession ? await getGroupStats(larkAppId, chatId) : null;
-          if (ownsSession && isAllowed && stats && stats.userCount <= 1 && stats.botCount <= 1) {
-            // 1v1-style group + owns session → process without @mention
-          } else {
+
+        const routing = await decideRouting(larkAppId, message);
+        const ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+
+        // Permission gating — same shape as before, just keyed on
+        // `ownsSession` (anchor-aware) instead of "rootId presence":
+        //
+        //   ownsSession + 1v1 group → relax (no @mention required)
+        //   ownsSession + multi     → require @mention
+        //   !ownsSession (group)    → require @mention + allowlist
+        //   p2p                     → allowlist only
+        if (chatType === 'group') {
+          let stats: { userCount: number; botCount: number } | null = null;
+          if (ownsSession) stats = await getGroupStats(larkAppId, chatId);
+          const relax = ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1;
+          if (!relax) {
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {
-              logger.debug(`Ignoring thread reply from non-allowed user: ${senderOpenId}`);
+              if (!ownsSession) {
+                replyMessage(larkAppId, messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
+                  .catch(err => logger.debug(`Failed to send permission denied: ${err}`));
+              }
+              logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId}`);
               return;
             }
             if (access === 'ignore') {
-              logger.debug(`Ignoring group thread reply not addressed to bot: ${messageId}`);
+              logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
               return;
             }
           }
         } else if (!isAllowed) {
-          // P2P thread replies and DMs: still check allowlist
-          logger.debug(`Ignoring message from non-allowed user: ${senderOpenId}`);
+          logger.debug(`Ignoring p2p message from non-allowed user: ${senderOpenId}`);
           return;
         }
 
-        // p2p messages without rootId -> create session directly in the DM chat
-        // group messages -> normal flow
-        const promise = !rootId
-          ? handlers.handleNewTopic(data, chatId, messageId, chatType as 'group' | 'p2p', larkAppId)
-          : handlers.handleThreadReply(data, rootId, larkAppId);
+        const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing };
+        const promise = ownsSession
+          ? handlers.handleThreadReply(data, ctx)
+          : handlers.handleNewTopic(data, ctx);
         promise.catch(err => logger.error(`Error handling message event: ${err}`));
       } catch (err) {
         logger.error(`Error handling message event: ${err}`);

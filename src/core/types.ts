@@ -34,6 +34,13 @@ export interface DaemonSession {
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
+  /** Routing scope:
+   *   'thread' → routing key = session.rootMessageId, replies use reply_in_thread=true
+   *   'chat'   → routing key = chatId, replies are plain chat messages
+   *  Must be set explicitly at session creation (no implicit default — every
+   *  caller decides based on event context). Restored sessions without a
+   *  persisted scope fall back to 'thread' in the restore path. */
+  scope: 'thread' | 'chat';
   spawnedAt: number;
   cliVersion: string;
   lastMessageAt: number;
@@ -88,7 +95,19 @@ export interface DaemonSession {
   };
 }
 
-/** Composite key for activeSessions — allows multiple bots to have independent sessions for the same thread. */
-export function sessionKey(rootId: string, larkAppId: string): string {
-  return `${rootId}::${larkAppId}`;
+/** Composite key for activeSessions — allows multiple bots to have independent
+ *  sessions anchored on the same id. The first arg is the **routing anchor**:
+ *  - thread-scope → rootMessageId
+ *  - chat-scope   → chatId
+ *  Lark message ids start with `om_` and chat ids with `oc_`, so collisions
+ *  between the two address spaces are not possible. */
+export function sessionKey(anchorId: string, larkAppId: string): string {
+  return `${anchorId}::${larkAppId}`;
+}
+
+/** Resolve the routing anchor for an active session — chatId for chat-scope
+ *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
+ *  storage and lookup time. */
+export function sessionAnchorId(ds: DaemonSession): string {
+  return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
 }

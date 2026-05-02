@@ -25,7 +25,7 @@ import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { sessionKey, type DaemonSession } from './types.js';
+import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -375,7 +375,7 @@ export async function closeSession(
   let killedLive = false;
   if (ds) {
     killWorker(ds);
-    activeSessionsRegistry?.delete(sessionKey(ds.session.rootMessageId, ds.larkAppId));
+    activeSessionsRegistry?.delete(sessionKey(sessionAnchorId(ds), ds.larkAppId));
     killedLive = true;
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
@@ -470,7 +470,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
-    rootMessageId: ds.session.rootMessageId,
+    rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
@@ -567,7 +567,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
-              ds.session.rootMessageId,
+              sessionAnchorId(ds),
               readOnlyUrl,
               initTitle,
               ds.lastScreenContent ?? '',
@@ -608,7 +608,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
-            ds.session.rootMessageId,
+            sessionAnchorId(ds),
             readOnlyUrl,
             initTitle,
             '',
@@ -620,7 +620,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             isAdopt,
             showTakeover,
           );
-          ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
+          ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
           persistStreamCardState(ds);
           // New card is live — recall any cards frozen by previous turns.
           // Done after `streamCardId` is committed so we never delete the old
@@ -641,14 +641,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           try {
             const cardJson = buildSessionCard(
               ds.session.sessionId,
-              ds.session.rootMessageId,
+              sessionAnchorId(ds),
               readOnlyUrl,
               ds.session.title || getCliDisplayName(botCfg.cliId),
               botCfg.cliId,
               undefined,
               !!ds.adoptedFrom,
             );
-            await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
+            await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
           } catch (fallbackErr) {
             if (fallbackErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -709,7 +709,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           if (isNewTurn) ds.currentImageKey = undefined;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
-            ds.session.rootMessageId,
+            sessionAnchorId(ds),
             readUrl,
             turnTitle,
             isNewTurn ? '' : msg.content,
@@ -725,7 +725,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // not POSTed as duplicate cards.
           ds.streamCardPending = false;
           ds.streamCardId = CARD_POSTING_SENTINEL;
-          cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
+          cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId)
             .then(msgId => {
               ds.streamCardId = msgId;
               persistStreamCardState(ds);
@@ -754,7 +754,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           if (!statusChanged) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
-            ds.session.rootMessageId,
+            sessionAnchorId(ds),
             readUrl,
             turnTitle,
             msg.content,
@@ -784,7 +784,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
-          ds.session.rootMessageId,
+          sessionAnchorId(ds),
           readUrl,
           turnTitle,
           ds.lastScreenContent ?? '',
@@ -824,13 +824,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         }
         try {
           const cardJson = buildTuiPromptCard(
-            ds.session.rootMessageId,
+            sessionAnchorId(ds),
             ds.session.sessionId,
             msg.description,
             msg.options,
             msg.multiSelect,
           );
-          const cardMsgId = await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
+          const cardMsgId = await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
           ds.tuiPromptCardId = cardMsgId;
         } catch (err) {
           logger.warn(`[${t}] Failed to post TUI prompt card: ${err}`);
@@ -864,7 +864,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
             const frozenCard = buildStreamingCard(
-              ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
+              ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', botCfg.cliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover,
@@ -873,7 +873,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           }
           killWorker(ds);
           try {
-            await cb.sessionReply(ds.session.rootMessageId, '\u23cf 已采纳的 CLI 会话已退出', 'text', ds.larkAppId);
+            await cb.sessionReply(sessionAnchorId(ds), '\u23cf 已采纳的 CLI 会话已退出', 'text', ds.larkAppId);
           } catch { /* best effort */ }
           break;
         }
@@ -894,7 +894,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
             const frozenCard = buildStreamingCard(
-              ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
+              ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', botCfg.cliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
             );
@@ -904,7 +904,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           killWorker(ds);
           const cliName = getCliDisplayName(botCfg.cliId);
           try {
-            await cb.sessionReply(ds.session.rootMessageId, `\u26a0\ufe0f ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
+            await cb.sessionReply(sessionAnchorId(ds), `\u26a0\ufe0f ${cliName} 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`, 'text', ds.larkAppId);
           } catch (replyErr) {
             if (replyErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -930,7 +930,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         try {
-          await cb.sessionReply(ds.session.rootMessageId, msg.message, 'text', ds.larkAppId);
+          await cb.sessionReply(sessionAnchorId(ds), msg.message, 'text', ds.larkAppId);
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
         }
@@ -974,7 +974,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           '🤖 Claude：',
           assistantBlock || '(空)',
         ].join('\n');
-        cb.sessionReply(ds.session.rootMessageId, text, 'text', ds.larkAppId).catch((err: any) => {
+        cb.sessionReply(sessionAnchorId(ds), text, 'text', ds.larkAppId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
         });
         break;
@@ -1037,7 +1037,7 @@ function deliverFinalOutput(
       // to one the model sent itself. Markdown rendering, tables, code
       // blocks all flow through the shared `buildCardBodyElements`.
       const cardJson = buildMarkdownCard(msg.content, ds.session.ownerOpenId);
-      await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
+      await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, attempt ${attempt + 1})`);
     } catch (err: any) {
@@ -1133,7 +1133,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
-    rootMessageId: ds.session.rootMessageId,
+    rootMessageId: sessionAnchorId(ds),
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
     cliSessionId: adoptedCliId === 'codex' ? adopted.sessionId : undefined,

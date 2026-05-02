@@ -2,7 +2,15 @@ export interface Session {
   sessionId: string;
   chatId: string;
   chatType?: 'group' | 'p2p';
+  /** Thread-scope: an actual root message id under which all replies thread.
+   *  Chat-scope: the message id of the first message that started the
+   *  session — kept for traceability, NOT used as the routing anchor. */
   rootMessageId: string;
+  /** Conversation unit. 'thread' (default for legacy) routes by rootMessageId
+   *  and replies via reply_in_thread=true. 'chat' routes by chatId and posts
+   *  replies as plain chat messages. Sessions in 话题群 are always 'thread'
+   *  because Lark forces every top-level message into a thread. */
+  scope?: 'thread' | 'chat';
   title: string;
   status: 'active' | 'closed';
   createdAt: string;
@@ -99,6 +107,10 @@ export interface ScheduledTask {
    *  execution replies into this thread instead of creating a new one. */
   rootMessageId?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
+  /** Mirrors Session.scope. Determines whether the scheduled fire posts as
+   *  reply_in_thread to rootMessageId (thread) or as a plain message to
+   *  chatId (chat). Absent → 'thread' for legacy compat. */
+  scope?: 'thread' | 'chat';
   larkAppId?: string;
   /** Where the user originally created the task (for cross-thread tasks where
    *  --chat-id / --root-msg-id retarget execution to a different chat).

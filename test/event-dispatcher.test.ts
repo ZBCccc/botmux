@@ -38,8 +38,11 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
+const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
+const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 vi.mock('../src/im/lark/client.js', () => ({
-  getChatInfo: vi.fn(async () => ({ userCount: 1 })),
+  getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
+  getChatMode: (...args: any[]) => mockGetChatMode(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: vi.fn(async () => 'msg-id'),
 }));
@@ -231,7 +234,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handler).toBeDefined();
     await handler(event);
 
-    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-1', MY_APP_ID);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-thread-1',
+      scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
   });
 
   it('routes @mentioned bot message (via mentions array) to handleThreadReply', async () => {
@@ -244,7 +251,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-2', MY_APP_ID);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-thread-2',
+      scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
   });
 
   it('ignores bot message that does not @mention this bot', async () => {
@@ -260,7 +271,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('ignores bot message without rootId (not in a thread)', async () => {
+  it('ignores cross-bot @mention in chat-scope without an existing session', async () => {
+    // Foreign bot @mentions us at top level (no rootId) in a 普通群. Without an
+    // existing chat-scope session, we ignore — otherwise other bots could
+    // unilaterally spawn sessions in any chat they share with us.
+    mockGetChatMode.mockResolvedValueOnce('group');
     const event = makeBotMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,
       content: JSON.stringify({
@@ -268,8 +283,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       }),
       rootId: undefined,
     });
-    // rootId is undefined — set it explicitly
     event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
 
     await capturedHandlers['im.message.receive_v1'](event);
 
@@ -286,7 +301,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-4', MY_APP_ID);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-thread-4',
+      scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
   });
 
   it('ignores own bot messages that are not /close', async () => {
@@ -314,7 +333,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-6', MY_APP_ID);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-thread-6',
+      scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
   });
 
   it('requires @mention in multi-bot thread even if bot owns session', async () => {
@@ -326,6 +349,9 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       chatType: 'group',
     });
     handlers.isSessionOwner.mockReturnValue(true);
+    // Multi-bot stats — the relax check needs botCount > 1 to fail and force
+    // the @mention requirement back on.
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 2 });
     mockListChatBotMembers.mockResolvedValue([
       { openId: MY_OPEN_ID, name: 'BotA' },
       { openId: OTHER_BOT_OPEN_ID, name: 'BotB' },
@@ -355,7 +381,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-8', MY_APP_ID);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-thread-8',
+      scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
   });
 
   it('ignores unmentioned replies when another bot owns the thread', async () => {

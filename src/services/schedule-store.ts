@@ -131,6 +131,7 @@ export function createTask(params: {
   workingDir: string;
   chatId: string;
   rootMessageId?: string;
+  scope?: 'thread' | 'chat';
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
   creatorChatId?: string;
@@ -150,6 +151,7 @@ export function createTask(params: {
     workingDir: params.workingDir,
     chatId: params.chatId,
     rootMessageId: params.rootMessageId,
+    scope: params.scope,
     chatType: params.chatType,
     larkAppId: params.larkAppId,
     creatorChatId: params.creatorChatId,

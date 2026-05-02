@@ -15,7 +15,7 @@ import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-sto
 import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState } from '../../core/session-manager.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
-import { sessionKey, frozenDisplayMode } from '../../core/types.js';
+import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 
@@ -173,7 +173,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // PATCH card to update ☐/☑ state
         if (cardMessageId && ds.tuiPromptOptions) {
           const updatedCard = buildTuiPromptCard(
-            ds.session.rootMessageId,
+            sessionAnchorId(ds),
             ds.session.sessionId,
             ds.currentTurnTitle || 'Select options',
             ds.tuiPromptOptions,
@@ -258,7 +258,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const writeUrl = `http://${config.web.externalHost}:${ds.workerPort}?token=${ds.workerToken}`;
         const dmCardJson = buildSessionCard(
           ds.session.sessionId,
-          ds.session.rootMessageId,
+          sessionAnchorId(ds),
           writeUrl,
           ds.session.title || getCliDisplayName(botCfg.cliId),
           botCfg.cliId,
@@ -299,7 +299,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const readUrl = ds.workerPort ? `http://${config.web.externalHost}:${ds.workerPort}` : '';
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
-          ds.session.rootMessageId,
+          sessionAnchorId(ds),
           readUrl,
           frozen.title,
           frozen.content,
@@ -334,7 +334,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
-          ds.session.rootMessageId,
+          sessionAnchorId(ds),
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',
@@ -368,7 +368,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         content = ds.lastScreenContent ?? '';
       }
       const body = content.trim() ? truncateContent(content) : '(当前无输出内容)';
-      await sessionReply(ds.session.rootMessageId, body);
+      await sessionReply(sessionAnchorId(ds), body);
       logger.info(`[${tag(ds)}] Exported terminal text (${body.length} chars)`);
       return;
     }
@@ -388,7 +388,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
-          ds.session.rootMessageId,
+          sessionAnchorId(ds),
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',
@@ -424,7 +424,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
-          ds.session.rootMessageId,
+          sessionAnchorId(ds),
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',

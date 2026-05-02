@@ -20,7 +20,7 @@ import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession }
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
-import { sessionKey } from './types.js';
+import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
@@ -181,6 +181,11 @@ async function handleScheduleCommand(
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
+    // For chat-scope sessions, `rootId` here is actually the chatId (the
+    // session's anchor). The scheduler keys cross-target routing on
+    // rootMessageId — for chat-scope tasks we set rootMessageId=undefined and
+    // rely on chatId + scope='chat' to do plain chat sends at fire time.
+    const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     const task = scheduler.addTask({
       name: parsed.name,
       schedule: trimmed, // raw user input (schedule + prompt blob, kept only for display)
@@ -188,7 +193,8 @@ async function handleScheduleCommand(
       prompt: parsed.prompt,
       workingDir,
       chatId,
-      rootMessageId: rootId,
+      rootMessageId: taskScope === 'thread' ? rootId : undefined,
+      scope: taskScope,
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
     });
@@ -656,7 +662,7 @@ export async function startAdoptSession(
 
   // Validate target is still alive
   if (!validateAdoptTarget(target.tmuxTarget, target.cliPid)) {
-    await sessionReply(ds.session.rootMessageId, '⚠️ 目标 CLI 会话已退出');
+    await sessionReply(sessionAnchorId(ds), '⚠️ 目标 CLI 会话已退出');
     return;
   }
 
@@ -682,5 +688,5 @@ export async function startAdoptSession(
   forkAdoptWorker(ds);
 
   const cliName = getCliDisplayName(target.cliId);
-  await sessionReply(ds.session.rootMessageId, `📡 已接入 ${cliName} · ${project} (${target.tmuxTarget})`);
+  await sessionReply(sessionAnchorId(ds), `📡 已接入 ${cliName} · ${project} (${target.tmuxTarget})`);
 }

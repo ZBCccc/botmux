@@ -41,16 +41,25 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
-  const res = await c.im.v1.message.create({
-    params: { receive_id_type: 'chat_id' },
-    data: {
-      receive_id: chatId,
-      msg_type: msgType as any,
-      content: body,
-    },
-  });
+  let res: any;
+  try {
+    res = await c.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        msg_type: msgType as any,
+        content: body,
+      },
+    });
+  } catch (err: any) {
+    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+      throw new MessageWithdrawnError(chatId);
+    }
+    throw err;
+  }
 
   if (res.code !== 0) {
+    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(chatId);
     throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
   }
 
@@ -153,6 +162,61 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
     userCount: Number(res.data?.user_count ?? 0),
     botCount: Number(res.data?.bot_count ?? 0),
   };
+}
+
+/** Lark chat-mode classification used by botmux to decide session scope:
+ *   - 'topic'  → 话题群 (chat_mode='topic'): every top-level message becomes a
+ *                new thread, so botmux always uses thread-scope sessions
+ *   - 'group'  → 普通群 (chat_mode='group'): top-level messages stay top-level,
+ *                so botmux uses chat-scope by default; user-initiated threads
+ *                still get their own thread-scope sessions
+ *   - 'p2p'    → direct message: equivalent to 普通群 from a routing
+ *                perspective (chat-scope by default) */
+export type ChatMode = 'group' | 'topic' | 'p2p';
+
+const chatModeCache = new Map<string, { mode: ChatMode; cachedAt: number }>();
+const CHAT_MODE_TTL_MS = 30 * 60 * 1000; // 30 min — chat_mode rarely changes
+
+/** Resolve the conversational topology of a chat (话题群 vs 普通群 vs p2p).
+ *
+ *  Cached per (appId, chatId) for 30 minutes. Errors fall back to 'group' so a
+ *  flaky Lark API doesn't break message routing — chat-scope is the safer
+ *  default than incorrectly forcing a thread, since users can always reply
+ *  in-thread to escape it.
+ *
+ *  Calling this with a chat that's already known to be p2p (from
+ *  message.chat_type === 'p2p') is fine but wasteful — prefer skipping the
+ *  call in that case. */
+export async function getChatMode(larkAppId: string, chatId: string): Promise<ChatMode> {
+  const cacheKey = `${larkAppId}::${chatId}`;
+  const cached = chatModeCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) {
+    return cached.mode;
+  }
+
+  let mode: ChatMode = 'group';
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).im.v1.chat.get({
+      path: { chat_id: chatId },
+    });
+    if (res.code === 0) {
+      const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+      const rawType = String(res.data?.chat_type ?? '').toLowerCase();
+      // Lark returns chat_mode='topic' for 话题群; chat_mode='group' for 普通群.
+      // p2p chats answer with chat_type='p2p' regardless of chat_mode.
+      if (rawType === 'p2p') mode = 'p2p';
+      else if (rawMode === 'topic') mode = 'topic';
+      else mode = 'group';
+    } else {
+      logger.warn(`getChatMode(${chatId}) failed: ${res.msg} (code: ${res.code}); falling back to 'group'`);
+    }
+  } catch (err: any) {
+    logger.warn(`getChatMode(${chatId}) errored: ${err?.message ?? err}; falling back to 'group'`);
+  }
+
+  chatModeCache.set(cacheKey, { mode, cachedAt: Date.now() });
+  return mode;
 }
 
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<void> {

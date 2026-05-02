@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
-import { replyMessage, resolveAllowedUsers } from './im/lark/client.js';
+import { replyMessage, resolveAllowedUsers, sendMessage } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -19,7 +19,7 @@ import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
-import { sessionKey } from './core/types.js';
+import { sessionKey, sessionAnchorId } from './core/types.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
@@ -58,7 +58,7 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, type RoutingContext } from './im/lark/event-dispatcher.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -69,22 +69,44 @@ const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 
 /**
- * Reply to a message, automatically using reply_in_thread for p2p sessions.
- * Always reply in thread to create/continue a topic.
- * This ensures topic-style replies in all chat types (p2p, group, topic group).
+ * Reply into a session — scope-aware.
+ *
+ * `anchor` is whatever the caller has at hand:
+ *   - thread-scope sessions → rootMessageId
+ *   - chat-scope sessions  → chatId
+ *
+ * Behaviour:
+ *   - thread-scope (or no matching DS, the legacy default) → reply with
+ *     reply_in_thread=true to the anchor message_id
+ *   - chat-scope                                           → send a plain
+ *     message to ds.chatId (no reply, no thread). Cards / button values
+ *     embed the chatId so handleCardAction can route back into the same
+ *     session.
+ *
+ * Lark message ids start with `om_` and chat ids with `oc_`, so the two
+ * address spaces never collide; the lookup just tries both.
  */
-async function sessionReply(rootId: string, content: string, msgType: string = 'text', larkAppId?: string): Promise<string> {
+async function sessionReply(anchor: string, content: string, msgType: string = 'text', larkAppId?: string): Promise<string> {
   let ds: DaemonSession | undefined;
   if (larkAppId) {
-    ds = activeSessions.get(sessionKey(rootId, larkAppId));
+    ds = activeSessions.get(sessionKey(anchor, larkAppId));
   } else {
     for (const s of activeSessions.values()) {
-      if (s.session.rootMessageId === rootId) { ds = s; break; }
+      if (sessionAnchorId(s) === anchor) { ds = s; break; }
     }
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
-  return replyMessage(appId, rootId, content, msgType, true);
+
+  // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
+  // the conversation flat in 普通群 / p2p. The card layer carries chatId in
+  // its button values, so handleCardAction routes back via sessionKey(chatId).
+  if (ds?.scope === 'chat') {
+    return sendMessage(appId, ds.chatId, content, msgType);
+  }
+
+  // Thread-scope (or unknown / legacy): reply in thread.
+  return replyMessage(appId, anchor, content, msgType, true);
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -240,7 +262,8 @@ const cardDeps: CardHandlerDeps = {
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
-async function handleNewTopic(data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p' = 'group', larkAppId: string): Promise<void> {
+async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
+  const { chatId, messageId, chatType, scope, anchor, larkAppId } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
@@ -255,29 +278,30 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   const cmdContent = stripLeadingMentions(content, parsed.mentions);
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const botCfg = getBot(larkAppId).config;
-  logger.info(`New topic: "${content.substring(0, 60)}" (resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId}`);
+  logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
 
   // Intercept daemon commands in new topics (no session needed for some commands)
   const invocation = parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
-      await sessionReply(messageId, `${cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。`, 'text', larkAppId);
+      await sessionReply(anchor, `${cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。`, 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
       // Oncall groups: any member can talk, but daemon commands (except /oncall
       // itself which gates bind/unbind inside) are owner-only.
       if (cmd !== '/oncall' && findOncallChat(larkAppId, chatId) && !canOperate(larkAppId, chatId, senderOpenId)) {
-        await sessionReply(messageId, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
+        await sessionReply(anchor, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
         return;
       }
       const session = sessionStore.createSession(chatId, messageId, cmdContent.substring(0, 50), chatType);
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
       session.lastCallerOpenId = senderOpenId;
+      session.scope = scope;
       sessionStore.updateSession(session);
-      activeSessions.set(sessionKey(messageId, larkAppId), {
+      activeSessions.set(sessionKey(anchor, larkAppId), {
         session,
         worker: null,
         workerPort: null,
@@ -285,6 +309,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         larkAppId,
         chatId,
         chatType,
+        scope,
         spawnedAt: Date.now(),
         cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
         lastMessageAt: Date.now(),
@@ -292,7 +317,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         ownerOpenId: senderOpenId,
       });
       // Pass mention-stripped content so /command argument parsing works.
-      await handleCommand(cmd, messageId, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+      await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
       return;
     }
   }
@@ -303,18 +328,22 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     parsed.attachments = attachments;
   }
   if (needLogin) {
-    sessionReply(messageId, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', larkAppId);
+    sessionReply(anchor, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', larkAppId);
   }
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
-  // Create session in pending-repo state — don't spawn CLI yet
+  // Create session in pending-repo state — don't spawn CLI yet.
+  // For thread-scope, rootMessageId == anchor (the thread root).
+  // For chat-scope, rootMessageId stores the seed message_id (audit only);
+  // routing keys off chatId via sessionAnchorId().
   const session = sessionStore.createSession(chatId, messageId, parsed.content.substring(0, 50), chatType);
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
+  session.scope = scope;
   sessionStore.updateSession(session);
-  messageQueue.ensureQueue(messageId);
-  messageQueue.appendMessage(messageId, parsed);
+  messageQueue.ensureQueue(anchor);
+  messageQueue.appendMessage(anchor, parsed);
 
   // Oncall group: pin working dir from binding, skip repo selection entirely.
   const oncallEntry = findOncallChat(larkAppId, chatId);
@@ -326,6 +355,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     larkAppId,
     chatId,
     chatType,
+    scope,
     spawnedAt: Date.now(),
     cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
     lastMessageAt: Date.now(),
@@ -342,7 +372,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
     ds.session.workingDir = oncallEntry.workingDir;
     sessionStore.updateSession(ds.session);
   }
-  activeSessions.set(sessionKey(messageId, larkAppId), ds);
+  activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
   // Oncall-bound chat: spawn CLI immediately with the pinned working dir.
   if (oncallEntry) {
@@ -362,8 +392,8 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   if (projects.length > 0) {
     lastRepoScan.set(chatId, projects);
     const currentCwd = getSessionWorkingDir(ds);
-    const cardJson = buildRepoSelectCard(projects, currentCwd, messageId);
-    ds.repoCardMessageId = await sessionReply(messageId, cardJson, 'interactive', larkAppId);
+    const cardJson = buildRepoSelectCard(projects, currentCwd, anchor);
+    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
     // No projects found — skip repo selection, spawn directly
@@ -375,7 +405,8 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
   }
 }
 
-async function handleThreadReply(data: any, rootId: string, larkAppId: string): Promise<void> {
+async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
+  const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
@@ -404,44 +435,48 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
-      const ds = activeSessions.get(sessionKey(rootId, larkAppId));
+      const ds = activeSessions.get(sessionKey(anchor, larkAppId));
       if (ds?.worker && !ds.worker.killed) {
         ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
         ds.lastMessageAt = Date.now();
-        logger.info(`[${rootId.substring(0, 12)}] Passthrough ${cmd} → worker`);
+        logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
       } else {
-        sessionReply(rootId, `${cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。`, 'text', larkAppId);
+        sessionReply(anchor, `${cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。`, 'text', larkAppId);
       }
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
       // Oncall owner gate for thread-reply daemon commands
-      const existingDs = activeSessions.get(sessionKey(rootId, larkAppId));
-      const threadChatId = existingDs?.chatId ?? data?.message?.chat_id;
+      const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
+      const threadChatId = existingDs?.chatId ?? ctxChatId ?? data?.message?.chat_id;
       const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       if (cmd !== '/oncall' && threadChatId && findOncallChat(larkAppId, threadChatId) && !canOperate(larkAppId, threadChatId, threadSenderOpenId)) {
-        sessionReply(rootId, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
+        sessionReply(anchor, `⚠️ ${cmd} 仅 oncall owner 可执行。`, 'text', larkAppId);
         return;
       }
       // Pass mention-stripped content so /command argument parsing works.
-      handleCommand(cmd, rootId, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+      handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
       return;
     }
   }
 
-  logger.info(`Thread reply in ${rootId}: ${content.substring(0, 100)} (resources: ${resources.length})`);
+  logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
-  let ds = activeSessions.get(sessionKey(rootId, larkAppId));
+  let ds = activeSessions.get(sessionKey(anchor, larkAppId));
 
-  // If another bot already owns this thread, ignore unmentioned replies here as a
+  // If another bot already owns this anchor, ignore unmentioned replies here as a
   // second line of defense. Explicit @mentions are still allowed to spin up/take over.
+  // For chat-scope: another bot's session in the same chat is keyed by its own chatId.
+  // For thread-scope: same rootMessageId may have peer sessions across bots.
   if (!ds) {
     const mentionedThisBot = isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id);
-    const hasOtherBot = [...activeSessions.values()].some(
-      s => s.session.rootMessageId === rootId && s.larkAppId !== larkAppId
-    );
+    const hasOtherBot = [...activeSessions.values()].some(s => {
+      if (s.larkAppId === larkAppId) return false;
+      if (s.scope === 'chat') return s.chatId === ctxChatId && scope === 'chat';
+      return s.session.rootMessageId === anchor;
+    });
     if (hasOtherBot && !mentionedThisBot) {
-      logger.info(`[${larkAppId}] Ignoring thread ${rootId}; another bot already owns it`);
+      logger.info(`[${larkAppId}] Ignoring ${scope}-scope ${anchor}; another bot already owns it`);
       return;
     }
   }
@@ -453,7 +488,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     parsed.attachments = attachments;
   }
   if (needLogin) {
-    sessionReply(rootId, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', effectiveAppId);
+    sessionReply(anchor, '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。', 'text', effectiveAppId);
   }
 
   // Update last message time + last caller (used by `botmux send` to address
@@ -483,44 +518,53 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     }
     if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
     ds.pendingFollowUps.push(enriched);
-    await sessionReply(rootId, '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。', 'text', larkAppId);
+    await sessionReply(anchor, '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。', 'text', larkAppId);
     return;
   }
 
-  // Route to file queue
-  messageQueue.ensureQueue(rootId);
-  messageQueue.appendMessage(rootId, parsed);
+  // Route to file queue (keyed by anchor: rootMessageId for thread, chatId for chat)
+  messageQueue.ensureQueue(anchor);
+  messageQueue.appendMessage(anchor, parsed);
 
   if (!ds) {
-    // No active session for this thread — auto-create with repo selection
-    if (activeSessions.has(sessionKey(rootId, larkAppId))) {
-      logger.info(`[${larkAppId}] Session already exists for thread ${rootId}, skipping auto-create`);
+    // No active session at this anchor — auto-create. This branch is mostly a
+    // safety net; the dispatcher routes here only when isSessionOwner() returns
+    // true, but races (between check and execution, or session-closed events)
+    // can land us here.
+    if (activeSessions.has(sessionKey(anchor, larkAppId))) {
+      logger.info(`[${larkAppId}] Session already exists for ${scope}-scope ${anchor}, skipping auto-create`);
       return;
     }
 
-    const chatId: string = data?.message?.chat_id ?? '';
-    const chatType = (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
+    const autoCreateChatId: string = ctxChatId ?? data?.message?.chat_id ?? '';
+    const autoCreateChatType = ctxChatType ?? (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     const botCfg = getBot(larkAppId).config;
-    logger.info(`No active session for thread ${rootId}, auto-creating new session...`);
+    logger.info(`No active session for ${scope}-scope ${anchor}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const senderOId = data.sender?.sender_id?.open_id;
-    const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50), chatType);
+    // For thread-scope: rootMessageId = anchor (real thread root).
+    // For chat-scope:   rootMessageId = the message_id that triggered this auto-create
+    //                   (used as audit trail; routing key is chatId).
+    const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
+    const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType);
     session.larkAppId = larkAppId;
     session.ownerOpenId = senderOId;
     session.lastCallerOpenId = senderOId;
+    session.scope = scope;
     sessionStore.updateSession(session);
 
     // Oncall group: pin working dir from binding, skip repo selection entirely
     // (mirrors handleNewTopic — auto-create was missing this check).
-    const oncallEntry = findOncallChat(larkAppId, chatId);
+    const oncallEntry = findOncallChat(larkAppId, autoCreateChatId);
 
     // Cross-bot inheritance: when another bot already pinned a working dir for
-    // this thread (typical: Bot A is mid-task and @mentions Bot B for review),
+    // this anchor (typical: Bot A is mid-task and @mentions Bot B for review),
     // inherit it so we can spawn immediately with the @-content as the prompt
     // — same shape as a human-initiated start, no repo selection round-trip.
+    // Only meaningful for thread-scope (peer lookup is by rootMessageId).
     let inheritedFrom: { sessionId: string; larkAppId?: string; workingDir: string } | null = null;
-    if (!oncallEntry) {
-      const peers = sessionStore.findActiveSessionsByRoot(rootId);
+    if (!oncallEntry && scope === 'thread') {
+      const peers = sessionStore.findActiveSessionsByRoot(anchor);
       const peer = peers.find(p => p.larkAppId !== larkAppId && !!p.workingDir);
       if (peer && peer.workingDir) {
         inheritedFrom = { sessionId: peer.sessionId, larkAppId: peer.larkAppId, workingDir: peer.workingDir };
@@ -534,8 +578,9 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       workerPort: null,
       workerToken: null,
       larkAppId,
-      chatId,
-      chatType,
+      chatId: autoCreateChatId,
+      chatType: autoCreateChatType,
+      scope,
       spawnedAt: Date.now(),
       cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
       lastMessageAt: Date.now(),
@@ -552,16 +597,16 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       newDs.session.workingDir = pinnedWorkingDir;
       sessionStore.updateSession(newDs.session);
     }
-    activeSessions.set(sessionKey(rootId, larkAppId), newDs);
+    activeSessions.set(sessionKey(anchor, larkAppId), newDs);
 
     // Pinned (oncall binding or inherited from peer bot in same thread):
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
       const reason = oncallEntry
-        ? `oncall-bound chat ${chatId}`
+        ? `oncall-bound chat ${autoCreateChatId}`
         : `inherited from peer session ${inheritedFrom!.sessionId.substring(0, 8)} (app=${inheritedFrom!.larkAppId ?? 'unknown'})`;
       logger.info(`[${tag(newDs)}] ${reason} → workingDir=${pinnedWorkingDir}, skipped repo select`);
       return;
@@ -574,16 +619,16 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       projects = scanMultipleProjects(scanDirs2);
     }
     if (projects.length > 0) {
-      lastRepoScan.set(chatId, projects);
+      lastRepoScan.set(autoCreateChatId, projects);
       const currentCwd = getSessionWorkingDir(newDs);
-      const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
-      newDs.repoCardMessageId = await sessionReply(rootId, cardJson, 'interactive', larkAppId);
+      const cardJson = buildRepoSelectCard(projects, currentCwd, anchor);
+      newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
     }
 
@@ -621,7 +666,7 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
       const prevMode = ds.displayMode ?? 'hidden';
       const frozenCard = buildStreamingCard(
-        ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
+        ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
         ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId,
         prevMode, ds.streamCardNonce, ds.currentImageKey,
         !!ds.adoptedFrom, false,
@@ -887,13 +932,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Start event dispatcher for this bot
     startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
       handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
-      handleNewTopic: (data, chatId, messageId, chatType, appId) =>
-        handleNewTopic(data, chatId, messageId, chatType, appId),
-      handleThreadReply: (data, rootId, appId) =>
-        handleThreadReply(data, rootId, appId),
-      isSessionOwner: (rootId, appId) => {
-        return activeSessions.has(sessionKey(rootId, appId));
-      },
+      handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
+      handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
+      isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
     });
   }
 

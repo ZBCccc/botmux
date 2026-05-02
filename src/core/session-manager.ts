@@ -19,7 +19,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
-import { sessionKey } from './types.js';
+import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -354,6 +354,10 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
 
   for (const session of active) {
+    // Restored sessions persisted before the scope field was added default to
+    // 'thread' — that matches the legacy thread-only behaviour.
+    const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
+
     // Adopt sessions: restore if original CLI is still alive, otherwise close
     if (session.title?.startsWith('Adopt:') && session.adoptedFrom) {
       const adopted = session.adoptedFrom;
@@ -363,7 +367,6 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         continue;
       }
       // Original CLI still alive — re-register and fork adopt worker
-      messageQueue.ensureQueue(session.rootMessageId);
       const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
       const ds: DaemonSession = {
         session,
@@ -373,6 +376,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         larkAppId,
         chatId: session.chatId,
         chatType: session.chatType ?? 'group',
+        scope,
         spawnedAt: Date.now(),
         cliVersion: getCurrentCliVersion(),
         lastMessageAt: Date.now(),
@@ -387,9 +391,11 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         currentImageKey: session.currentImageKey,
         currentTurnTitle: session.currentTurnTitle,
       };
-      activeSessions.set(sessionKey(session.rootMessageId, larkAppId), ds);
+      const anchor = sessionAnchorId(ds);
+      messageQueue.ensureQueue(anchor);
+      activeSessions.set(sessionKey(anchor, larkAppId), ds);
       forkAdoptWorker(ds, { restoredFromMetadata: true });
-      logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adopted.tmuxTarget})`);
+      logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adopted.tmuxTarget}, scope: ${scope})`);
       continue;
     }
     // Adopt sessions without persisted metadata — close (legacy)
@@ -398,10 +404,9 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       sessionStore.closeSession(session.sessionId);
       continue;
     }
-    messageQueue.ensureQueue(session.rootMessageId);
 
     const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
-    activeSessions.set(sessionKey(session.rootMessageId, larkAppId), {
+    const ds: DaemonSession = {
       session,
       worker: null,
       workerPort: null,
@@ -409,6 +414,7 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       larkAppId,
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
+      scope,
       spawnedAt: Date.now(),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: Date.now(),
@@ -424,9 +430,12 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
-    });
+    };
+    const anchor = sessionAnchorId(ds);
+    messageQueue.ensureQueue(anchor);
+    activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
-    logger.debug(`Registered session ${session.sessionId} (thread: ${session.rootMessageId})`);
+    logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
   }
 
   // Tmux mode: auto-fork workers for sessions with surviving tmux sessions
@@ -461,68 +470,99 @@ export async function executeScheduledTask(
 
   const { sendMessage, replyMessage } = await import('../im/lark/client.js');
 
+  // Scope resolution — explicit task.scope wins; otherwise fall back to legacy
+  // semantics (rootMessageId present → thread, absent → chat). Restoring an
+  // older schedule without scope keeps current behaviour.
+  const scope: 'thread' | 'chat' = task.scope === 'chat'
+    ? 'chat'
+    : task.scope === 'thread'
+      ? 'thread'
+      : (task.rootMessageId ? 'thread' : 'chat');
+
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
   //
-  // Cross-thread case: task created in thread A but execution targets chat/thread B
-  // (user passed --chat-id / --root-msg-id). Send the start notification only
-  // to the creator's thread (A) so the task owner has a record; the target
-  // chat (B) gets only the actual task output (via botmux send), staying clean.
+  // Thread-scope (legacy and current default):
+  //   - cross-thread (creator != target): notify creator's thread; deliver
+  //     execution into target rootMessageId
+  //   - same-thread:                       notify into the bound thread,
+  //     which doubles as the session anchor
+  //   - missing rootMessageId:             fall back to a fresh top-level
+  //     post in the chat (one-shot session)
   //
-  // Same-thread case (legacy / typical): notification doubles as the conversation
-  // root in the bound thread — unchanged behavior.
-  //
-  // Fallback (no rootMessageId): post a new top-level message in target.
-  let threadRootId: string;
+  // Chat-scope (auto-adopt / 普通群): post the start notification straight to
+  // the chat without reply_in_thread; the chat IS the session anchor.
+  let anchor: string;
   let isContinuation = false;
 
-  const isCrossThread =
-    !!task.creatorRootMessageId &&
-    !!task.rootMessageId &&
-    task.creatorRootMessageId !== task.rootMessageId;
-
-  if (isCrossThread) {
-    // Notify creator (best-effort, never blocks execution)
-    const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-    replyMessage(
-      creatorAppId,
-      task.creatorRootMessageId!,
-      `🕐 定时任务「${task.name}」已在目标话题触发`,
-      'text',
-      true,
-    ).catch((err: any) => {
-      logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-    });
-    // Bind execution to the target thread without posting a start message there
-    threadRootId = task.rootMessageId!;
-    isContinuation = true;
-  } else if (task.rootMessageId) {
-    try {
-      // Reply in the original thread — the returned reply message id is just an
-      // anchor for this run; the thread's root remains task.rootMessageId, which
-      // is what the session/card system keys off.
-      await replyMessage(
-        larkAppId,
-        task.rootMessageId,
-        `🕐 定时任务「${task.name}」开始执行`,
+  if (scope === 'chat') {
+    // Cross-target chat-scope (rare): a creator-thread notification + a fresh
+    // chat post in target. We use task.chatId as the runtime anchor.
+    if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
+      const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+      replyMessage(
+        creatorAppId,
+        task.creatorRootMessageId,
+        `🕐 定时任务「${task.name}」已在目标群聊触发`,
         'text',
-        true, // reply_in_thread
-      );
-      threadRootId = task.rootMessageId;
-      isContinuation = true;
-    } catch (err: any) {
-      logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
-      threadRootId = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+        true,
+      ).catch((err: any) => {
+        logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+      });
+    } else {
+      // Same-chat: post the start banner to the chat as a plain message.
+      try {
+        await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+      } catch (err: any) {
+        logger.warn(`[scheduler] Failed to post start banner in chat ${task.chatId} (${err.message})`);
+      }
     }
+    anchor = task.chatId;
+    isContinuation = !!activeSessions.get(sessionKey(anchor, larkAppId));
   } else {
-    threadRootId = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+    // thread-scope path (existing logic)
+    const isCrossThread =
+      !!task.creatorRootMessageId &&
+      !!task.rootMessageId &&
+      task.creatorRootMessageId !== task.rootMessageId;
+
+    if (isCrossThread) {
+      const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+      replyMessage(
+        creatorAppId,
+        task.creatorRootMessageId!,
+        `🕐 定时任务「${task.name}」已在目标话题触发`,
+        'text',
+        true,
+      ).catch((err: any) => {
+        logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+      });
+      anchor = task.rootMessageId!;
+      isContinuation = true;
+    } else if (task.rootMessageId) {
+      try {
+        await replyMessage(
+          larkAppId,
+          task.rootMessageId,
+          `🕐 定时任务「${task.name}」开始执行`,
+          'text',
+          true,
+        );
+        anchor = task.rootMessageId;
+        isContinuation = true;
+      } catch (err: any) {
+        logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
+        anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+      }
+    } else {
+      anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+    }
   }
 
   refreshCliVersion(bot.config.cliId, bot.config.cliPathOverride);
 
-  // If a live session already exists for this thread (user was just chatting in it),
-  // inject the prompt as a follow-up message rather than spawning a fresh worker.
-  const existing = activeSessions.get(sessionKey(threadRootId, larkAppId));
+  // Inject into a live session if one already exists at this anchor.
+  const existing = activeSessions.get(sessionKey(anchor, larkAppId));
   if (isContinuation && existing?.worker && !existing.worker.killed) {
     existing.lastMessageAt = Date.now();
     try {
@@ -534,12 +574,14 @@ export async function executeScheduledTask(
     }
   }
 
-  // Otherwise create a new session bound to the original thread root so all the
-  // worker's replies continue to land under that topic in Lark.
-  const session = sessionStore.createSession(task.chatId, threadRootId, `[定时] ${task.name}`);
+  // Spawn a fresh session bound to the chosen anchor.
+  // Thread-scope: rootMessageId = anchor. Chat-scope: rootMessageId stores the
+  // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope).
+  const session = sessionStore.createSession(task.chatId, anchor, `[定时] ${task.name}`);
   session.larkAppId = larkAppId;
+  session.scope = scope;
   sessionStore.updateSession(session);
-  messageQueue.ensureQueue(threadRootId);
+  messageQueue.ensureQueue(anchor);
 
   const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId });
 
@@ -551,14 +593,15 @@ export async function executeScheduledTask(
     larkAppId,
     chatId: task.chatId,
     chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
+    scope,
     spawnedAt: Date.now(),
     cliVersion: getCurrentCliVersion(),
     lastMessageAt: Date.now(),
-    hasHistory: isContinuation, // continuation sessions inherit the old thread's context
+    hasHistory: isContinuation,
     workingDir: task.workingDir,
   };
-  activeSessions.set(sessionKey(threadRootId, larkAppId), ds);
+  activeSessions.set(sessionKey(anchor, larkAppId), ds);
   forkWorker(ds, prompt);
 
-  logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, thread: ${threadRootId}, continuation: ${isContinuation})`);
+  logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${scope}, anchor: ${anchor}, continuation: ${isContinuation})`);
 }
