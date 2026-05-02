@@ -10,6 +10,7 @@ import { getBot, getAllBots, findOncallChat } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { getChatInfo, getChatMode, listChatBotMembers, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
+import { isBotMentionMessageHandled, markBotMentionMessageHandled } from '../../utils/bot-mention-dedup.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -141,6 +142,16 @@ export function readBotOpenIdCrossRef(dataDir: string, larkAppId: string): Map<s
     }
   } catch { /* ignore */ }
   return map;
+}
+
+/** Is `senderOpenId` a registered botmux peer (from larkAppId's cross-ref)?
+ *  Used to gate chat-scope foreign-bot @mention spawning to vetted peers. */
+export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId: string | undefined): boolean {
+  if (!senderOpenId) return false;
+  for (const openId of readBotOpenIdCrossRef(dataDir, larkAppId).values()) {
+    if (openId === senderOpenId) return true;
+  }
+  return false;
 }
 
 /** Update the per-bot cross-reference from @mention data in an event.
@@ -411,16 +422,26 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
           // Foreign bot: only route on @mention of us.
           if (!isBotMentioned(larkAppId, message, undefined)) return;
+          // Cross-path dedup: signal-file watcher may have already enqueued
+          // this turn (Bot A's `botmux send --mention` writes both a Lark
+          // message and a signal file; whichever path lands first wins).
+          if (isBotMentionMessageHandled(messageId)) {
+            logger.debug(`[bot-mention] WS path skipping ${messageId.substring(0, 12)}: already handled by signal-file watcher`);
+            return;
+          }
           const ctx = await decideRouting(larkAppId, message);
-          // Chat-scope foreign-bot @mention without an existing session would
-          // let other bots silently spawn chat-scope sessions in 普通群/p2p —
-          // require an existing session as the trigger gate. Thread-scope
-          // mentions still flow through unconditionally (auto-create at
-          // handleThreadReply) to preserve the existing cross-bot review flow.
+          // Chat-scope foreign-bot @mention without an existing session: gate to
+          // vetted botmux peers (registered in our bot-openids cross-ref). This
+          // keeps random Lark bots from silently spawning chat-scope sessions
+          // in 普通群/p2p, while letting Bot A → Bot B handoffs in 普通群 work
+          // (handleThreadReply auto-create + chat-scope inheritance below).
           if (ctx.scope === 'chat') {
             const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
-            if (!ownsSession) return;
+            if (!ownsSession && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) {
+              return;
+            }
           }
+          markBotMentionMessageHandled(messageId);
           logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
           handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId })
             .catch(err => logger.error(`Error handling bot @mention: ${err}`));
@@ -432,8 +453,27 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
         logger.debug('Received message:', message);
 
-        const routing = await decideRouting(larkAppId, message);
-        const ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+        let routing = await decideRouting(larkAppId, message);
+        let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+
+        // 普通群 reflex: Lark sometimes attaches a `root_id` to what the user
+        // typed as a top-level message (quote/reply UI, fast-reply bubble,
+        // etc.). decideRouting honours root_id and routes thread-scope, which
+        // would spawn a fresh session and pop a repo-select card every time —
+        // even though the user clearly wants to keep talking in the existing
+        // chat-scope conversation. If we don't actually own a thread-scope
+        // session at this root but DO own a chat-scope session at this chat,
+        // continue the chat-scope session instead. Chat-scope sessions only
+        // get created in 普通群 (chat_mode='group'), so the presence of one is
+        // itself the "is 普通群" gate.
+        if (routing.scope === 'thread' && !ownsSession && chatType === 'group' && message.root_id) {
+          const ownsChatScope = handlers.isSessionOwner?.(chatId, larkAppId) ?? false;
+          if (ownsChatScope) {
+            logger.info(`Re-routing ${routing.anchor.substring(0, 12)} → chat-scope ${chatId.substring(0, 12)} (普通群 root_id w/o thread session, continuing chat-scope)`);
+            routing = { scope: 'chat', anchor: chatId };
+            ownsSession = true;
+          }
+        }
 
         // Permission gating — same shape as before, just keyed on
         // `ownsSession` (anchor-aware) instead of "rootId presence":
