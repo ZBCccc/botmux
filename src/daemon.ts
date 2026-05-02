@@ -59,6 +59,7 @@ import {
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, type RoutingContext } from './im/lark/event-dispatcher.js';
+import { isBotMentionMessageHandled, markBotMentionMessageHandled } from './utils/bot-mention-dedup.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -101,8 +102,14 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群 / p2p. The card layer carries chatId in
   // its button values, so handleCardAction routes back via sessionKey(chatId).
-  if (ds?.scope === 'chat') {
-    return sendMessage(appId, ds.chatId, content, msgType);
+  //
+  // Detect chat-scope from either ds.scope or anchor's `oc_` prefix. The
+  // prefix fallback covers the close-button race: card-handler deletes ds
+  // from activeSessions BEFORE sending the close-confirmation reply, so by
+  // the time we run, ds is gone — but the anchor (chatId, oc_xxx) is enough
+  // to know we should sendMessage, not reply_in_thread to a non-message-id.
+  if (ds?.scope === 'chat' || anchor.startsWith('oc_')) {
+    return sendMessage(appId, ds?.chatId ?? anchor, content, msgType);
   }
 
   // Thread-scope (or unknown / legacy): reply in thread.
@@ -424,7 +431,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (isCallbackUrl(content)) {
     const result = await handleCallbackUrl(content);
     if (result) {
-      replyMessage(larkAppId, parsed.messageId, JSON.stringify({ text: result }), 'text', true)
+      // Route through sessionReply so chat-scope (普通群) lands as a plain
+      // chat message instead of a forced new thread.
+      sessionReply(anchor, result, 'text', larkAppId)
         .catch(err => logger.error(`Failed to reply login result: ${err}`));
       return;
     }
@@ -561,10 +570,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // this anchor (typical: Bot A is mid-task and @mentions Bot B for review),
     // inherit it so we can spawn immediately with the @-content as the prompt
     // — same shape as a human-initiated start, no repo selection round-trip.
-    // Only meaningful for thread-scope (peer lookup is by rootMessageId).
+    // Thread-scope: peer lookup is by rootMessageId.
+    // Chat-scope (普通群): peer lookup is by chatId among other bots' chat-scope
+    //   sessions in the same chat — same intent, different anchor.
     let inheritedFrom: { sessionId: string; larkAppId?: string; workingDir: string } | null = null;
-    if (!oncallEntry && scope === 'thread') {
-      const peers = sessionStore.findActiveSessionsByRoot(anchor);
+    if (!oncallEntry) {
+      const peers = scope === 'thread'
+        ? sessionStore.findActiveSessionsByRoot(anchor)
+        : sessionStore.findActiveChatScopeSessionsByChat(autoCreateChatId);
       const peer = peers.find(p => p.larkAppId !== larkAppId && !!p.workingDir);
       if (peer && peer.workingDir) {
         inheritedFrom = { sessionId: peer.sessionId, larkAppId: peer.larkAppId, workingDir: peer.workingDir };
@@ -718,6 +731,10 @@ interface BotMentionSignal {
   rootMessageId: string;
   chatId: string;
   chatType?: string;
+  /** Sender session's routing scope; receivers use it to pick the right
+   *  activeSessions key. Older signals without this field default to 'thread'
+   *  (the legacy behaviour). */
+  scope?: 'thread' | 'chat';
   senderAppId: string;
   targetBotOpenId: string;
   content: string;
@@ -733,8 +750,19 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
     return;
   }
 
+  // Cross-path dedup: WSClient may have already enqueued this turn. messageId
+  // is the canonical key (per-message, immune to ordering between WS push and
+  // fs watch).
+  if (isBotMentionMessageHandled(signal.messageId)) {
+    logger.debug(`[bot-mention] Signal-file path skipping ${signal.messageId.substring(0, 12)}: already handled by WSClient`);
+    return;
+  }
+
   const targetAppId = targetBot.config.larkAppId;
-  const ds = activeSessions.get(sessionKey(signal.rootMessageId, targetAppId));
+  // Anchor depends on sender's session scope: chat-scope sessions are keyed
+  // by chatId, thread-scope by rootMessageId.
+  const anchor = signal.scope === 'chat' ? signal.chatId : signal.rootMessageId;
+  const ds = activeSessions.get(sessionKey(anchor, targetAppId));
 
   if (ds && ds.worker && !ds.worker.killed) {
     // Target bot has an active session in this thread — send the message.
@@ -766,10 +794,11 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
     ds.streamCardPending = true;
     ds.currentTurnTitle = signal.content.substring(0, 50);
     persistStreamCardState(ds);
+    markBotMentionMessageHandled(signal.messageId);
     ds.worker.send({ type: 'message', content: enrichedContent } as DaemonToWorker);
-    logger.info(`[bot-mention] Routed message from ${signal.senderAppId} to ${targetAppId} in thread ${signal.rootMessageId}`);
+    logger.info(`[bot-mention] Routed message from ${signal.senderAppId} to ${targetAppId} (scope=${signal.scope ?? 'thread'}, anchor=${anchor.substring(0, 12)})`);
   } else {
-    logger.debug(`[bot-mention] Target bot ${targetAppId} has no active worker for thread ${signal.rootMessageId}`);
+    logger.debug(`[bot-mention] Target bot ${targetAppId} has no active worker at ${signal.scope ?? 'thread'}-scope anchor ${anchor.substring(0, 12)} — WSClient auto-create path will handle it if @mention was delivered`);
   }
 }
 

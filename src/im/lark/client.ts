@@ -480,6 +480,50 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
   return allMessages;
 }
 
+/** List chat-container messages since a given epoch (ms), most-recent first
+ *  but returned chronologically (oldest → newest, capped at `pageSize`).
+ *  Used by `botmux thread messages` for chat-scope sessions (普通群整群一会话):
+ *  no thread to walk, so we walk the chat itself. We page in Desc order so a
+ *  long-running chat-scope session (hundreds of messages) returns its TAIL,
+ *  not its head — that's the context the caller wants. */
+export async function listChatMessagesSince(
+  larkAppId: string, chatId: string, sinceMs: number, pageSize: number = 50,
+): Promise<any[]> {
+  const c = getBotClient(larkAppId);
+  // Lark message.list start_time / end_time are 10-digit unix seconds (string).
+  // Subtract 1s to make sure the boundary message (e.g. the seed) is included.
+  const startSec = Math.max(0, Math.floor(sinceMs / 1000) - 1);
+  const allMessages: any[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const res = await c.im.v1.message.list({
+      params: {
+        container_id_type: 'chat' as any,
+        container_id: chatId,
+        page_size: pageSize,
+        sort_type: 'ByCreateTimeDesc' as any,
+        start_time: String(startSec),
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat messages: ${res.msg} (code: ${res.code})`);
+    }
+
+    if (res.data?.items) {
+      allMessages.push(...res.data.items);
+    }
+
+    pageToken = res.data?.page_token;
+    if (allMessages.length >= pageSize) break;
+  } while (pageToken);
+
+  // Cap to pageSize newest, then reverse to chronological for the caller.
+  return allMessages.slice(0, pageSize).reverse();
+}
+
 /** Fallback: scan chat messages and filter by root_id. */
 async function listByChatFilter(c: any, chatId: string, rootMessageId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];

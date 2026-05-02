@@ -624,6 +624,9 @@ interface SessionData {
   chatId: string;
   chatType?: 'group' | 'p2p';
   rootMessageId: string;
+  /** 'thread' (legacy default) → cmdSend uses reply_in_thread to rootMessageId.
+   *  'chat' → cmdSend posts a plain message to chatId (普通群整群一个会话). */
+  scope?: 'thread' | 'chat';
   title: string;
   status: 'active' | 'closed';
   createdAt: string;
@@ -1585,12 +1588,17 @@ async function cmdThreadMessages(rest: string[]): Promise<void> {
     for (const cfg of loadBotConfigs()) registerBot(cfg);
   } catch { /* ignore */ }
 
-  const { listThreadMessages } = await import('./im/lark/client.js');
+  const { listThreadMessages, listChatMessagesSince } = await import('./im/lark/client.js');
   const { parseApiMessage } = await import('./im/lark/message-parser.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   const appId = s.larkAppId;  // narrowed above; pin into a const so async closures keep the narrowing
   try {
-    const raw = await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
+    // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
+    // chat container instead, since the session was created.
+    const isChatScope = s.scope === 'chat';
+    const raw = isChatScope
+      ? await listChatMessagesSince(appId, s.chatId, Date.parse(s.createdAt) || 0, limit)
+      : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
     // path in daemon.ts. Each merge_forward gets its own numberer (we don't
     // download resources here — only [图片 N] placeholders matter).
@@ -1601,9 +1609,14 @@ async function cmdThreadMessages(rest: string[]): Promise<void> {
       }
       return parsed;
     }));
-    console.log(JSON.stringify({ sessionId: sid, threadId: s.rootMessageId, messages, total: messages.length }, null, 2));
+    console.log(JSON.stringify({
+      sessionId: sid,
+      ...(isChatScope ? { chatId: s.chatId, scope: 'chat' } : { threadId: s.rootMessageId, scope: 'thread' }),
+      messages,
+      total: messages.length,
+    }, null, 2));
   } catch (err: any) {
-    console.error(`获取话题消息失败: ${err.message}`);
+    console.error(`获取消息失败: ${err.message}`);
     process.exit(1);
   }
 }
@@ -1730,13 +1743,17 @@ async function cmdSend(rest: string[]): Promise<void> {
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
+  // Chat-scope sessions (普通群整群一会话) post to chatId without
+  // reply_in_thread, otherwise Lark would force every reply into a fresh
+  // topic — defeating the whole point of chat-scope routing.
+  const isChatScope = s.scope === 'chat';
   // Oncall addressing only meaningful for thread replies inside the session's
   // own chat — skip when publishing top-level or to a different chat.
   const oncallEntry = !sendTopLevel && !overrideChatId && s.chatId
     ? findOncallChat(appId, s.chatId) : undefined;
-  // Dispatch helper: top-level send vs reply-in-thread, single decision point
+  // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single decision point
   const dispatch = (content: string, msgType: string): Promise<string> =>
-    sendTopLevel
+    (sendTopLevel || isChatScope)
       ? sendMessage(appId, targetChatId, content, msgType)
       : replyMessage(appId, s.rootMessageId, content, msgType, true);
 
@@ -1999,6 +2016,10 @@ async function cmdSend(rest: string[]): Promise<void> {
         const te = botEntries.find(e => e.larkAppId === targetApp);
         const signal = {
           rootMessageId: s.rootMessageId, chatId: s.chatId, chatType: s.chatType,
+          // Routing scope of the SENDER's session — receivers use this to pick
+          // the right activeSessions key (chatId for chat-scope, rootMessageId
+          // for thread-scope).
+          scope: s.scope ?? 'thread',
           senderAppId: appId, targetBotOpenId: te?.botOpenId ?? targetApp,
           content: text, messageId, timestamp: Date.now(),
         };

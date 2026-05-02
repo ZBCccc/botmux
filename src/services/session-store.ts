@@ -173,10 +173,29 @@ export function listSessions(): Session[] {
  * any in-memory state, since each daemon process only owns its own bot.
  */
 export function findActiveSessionsByRoot(rootMessageId: string): Session[] {
+  return findActiveSessionsMatching(s => s.rootMessageId === rootMessageId);
+}
+
+/**
+ * Cross-file lookup: find every active chat-scope session for a chat, across
+ * all bots. Mirror of findActiveSessionsByRoot for chat-scope (普通群整群一会话):
+ * lets a not-yet-initialised bot inherit the workingDir from a peer bot that
+ * already has a chat-scope session in the same chat, so a `botmux send
+ * --mention <other-bot>` in 普通群 can spawn the second bot without bouncing
+ * through the repo-select card.
+ *
+ * Only returns scope='chat' sessions — thread-scope sessions in the same chat
+ * are routed by rootMessageId and not eligible for chat-scope inheritance.
+ */
+export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
+  return findActiveSessionsMatching(s => s.chatId === chatId && s.scope === 'chat');
+}
+
+function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session[] {
   load();
   const matches: Session[] = [];
   for (const s of sessions.values()) {
-    if (s.rootMessageId === rootMessageId && s.status === 'active') matches.push(s);
+    if (predicate(s) && s.status === 'active') matches.push(s);
   }
   const dataDir = config.session.dataDir;
   const currentFp = getFilePath();
@@ -188,7 +207,7 @@ export function findActiveSessionsByRoot(rootMessageId: string): Session[] {
       try {
         const data: Record<string, Session> = JSON.parse(readFileSync(fp, 'utf-8'));
         for (const s of Object.values(data)) {
-          if (s.rootMessageId === rootMessageId && s.status === 'active') matches.push(s);
+          if (predicate(s) && s.status === 'active') matches.push(s);
         }
       } catch { continue; }
     }

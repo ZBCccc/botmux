@@ -74,6 +74,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { _resetForTest as _resetBotMentionDedup } from '../src/utils/bot-mention-dedup.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -210,6 +211,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     capturedHandlers = {};
     setupBotState();
     handlers = makeHandlers();
+    _resetBotMentionDedup();
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
 
@@ -271,11 +273,14 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('ignores cross-bot @mention in chat-scope without an existing session', async () => {
-    // Foreign bot @mentions us at top level (no rootId) in a 普通群. Without an
-    // existing chat-scope session, we ignore — otherwise other bots could
-    // unilaterally spawn sessions in any chat they share with us.
+  it('ignores cross-bot @mention in chat-scope from an unknown bot', async () => {
+    // Foreign bot @mentions us at top level (no rootId) in a 普通群, but the
+    // sender is NOT in our peer cross-ref (random Lark bot, not a botmux peer).
+    // Drop it — otherwise random bots could spawn chat-scope sessions in any
+    // chat they share with us.
     mockGetChatMode.mockResolvedValueOnce('group');
+    // No cross-ref entries → unknown peer
+    mockReadFileSync.mockReturnValue('{}');
     const event = makeBotMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,
       content: JSON.stringify({
@@ -290,6 +295,49 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('routes cross-bot @mention in chat-scope when sender is a known botmux peer', async () => {
+    // Same setup as above, but the foreign bot IS in our peer cross-ref → the
+    // dispatcher should route it through to handleThreadReply (which auto-
+    // creates a chat-scope session and inherits the peer's workingDir).
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue(JSON.stringify({ 'BotB': OTHER_BOT_OPEN_ID }));
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('dedups bot-to-bot @mention if signal-file path already handled this messageId', async () => {
+    // Pre-mark messageId as handled (signal-file watcher fired first).
+    const { markBotMentionMessageHandled } = await import('../src/utils/bot-mention-dedup.js');
+    markBotMentionMessageHandled('msg-dedup-1');
+
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      messageId: 'msg-dedup-1',
+      content: JSON.stringify({ text: '@BotA hi' }),
+      rootId: 'root-dedup',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('processes /close from own bot messages in a thread', async () => {
@@ -384,6 +432,56 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       anchor: 'root-thread-8',
       scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('falls back to chat-scope when root_id is set in 普通群 but no thread session exists', async () => {
+    // User typed a top-level message in 普通群; Lark client attached root_id
+    // (quote/reply UI). decideRouting would say thread-scope, but we have no
+    // thread session at that root and DO have a chat-scope session at the chat
+    // → re-route to chat-scope so the user keeps talking in the existing convo
+    // instead of getting bounced into a fresh session + repo card.
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue please' }),
+      rootId: 'root-not-mine',
+      chatId: 'chat-fallback-1',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-fallback-1');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-fallback-1',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('keeps thread-scope when root_id is set and a thread session DOES exist', async () => {
+    // Same shape as above but bot DOES own a thread-scope session at the root
+    // → no fallback, just continue the existing thread session.
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue please' }),
+      rootId: 'root-keep',
+      chatId: 'chat-fallback-2',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-keep');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'root-keep',
       larkAppId: MY_APP_ID,
     }));
   });
