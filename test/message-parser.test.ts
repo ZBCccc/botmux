@@ -276,4 +276,16 @@ describe('stripLeadingMentions', () => {
     const out = stripLeadingMentions('@Botmux 介绍下当前项目', [{ name: 'Botmux' }]);
     expect(out).toBe('介绍下当前项目');
   });
+
+  it('strips prefix-overlapping names by length-desc so "@Claude分身" wins over "@Claude"', () => {
+    // Regression: chain @Claude @Claude分身 @CoCo /close — naive iteration
+    // matches "@Claude" first, slices 7 chars, leaves "分身 @CoCo /close"
+    // which never rematches and silently breaks /close detection.
+    const out = stripLeadingMentions('@Claude @Claude分身 @CoCo /close', [
+      { name: 'Claude' },
+      { name: 'Claude分身' },
+      { name: 'CoCo' },
+    ]);
+    expect(out).toBe('/close');
+  });
 });

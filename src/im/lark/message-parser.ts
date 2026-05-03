@@ -290,10 +290,15 @@ function resolvePostBody(parsed: any): { title: string; content: any[] } {
 export function stripLeadingMentions(content: string, mentions?: { name: string }[]): string {
   let s = content.trimStart();
   if (mentions && mentions.length > 0) {
+    // Sort by name length desc so "@Claude分身" wins over "@Claude" when both
+    // could startsWith — otherwise the short name eats "@Claude" and leaves
+    // "分身 @CoCo /close" stranded, breaking slash-command detection in
+    // multi-bot @ chains like "@Claude @Claude分身 @CoCo /close".
+    const sortedMentions = [...mentions].sort((a, b) => b.name.length - a.name.length);
     let changed = true;
     while (changed) {
       changed = false;
-      for (const m of mentions) {
+      for (const m of sortedMentions) {
         const tag = `@${m.name}`;
         if (s.startsWith(tag)) {
           s = s.slice(tag.length).trimStart();
