@@ -10,6 +10,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
+import { findCocoSessionByPid } from '../services/coco-transcript.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -217,6 +218,13 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       // an accurate "currently in session X" hint.
       const rollout = findCodexRolloutByPid(match.pid);
       if (rollout) sessionId = rollout.cliSessionId;
+    } else if (match.cliId === 'coco') {
+      // CoCo: probe /proc/<pid>/fd for an open file under the session dir
+      // (session.log / traces.jsonl). events.jsonl itself is opened-written-
+      // closed per event so it's not reliable on its own. Worker-side
+      // re-probes too, so undefined here is acceptable.
+      const cocoSession = findCocoSessionByPid(match.pid);
+      if (cocoSession) sessionId = cocoSession.sessionId;
     }
 
     // 6. Get pane dimensions

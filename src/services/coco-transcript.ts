@@ -11,9 +11,12 @@
  * user messages whose `extra.is_original_user_input === true` so a Lark
  * turn fingerprints against the user's prompt, not injected context.
  */
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+
+const COCO_SESSIONS_ROOT = join(homedir(), '.cache', 'coco', 'sessions');
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface CocoBridgeEvent {
   /** Synthetic uuid for dedup: `<absPath>:<byteOffset>` of the line start. */
@@ -33,7 +36,39 @@ export interface CocoDrainResult {
 }
 
 export function cocoEventsPathForSession(sessionId: string): string {
-  return join(homedir(), '.cache', 'coco', 'sessions', sessionId, 'events.jsonl');
+  return join(COCO_SESSIONS_ROOT, sessionId, 'events.jsonl');
+}
+
+/** Walk `/proc/<pid>/fd` to find which CoCo session a running CoCo process is
+ *  bound to. Unlike Codex (which keeps its rollout fd open continuously),
+ *  CoCo opens-writes-closes `events.jsonl` per event, so we look for ANY open
+ *  file under the session dir — `session.log` and `traces.jsonl` are held
+ *  open for the session's lifetime and reveal the same `<sid>` segment.
+ *
+ *  procfs may report `<path> (deleted)` for a previously-unlinked file kept
+ *  alive by the open fd; strip that suffix before matching. Linux-only —
+ *  returns undefined elsewhere or when /proc lookup fails. */
+export function findCocoSessionByPid(
+  pid: number,
+): { sessionId: string; eventsPath: string } | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (process.platform !== 'linux') return undefined;
+  const fdDir = `/proc/${pid}/fd`;
+  if (!existsSync(fdDir)) return undefined;
+  let entries: string[];
+  try { entries = readdirSync(fdDir); } catch { return undefined; }
+  const prefix = COCO_SESSIONS_ROOT + '/';
+  for (const fd of entries) {
+    let target: string;
+    try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
+    const cleanTarget = target.replace(/ \(deleted\)$/, '');
+    if (!cleanTarget.startsWith(prefix)) continue;
+    const sid = cleanTarget.slice(prefix.length).split('/')[0];
+    if (sid && SESSION_UUID_RE.test(sid)) {
+      return { sessionId: sid, eventsPath: cocoEventsPathForSession(sid) };
+    }
+  }
+  return undefined;
 }
 
 function messageText(content: unknown): string {

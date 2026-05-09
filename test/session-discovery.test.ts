@@ -15,6 +15,8 @@ vi.mock('node:child_process', () => ({
 }));
 
 vi.mock('node:fs', () => ({
+  existsSync: vi.fn(() => false),
+  readdirSync: vi.fn(() => []),
   readFileSync: vi.fn(),
   readlinkSync: vi.fn(),
 }));

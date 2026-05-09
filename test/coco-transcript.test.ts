@@ -106,3 +106,19 @@ describe('drainCocoEvents', () => {
     expect(r2.events.map(e => e.text)).toEqual(['new']);
   });
 });
+
+describe('findCocoSessionByPid', () => {
+  it('rejects non-positive / non-integer pids', async () => {
+    const { findCocoSessionByPid } = await import('../src/services/coco-transcript.js');
+    expect(findCocoSessionByPid(0)).toBeUndefined();
+    expect(findCocoSessionByPid(-1)).toBeUndefined();
+    expect(findCocoSessionByPid(1.5 as any)).toBeUndefined();
+  });
+
+  it('returns undefined when /proc/<pid>/fd is unavailable', async () => {
+    const { findCocoSessionByPid } = await import('../src/services/coco-transcript.js');
+    // pid 99999999 is essentially guaranteed not to exist on the test host;
+    // covers the "fdDir doesn't exist" branch without needing /proc mocking.
+    expect(findCocoSessionByPid(99999999)).toBeUndefined();
+  });
+});

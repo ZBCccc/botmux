@@ -1122,12 +1122,17 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //   - codex: worker resolves the rollout path either from cliSessionId
   //     (passed below when known) or by reading the Codex pid's open fds
   //     in /proc — so we always pass the pid for codex adopt.
+  //   - coco: events.jsonl path is `~/.cache/coco/sessions/<sid>/events.jsonl`,
+  //     deterministic from cliSessionId. PID is the fallback when discovery
+  //     missed (events.jsonl isn't held open continuously, so worker may need
+  //     to re-probe via session.log / traces.jsonl fds).
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   const bridgeJsonlPath =
     adoptedCliId === 'claude-code' && adopted.sessionId
       ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd)
       : undefined;
+  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco';
 
   const initMsg: DaemonToWorker = {
     type: 'init',
@@ -1136,7 +1141,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     rootMessageId: sessionAnchorId(ds),
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
-    cliSessionId: adoptedCliId === 'codex' ? adopted.sessionId : undefined,
+    cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     backendType: 'tmux',
     prompt: '',
     resume: false,
@@ -1154,8 +1159,8 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     // PID + cwd: claude uses for `~/.claude/sessions/<pid>.json` resolver;
     // codex uses for `/proc/<pid>/fd` rollout discovery (works even if
     // session-discovery couldn't probe sessionId up-front).
-    adoptCliPid: (adoptedCliId === 'claude-code' || adoptedCliId === 'codex') ? adopted.originalCliPid : undefined,
-    adoptCwd: (adoptedCliId === 'claude-code' || adoptedCliId === 'codex') ? adopted.cwd : undefined,
+    adoptCliPid: (adoptedCliId === 'claude-code' || isStructuredBridge) ? adopted.originalCliPid : undefined,
+    adoptCwd: (adoptedCliId === 'claude-code' || isStructuredBridge) ? adopted.cwd : undefined,
     // Restored-from-metadata: this fork is recreating an /adopt session after
     // a daemon restart, NOT a fresh /adopt command. The Lark thread already
     // has every prior turn pushed as cards, so the worker should skip the

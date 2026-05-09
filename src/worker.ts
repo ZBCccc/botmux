@@ -28,7 +28,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff } from './services/codex-transcript.js';
-import { cocoEventsPathForSession, drainCocoEvents } from './services/coco-transcript.js';
+import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -1147,8 +1147,9 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
   // from append-only JSONL when the model forgets to call `botmux send`.
-  // Codex uses ~/.codex rollouts; CoCo uses ~/.cache/coco events.
-  return lastInitConfig?.cliId === 'codex' || (lastInitConfig?.cliId === 'coco' && lastInitConfig?.adoptMode !== true);
+  // Codex uses ~/.codex rollouts; CoCo uses ~/.cache/coco events. Both
+  // work in adopt mode now that CoCo's PID→sessionId discovery is wired.
+  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco';
 }
 
 function structuredBridgeIsCodex(): boolean {
@@ -1183,13 +1184,25 @@ function codexBridgeStartTimer(): void {
         // attaches via split-live (history absorbed, live ingested);
         // non-adopt uses fresh-empty (queue's markTimeMs - 5s lower bound
         // gates historical fingerprint matches without needing a split).
+        // Discovery primitives differ per CLI: codex walks ~/.codex/sessions
+        // by sid suffix; CoCo's events.jsonl path is deterministic from
+        // sid, so the lookup is just a path computation + existence check.
+        const isCoco = lastInitConfig?.cliId === 'coco';
         let path: string | undefined;
         if (codexBridgePendingSessionId) {
-          path = findCodexRolloutBySessionId(codexBridgePendingSessionId);
+          path = isCoco
+            ? cocoEventsPathForSession(codexBridgePendingSessionId)
+            : findCodexRolloutBySessionId(codexBridgePendingSessionId);
+          if (path && isCoco && !existsSync(path)) path = undefined;
         }
         if (!path && codexAdoptPendingPid) {
-          const probed = findCodexRolloutByPid(codexAdoptPendingPid);
-          if (probed) path = probed.path;
+          if (isCoco) {
+            const probed = findCocoSessionByPid(codexAdoptPendingPid);
+            if (probed && existsSync(probed.eventsPath)) path = probed.eventsPath;
+          } else {
+            const probed = findCodexRolloutByPid(codexAdoptPendingPid);
+            if (probed) path = probed.path;
+          }
         }
         if (path) {
           codexBridgePendingSessionId = undefined;
@@ -2106,6 +2119,31 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         codexAdoptPendingPid = cfg.adoptCliPid;
         codexBridgeStartTimer();
       }
+    } else if (cfg.cliId === 'coco') {
+      // CoCo adopt: parallel to codex, but the events.jsonl path is
+      // deterministic from cliSessionId, so once the daemon-side discovery
+      // surfaced an sid we know the path immediately. The file may not
+      // exist yet (CoCo creates it on first event); codexBridgeAttach's
+      // split-live-with-missing-file branch degrades to fresh, and the
+      // late-attach poller catches re-creation.
+      const adoptStartMs = Date.now();
+      codexAdoptStartMs = adoptStartMs;
+      codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+      let eventsPath: string | undefined;
+      if (cfg.cliSessionId) eventsPath = cocoEventsPathForSession(cfg.cliSessionId);
+      if (!eventsPath && cfg.adoptCliPid) {
+        const probed = findCocoSessionByPid(cfg.adoptCliPid);
+        if (probed) eventsPath = probed.eventsPath;
+      }
+      if (eventsPath) {
+        codexBridgeAttach(eventsPath, 'split-live');
+      } else {
+        // No sid known yet — fall back to PID-walk in the late-attach
+        // poller. Reuses codexAdoptPendingPid since the timer dispatches
+        // by cliId at probe time (see codexBridgeStartTimer).
+        codexAdoptPendingPid = cfg.adoptCliPid;
+        codexBridgeStartTimer();
+      }
     }
 
     // Idle detection. In bridge mode we use the adopted CLI's real
@@ -2114,8 +2152,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // minimal output-quiescence-only detector.
     const idleAdapter = cfg.bridgeJsonlPath
       ? createCliAdapterSync('claude-code', undefined)
-      : cfg.cliId === 'codex'
-        ? createCliAdapterSync('codex', undefined)
+      : cfg.cliId === 'codex' || cfg.cliId === 'coco'
+        ? createCliAdapterSync(cfg.cliId, undefined)
         : ({ completionPattern: undefined, readyPattern: undefined } as any);
     idleDetector = new IdleDetector(idleAdapter);
     // Codex adopt write path: route Lark messages through the codex
