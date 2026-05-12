@@ -14,6 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
+import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
 function user(uuid: string, content: string = `<input ${uuid}>`): TranscriptEvent {
@@ -578,6 +579,172 @@ describe('BridgeTurnQueue', () => {
       ]);
       expect(q.size()).toBe(0);
       expect(q.drainEmittable()).toEqual([]);
+    });
+  });
+
+  // ── Type-ahead via attachment(queued_command) attribution ────────────────
+  //
+  // When Claude is busy and the worker submits via type-ahead, jsonl records
+  // the dequeue moment as `attachment(queued_command)` (with uuid + timestamp)
+  // immediately before the assistant text for that turn streams. The queue
+  // must treat this identically to `role:user` for turn-start, AND override
+  // markTimeMs to the event timestamp so the bridge-fallback gate's window
+  // anchors on "Claude actually started processing this turn" — not on the
+  // earlier moment the worker wrote to PTY.
+  describe('attachment(queued_command) attribution', () => {
+    function queuedCommand(uuid: string, prompt: string, timestamp?: string): TranscriptEvent {
+      return {
+        type: 'attachment',
+        uuid,
+        timestamp,
+        attachment: { type: 'queued_command', prompt },
+      };
+    }
+
+    it('queued_command starts the matching pending Lark turn and overrides markTimeMs', () => {
+      const q = new BridgeTurnQueue();
+      const fpA = makeFingerprint('please review the new patch');
+      const fpB = makeFingerprint('also fix the typo on line 42');
+      // Both Lark turns marked while Claude was still on a previous turn —
+      // markTimeMs anchors at the early enqueue moment.
+      q.mark('tA', fpA, 100);
+      q.mark('tB', fpB, 120);
+      // Claude finally dequeues turn A: writes attachment(queued_command)
+      // followed by the assistant reply. Then dequeues B.
+      q.ingest([
+        queuedCommand('qa', 'please review the new patch — appended hint', '2026-05-10T18:36:00.000Z'),
+        assistant('aa', 'reviewed'),
+        queuedCommand('qb', 'also fix the typo on line 42 — appended', '2026-05-10T18:36:30.000Z'),
+        assistant('ab', 'fixed'),
+      ]);
+      const ready = q.drainEmittable();
+      expect(ready.map(t => t.turnId)).toEqual(['tA', 'tB']);
+      expect(ready[0].assistantUuids).toEqual(['aa']);
+      expect(ready[1].assistantUuids).toEqual(['ab']);
+      // markTimeMs MUST be the event timestamp, not the original mark time.
+      expect(ready[0].markTimeMs).toBe(Date.parse('2026-05-10T18:36:00.000Z'));
+      expect(ready[1].markTimeMs).toBe(Date.parse('2026-05-10T18:36:30.000Z'));
+    });
+
+    it('send-marker gate: marker between turn1 dequeue and turn2 dequeue suppresses turn1, not turn2', () => {
+      // Regression test for the bridge-fallback-gate window semantics under
+      // type-ahead. Without the markTimeMs override, turn2's window would
+      // start at its early enqueue time and a marker landing AFTER turn1's
+      // assistant text but BEFORE turn2's dequeue would (a) miss turn1's
+      // [enqueue, turn2.enqueue) window — failing to suppress turn1's
+      // fallback, and (b) fall inside turn2's [enqueue, ∞) window — wrongly
+      // suppressing turn2's real reply. Overriding markTimeMs fixes both.
+      const q = new BridgeTurnQueue();
+      const fpA = makeFingerprint('first prompt');
+      const fpB = makeFingerprint('second prompt');
+      q.mark('tA', fpA, 100);  // enqueue (early)
+      q.mark('tB', fpB, 120);  // enqueue (close to A, well before B's dequeue)
+      q.ingest([
+        queuedCommand('qa', 'first prompt — body', new Date(1000).toISOString()),
+        assistant('aa', 'reply A'),
+        queuedCommand('qb', 'second prompt — body', new Date(3000).toISOString()),
+        assistant('ab', 'reply B'),
+      ]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(2);
+      expect(ready[0].markTimeMs).toBe(1000);
+      expect(ready[1].markTimeMs).toBe(3000);
+      // End-to-end gate behaviour: a `botmux send` marker landing between
+      // turn1's dequeue (1000) and turn2's dequeue (3000) means the model
+      // pushed turn1's reply itself and DOESN'T also serve as turn2's
+      // delivery. The gate must suppress turn1 and let turn2 through.
+      const markers = [{ sentAtMs: 2000 }];
+      const turn1NextBoundary = ready[1].markTimeMs;  // 3000
+      const turn2NextBoundary = undefined;  // last in batch
+      expect(
+        shouldSuppressBridgeEmit({ markTimeMs: ready[0].markTimeMs, isLocal: ready[0].isLocal }, turn1NextBoundary, markers, false),
+      ).toBe(true);
+      expect(
+        shouldSuppressBridgeEmit({ markTimeMs: ready[1].markTimeMs, isLocal: ready[1].isLocal }, turn2NextBoundary, markers, false),
+      ).toBe(false);
+    });
+
+    it('queued_command prompt mismatch falls through to local turn synthesised from attachment.prompt', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1', makeFingerprint('lark-specific question'));
+      // User typed something else directly in the pane while Claude was busy
+      // — it landed in the type-ahead queue and now dequeues as a
+      // queued_command attachment whose prompt doesn't match t1's fingerprint.
+      q.ingest([
+        queuedCommand('local-q', 'something completely different', new Date(5000).toISOString()),
+      ]);
+      const t1 = q.peek().find(t => t.turnId === 't1');
+      expect(t1?.started).toBe(false);
+      const local = q.peek().find(t => t.isLocal);
+      expect(local).toBeTruthy();
+      expect(local?.userUuid).toBe('local-q');
+      expect(local?.markTimeMs).toBe(5000);
+      // Lark turn stays unstarted, ready to consume the next matching submit.
+    });
+
+    it('extractTurnStartText recovers prompt for local emit (queued_command-derived local turn)', async () => {
+      // Verify that the worker emit path's text extraction works on the
+      // synthesised local turn — without this, formatLocalTurnContent would
+      // see an empty user side and the Lark thread would show an orphan reply.
+      const { extractTurnStartText } = await import('../src/services/claude-transcript.js');
+      const ev: TranscriptEvent = {
+        type: 'attachment',
+        uuid: 'q1',
+        attachment: { type: 'queued_command', prompt: 'pwd' },
+      };
+      expect(extractTurnStartText(ev)).toBe('pwd');
+      // Falls back to message.content for legacy role:user events.
+      const userEv: TranscriptEvent = { type: 'user', uuid: 'u1', message: { role: 'user', content: 'ls -la' } };
+      expect(extractTurnStartText(userEv)).toBe('ls -la');
+      // Tolerates non-string prompt via stringifyUserContent.
+      const arrayPrompt: TranscriptEvent = {
+        type: 'attachment',
+        uuid: 'q2',
+        attachment: { type: 'queued_command', prompt: [{ type: 'text', text: 'hello' }] as unknown },
+      };
+      expect(extractTurnStartText(arrayPrompt)).toBe('hello');
+    });
+
+    it('queued_command with empty prompt is skipped: does not drop collecting or synthesise a local turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), assistant('a1', 'partial')]);
+      // Empty prompt — must NOT trigger HOL-block drop on the active
+      // collecting turn, must NOT create a new local turn.
+      q.ingest([queuedCommand('q-empty', '', new Date(2000).toISOString())]);
+      const peek = q.peek();
+      expect(peek).toHaveLength(1);
+      expect(peek[0].turnId).toBe('t1');
+      expect(peek[0].assistantUuids).toEqual(['a1']);
+    });
+
+    it('idempotent ingest: replaying the same queued_command uuid does not double-attribute', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1', makeFingerprint('hello world'));
+      const ev = queuedCommand('q1', 'hello world', new Date(1000).toISOString());
+      q.ingest([ev, assistant('a1', 'reply')]);
+      // Replay the same events — must be a no-op (uuid already in seen set).
+      q.ingest([ev, assistant('a1', 'reply')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(q.size()).toBe(0);
+    });
+
+    it('synthetic-prefixed queued_command is filtered (defense-in-depth against slash-command type-ahead)', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1'), assistant('a1', 'partial')]);
+      // Hypothetical: a slash-command-wrapped prompt landed in the queue.
+      // Treating it as a turn-start would drop the active collecting turn.
+      q.ingest([
+        queuedCommand('q-slash', '<command-name>/clear</command-name>', new Date(2000).toISOString()),
+      ]);
+      const peek = q.peek();
+      expect(peek).toHaveLength(1);
+      expect(peek[0].turnId).toBe('t1');
+      expect(peek[0].assistantUuids).toEqual(['a1']);
     });
   });
 });

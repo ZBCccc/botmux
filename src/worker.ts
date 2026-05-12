@@ -15,7 +15,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
@@ -1104,8 +1104,12 @@ function emitReadyTurns(): void {
         // Local turn (adopt mode only): also surface the user prompt so the
         // Lark thread shows both sides of the exchange. User text comes from
         // the same drained transcript via the userUuid stamped at start time.
+        // extractTurnStartText handles both `role:user` events (text in
+        // message.content) AND `attachment(queued_command)` events (text in
+        // attachment.prompt) so type-ahead'd local input renders the same as
+        // a normally-typed pane prompt.
         const userEv = drained.events.find(e => e.uuid === turn.userUuid);
-        const userText = userEv ? stringifyUserContent(userEv.message?.content) : '';
+        const userText = userEv ? extractTurnStartText(userEv) : '';
         const content = formatLocalTurnContent(userText, assistantText);
         if (!content) continue;
         send({ type: 'final_output', content, lastUuid, turnId: turn.turnId });
@@ -1932,21 +1936,18 @@ async function flushPending(): Promise<void> {
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
-  // Type-ahead adapters flush even while the CLI is busy; others wait for idle.
-  // Bridge fallback (non-adopt) disables type-ahead: queued submits land
-  // in jsonl as `attachment(queued_command)` events, NOT `role:user` lines,
-  // so BridgeTurnQueue.ingest never starts the pending turn for them and
-  // the assistant text would be dropped on the floor. Serialise instead —
-  // worker holds messages in pendingMessages until the CLI reaches idle.
+  // Type-ahead adapters flush even while the CLI is busy; others wait for
+  // idle. Claude bridge fallback used to also disable type-ahead because
+  // BridgeTurnQueue.ingest didn't recognise the `attachment(queued_command)`
+  // events Claude writes when it dequeues a queued submit — assistant text
+  // for the type-ahead'd turn was either dropped or attributed to the wrong
+  // Lark message. Now that the queue handles queued_command identically to
+  // role:user (and overrides markTimeMs to the dequeue-time event timestamp
+  // so the gate window is correct), Claude bridge can run with type-ahead
+  // again. Codex bridge stays serial because its queue hasn't been upgraded.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
-  const bridgeFallbackActive = claudeBridgeActive || codexBridgeActive;
-  // Type-ahead must be disabled for any active bridge fallback (claude or
-  // codex). Claude type-ahead's queued submits never become role:user
-  // events; Codex doesn't declare supportsTypeAhead so this is mostly a
-  // belt-and-braces gate, but keep symmetry so future adapters with
-  // type-ahead get the same protection automatically.
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !bridgeFallbackActive;
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !codexBridgeActive;
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
@@ -1991,15 +1992,16 @@ async function flushPending(): Promise<void> {
       if (result && result.submitted === false) {
         scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL');
       }
-      // Bridge fallback: stop after one writeInput. Subsequent submits
-      // would be type-ahead'd into Claude's queue, which jsonl records as
-      // queued_command attachments (not role:user lines) — BridgeTurnQueue
-      // can't attribute those, so the fallback would silently drop them.
-      // We resume on the next idle, by which point Claude has finished
-      // and the next message can be a normal role:user submit. Scoped to
-      // bridgeFallbackActive so non-bridge CLIs (codex/gemini/...) keep
-      // the original "one idle drains all pending" behaviour.
-      if (bridgeFallbackActive && pendingMessages.length > 0) break;
+      // Codex bridge: stop after one writeInput per idle cycle. Codex's
+      // bridge queue doesn't yet attribute queued_command-equivalents, so
+      // type-ahead'd submits would have their assistant text dropped or
+      // mis-attributed. We resume on the next idle, by which point Codex
+      // has finished and the next message can be a normal user_message
+      // submit. Claude bridge no longer takes this break — its
+      // BridgeTurnQueue handles `attachment(queued_command)` events
+      // identically to `role:user`, so type-ahead'd turns are correctly
+      // attributed and no longer need the serial-per-idle guard.
+      if (codexBridgeActive && pendingMessages.length > 0) break;
     }
   } finally {
     isFlushing = false;
@@ -2022,9 +2024,12 @@ function sendToPty(content: string): void {
     // Tear down the prompt card so the user doesn't see stale options.
     send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
   }
-  // See flushPending: bridge fallback gates type-ahead off (claude OR codex).
-  const bridgeFallbackActive = (!!bridgeJsonlPath && !lastInitConfig?.adoptMode) || codexBridgeFallbackActive();
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !bridgeFallbackActive;
+  // See flushPending: only Codex bridge still serialises type-ahead.
+  // Claude bridge now attributes `attachment(queued_command)` events
+  // identically to `role:user`, so type-ahead'd submits land in the right
+  // turn and we no longer need to gate the entry path on claudeBridgeActive.
+  const codexBridgeActive = codexBridgeFallbackActive();
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !codexBridgeActive;
   if (isPromptReady || isFlushing || typeAheadAllowed) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing

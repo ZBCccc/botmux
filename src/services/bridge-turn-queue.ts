@@ -28,7 +28,7 @@
  * Baseline (`absorb()`) takes a batch of historical events and registers
  * their uuids as already-seen so future ingest doesn't double-attribute.
  */
-import { stringifyUserContent, normaliseForFingerprint, isMeaningfulUserEvent, type TranscriptEvent } from './claude-transcript.js';
+import { normaliseForFingerprint, isMeaningfulUserEvent, isMeaningfulQueuedCommand, extractTurnStartText, type TranscriptEvent } from './claude-transcript.js';
 
 // Re-export so existing callers (worker.ts, tests) don't need to change
 // their import path now that these helpers live in claude-transcript.ts.
@@ -162,68 +162,19 @@ export class BridgeTurnQueue {
         // accidentally contains the fingerprint substring start the
         // wrong turn.
         if (!isMeaningfulUserEvent(ev)) continue;
-        // Defensive: if the previous turn never accumulated any assistant
-        // text, drop it now so its empty `assistantUuids` doesn't
-        // head-of-line block every subsequent emit. Applies to BOTH local
-        // and Lark turns: Claude is single-threaded over the PTY, so a new
-        // meaningful user event in the transcript means the model has
-        // already moved on from the previous turn — if no visible text
-        // landed by now, none ever will (e.g. post-/clear "good" silence,
-        // or model emitted only tool_use without a follow-up text). Tool-use
-        // mid-stream is NOT affected: the tool_result events that come
-        // between tool_use and the final text are filtered out by
-        // `isMeaningfulUserEvent` above and never reach this branch.
-        if (this.collecting && this.collecting.assistantUuids.length === 0) {
-          const idx = this.queue.indexOf(this.collecting);
-          if (idx >= 0) this.queue.splice(idx, 1);
-          this.collecting = null;
-        }
-        const next = this.queue.find(t => !t.started);
-        let consumedNext = false;
-        if (next) {
-          // If this turn has a fingerprint, gate on a content match. Both
-          // sides are normalised (whitespace-collapsed + trimmed) before
-          // the substring check so a transcript line that preserved
-          // newlines still matches a fingerprint built from the same text.
-          if (next.contentFingerprint) {
-            const userText = normaliseForFingerprint(stringifyUserContent(ev.message?.content));
-            if (userText.includes(next.contentFingerprint)) {
-              next.started = true;
-              if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
-              this.collecting = next;
-              consumedNext = true;
-            }
-            // Mismatch falls through to the local-turn branch below.
-          } else {
-            // Legacy mark() with no fingerprint — start on the next user.
-            next.started = true;
-            if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
-            this.collecting = next;
-            consumedNext = true;
-          }
-        }
-        if (!consumedNext) {
-          // Local-terminal input. Synthesise a started turn so the
-          // assistant text that follows is captured (and pushed to the
-          // Lark thread) instead of being silently dropped — that's the
-          // /adopt symptom users hit when typing directly in the iterm
-          // pane. Insert AHEAD of any still-unstarted Lark turn so
-          // chronological order is preserved: this user event landed in
-          // the transcript before the next Lark turn's user event will.
-          const localTurn: BridgePendingTurn = {
-            turnId: `local-${uuid}`,
-            started: true,
-            isLocal: true,
-            userUuid: uuid,
-            assistantUuids: [],
-            sourceJsonlPath,
-            markTimeMs: Date.now(),
-          };
-          const insertAt = this.queue.findIndex(t => !t.started);
-          if (insertAt === -1) this.queue.push(localTurn);
-          else this.queue.splice(insertAt, 0, localTurn);
-          this.collecting = localTurn;
-        }
+        this.handleTurnStart(uuid, ev, sourceJsonlPath);
+      } else if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+        // Type-ahead path: Claude writes `attachment(queued_command)` the
+        // moment it dequeues a queued submit, immediately before the
+        // assistant text for that turn starts streaming. Equivalent to
+        // role:user for turn-start purposes; share the same handler so
+        // fingerprint-match / HOL-block-drop / local-turn fallback all
+        // apply identically. Without this the bridge attribution queue
+        // would skip queued_command events and the type-ahead'd turn's
+        // assistant text would either be dropped or attributed to a
+        // sibling turn.
+        if (!isMeaningfulQueuedCommand(ev)) continue;
+        this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
         if (!assistantHasVisibleText(ev.message?.content)) continue;
@@ -254,6 +205,81 @@ export class BridgeTurnQueue {
         }
         this.collecting.assistantUuids.push(uuid);
       }
+    }
+  }
+
+  /** Shared turn-start handler. Called for both `role:user` and
+   *  `attachment(queued_command)` events once meaningfulness has been
+   *  established by the caller. Encapsulates:
+   *    1. HOL-block drop of the previous collecting turn when it got no
+   *       assistant text (Claude moved on).
+   *    2. Fingerprint-gated start of the earliest unstarted Lark turn,
+   *       falling through to local-turn synthesis on mismatch.
+   *    3. markTimeMs override to the transcript event's own timestamp —
+   *       critical for type-ahead, where the original markTimeMs (set when
+   *       the worker wrote to PTY) can be many seconds earlier than the
+   *       moment Claude actually dequeues and starts processing the turn.
+   *       The bridge-fallback gate's [markTimeMs, nextBoundaryMs) window
+   *       MUST anchor on the latter, otherwise a `botmux send` from the
+   *       previous turn can leak into the next turn's window and the
+   *       suppression decision flips to the wrong turn (real reply
+   *       suppressed, fallback shown — exactly what the type-ahead-disable
+   *       in commit b2d9791 was protecting against). */
+  private handleTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
+    // Head-of-line block drop: previous turn never produced any visible
+    // assistant text and a new meaningful turn-start has arrived → Claude
+    // is single-threaded over the PTY, so the old turn will never get
+    // text. Applies to both Lark and local turns.
+    if (this.collecting && this.collecting.assistantUuids.length === 0) {
+      const idx = this.queue.indexOf(this.collecting);
+      if (idx >= 0) this.queue.splice(idx, 1);
+      this.collecting = null;
+    }
+    const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
+    const eventTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
+    const next = this.queue.find(t => !t.started);
+    let consumedNext = false;
+    if (next) {
+      if (next.contentFingerprint) {
+        // Both sides normalised (whitespace-collapsed + trimmed) before
+        // the substring check so a transcript line that preserved newlines
+        // still matches a fingerprint built from the same text.
+        const userText = normaliseForFingerprint(extractTurnStartText(ev));
+        if (userText.includes(next.contentFingerprint)) {
+          next.started = true;
+          if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+          next.markTimeMs = eventTimeMs;
+          this.collecting = next;
+          consumedNext = true;
+        }
+        // Mismatch falls through to local-turn synthesis below.
+      } else {
+        // Legacy mark() with no fingerprint — start on the next turn-start.
+        next.started = true;
+        if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+        next.markTimeMs = eventTimeMs;
+        this.collecting = next;
+        consumedNext = true;
+      }
+    }
+    if (!consumedNext) {
+      // Local-terminal input (or a queued_command whose prompt didn't
+      // match any pending Lark fingerprint). Synthesise a started turn
+      // ahead of any unstarted Lark turn so chronological order matches
+      // transcript order at emit time.
+      const localTurn: BridgePendingTurn = {
+        turnId: `local-${uuid}`,
+        started: true,
+        isLocal: true,
+        userUuid: uuid,
+        assistantUuids: [],
+        sourceJsonlPath,
+        markTimeMs: eventTimeMs,
+      };
+      const insertAt = this.queue.findIndex(t => !t.started);
+      if (insertAt === -1) this.queue.push(localTurn);
+      else this.queue.splice(insertAt, 0, localTurn);
+      this.collecting = localTurn;
     }
   }
 

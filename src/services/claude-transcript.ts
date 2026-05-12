@@ -24,6 +24,34 @@ export interface TranscriptEvent {
     role?: string;
     content?: unknown;
   };
+  /** Present on `type:"attachment"` lines. The bridge attribution queue
+   *  treats `attachment.type === "queued_command"` as a turn-start signal —
+   *  Claude writes one of these the moment it dequeues a type-ahead
+   *  submission, immediately before the assistant's reply for that turn
+   *  starts streaming. `prompt` carries the same content the user typed;
+   *  shape is usually `string` but we tolerate the message-style array form
+   *  via stringifyUserContent. */
+  attachment?: {
+    type?: string;
+    prompt?: unknown;
+    commandMode?: string;
+  };
+}
+
+/** Extract the user-typed prompt text for a "turn start" event — works for
+ *  both legacy `role:user` events (text in `message.content`) and the
+ *  type-ahead `attachment(queued_command)` form (text in `attachment.prompt`).
+ *  Returns '' when neither shape carries usable content. Used at three
+ *  layers: BridgeTurnQueue.ingest (fingerprint-match the right pending Lark
+ *  turn), worker emit (local-turn user-text resolution), and tests. */
+export function extractTurnStartText(ev: TranscriptEvent | null | undefined): string {
+  if (!ev || typeof ev !== 'object') return '';
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    if (typeof prompt === 'string') return prompt;
+    return stringifyUserContent(prompt);
+  }
+  return stringifyUserContent(ev.message?.content);
 }
 
 export interface DrainResult {
@@ -196,6 +224,24 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   const content = ev.message?.content;
   if (isPureToolResultUserEvent(content)) return false;
   const text = normaliseForFingerprint(stringifyUserContent(content));
+  if (text.length === 0) return false;
+  if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
+  return true;
+}
+
+/** True when a `type:'attachment'` line carries a queued-command payload
+ *  representing a real submitted prompt. Claude writes one of these when it
+ *  dequeues a type-ahead submission (right before the assistant's reply for
+ *  that turn starts streaming) — the bridge attribution queue treats it
+ *  exactly like a `role:user` event for turn-start purposes. Filters mirror
+ *  isMeaningfulUserEvent's defenses (sidechain, empty / synthetic-prefix
+ *  prompts) so a queued slash command can't false-start a Lark turn. */
+export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.type !== 'attachment') return false;
+  if (ev.attachment?.type !== 'queued_command') return false;
+  if ((ev as any).isSidechain === true) return false;
+  const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
   return true;
