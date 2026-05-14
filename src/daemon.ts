@@ -7,10 +7,12 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
+import { statSync } from 'node:fs';
 import { getChatMode, replyMessage, resolveAllowedUsers, sendMessage } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, isChatOncallBoundForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
+import { autoBindOncallFromDefault } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
@@ -48,6 +50,7 @@ import {
   getSessionWorkingDir,
   getProjectScanDir,
   getProjectScanDirs,
+  expandHome,
   downloadResources,
   formatAttachmentsHint,
   buildNewTopicPrompt,
@@ -61,8 +64,8 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, type RoutingContext } from './im/lark/event-dispatcher.js';
-import { isBotMentionMessageHandled, markBotMentionMessageHandled, tryClaimBotMentionMessage } from './utils/bot-mention-dedup.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, type RoutingContext } from './im/lark/event-dispatcher.js';
+import { isBotMentionMessageHandled, tryClaimBotMentionMessage } from './utils/bot-mention-dedup.js';
 import { markSessionActivity } from './core/session-activity.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -292,6 +295,65 @@ const cardDeps: CardHandlerDeps = {
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
+/**
+ * Default-oncall is a uniform forward-only policy: whenever the toggle is
+ * on, ANY chat the bot is currently in — old or newly added, doesn't matter —
+ * gets auto-bound to the configured workingDir on its next observed topic,
+ * unless it's already bound (`findOncallChatForAnyBot` upstream) or the user
+ * has opted out via tombstone.
+ *
+ * Returns the binding entry on success, undefined when any precondition
+ * fails or the lock-internal authoritative check (in `autoBindOncallFromDefault`)
+ * sees a concurrent tombstone / existing binding.
+ */
+async function maybeAutoBindDefaultOncall(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+): Promise<OncallChat | undefined> {
+  if (chatType !== 'group') return undefined; // oncall is group-only by design
+  const bot = getBot(larkAppId);
+  const def = bot.config.defaultOncall;
+  if (!def?.enabled || !def.workingDir) return undefined;
+
+  // Fast-path tombstone check against the in-memory snapshot — avoids taking
+  // the lock when we already know we'd skip. The AUTHORITATIVE re-check lives
+  // inside autoBindOncallFromDefault under the file lock, so a race with a
+  // concurrent unbind (which writes the tombstone) is still safe.
+  const autobound = bot.config.defaultOncallAutoboundChats ?? [];
+  if (autobound.includes(chatId)) return undefined;
+
+  // Validate workingDir at fire time too — directory might have been
+  // deleted/moved since the dashboard save validated it. Skipping (vs.
+  // crashing) lets the user fix the path without losing other bot config.
+  const resolved = expandHome(def.workingDir);
+  let isDir = false;
+  try { isDir = statSync(resolved).isDirectory(); } catch { /* not a dir */ }
+  if (!isDir) {
+    logger.warn(
+      `[${larkAppId}] defaultOncall workingDir invalid (${resolved}); ` +
+      `skipping auto-bind for chat=${chatId}`,
+    );
+    return undefined;
+  }
+
+  const r = await autoBindOncallFromDefault(larkAppId, chatId, def.workingDir);
+  if (!r.ok) {
+    logger.warn(`[${larkAppId}] defaultOncall auto-bind failed: chat=${chatId} reason=${r.reason}`);
+    return undefined;
+  }
+  if (r.skipped) {
+    // Lock-internal authoritative check disagreed with our fast-path —
+    // tombstone or binding raced in. Fine, just don't surface a binding.
+    logger.info(`[${larkAppId}] defaultOncall auto-bind skipped chat=${chatId} reason=${r.skipped}`);
+    return undefined;
+  }
+  logger.info(
+    `[${larkAppId}] defaultOncall auto-bound chat=${chatId} → ${def.workingDir}`,
+  );
+  return r.entry;
+}
+
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
@@ -419,7 +481,15 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   // Oncall group: pin working dir from the chat-level binding, even if a
   // sibling bot (running in another daemon) is the one that persisted it.
-  const oncallEntry = findOncallChatForAnyBot(chatId);
+  // Layered lookup:
+  //   1) any existing binding (this bot or sibling)
+  //   2) this bot's defaultOncall — auto-binds the chat if it's brand new
+  //      and the flag is on. Once auto-bound, the chat appears in oncallChats
+  //      so the next handleNewTopic sees it via (1).
+  let oncallEntry = findOncallChatForAnyBot(chatId);
+  if (!oncallEntry) {
+    oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, chatId, chatType);
+  }
 
   // Cross-bot / chat-scope inheritance: reuse a sibling session's workingDir
   // and skip the repo card. Same block lives in handleThreadReply's auto-create
@@ -645,7 +715,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
     // Oncall group: pin working dir from the chat-level binding, even if a
     // sibling bot (running in another daemon) is the one that persisted it.
-    const oncallEntry = findOncallChatForAnyBot(autoCreateChatId);
+    // Defaults auto-bind path mirrors handleNewTopic — keep both call sites
+    // in sync (this is the auto-create branch that fires when routing lands
+    // here without an active session, e.g. chat-scope first-reply paths).
+    let oncallEntry = findOncallChatForAnyBot(autoCreateChatId);
+    if (!oncallEntry) {
+      oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, autoCreateChatId, autoCreateChatType);
+    }
 
     // Cross-bot / chat-scope inheritance — see findInheritablePeer comments.
     const inheritedFrom = !oncallEntry
@@ -828,13 +904,14 @@ interface BotMentionSignal {
    *  (the legacy behaviour). */
   scope?: 'thread' | 'chat';
   senderAppId: string;
+  senderOpenId?: string;
   targetBotOpenId: string;
   content: string;
   messageId: string;
   timestamp: number;
 }
 
-function processBotMentionSignal(signal: BotMentionSignal): void {
+async function processBotMentionSignal(signal: BotMentionSignal): Promise<void> {
   // Find the target bot by open_id
   const targetBot = getAllBots().find(b => b.botOpenId === signal.targetBotOpenId);
   if (!targetBot) {
@@ -870,10 +947,10 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
       }
     }
     const enrichedContent = enrichedParts.join('\n\n');
-    // Atomic claim before the worker send. The active-worker branch is
-    // currently sync from the top-of-function check to here, but using the
-    // atomic helper (a) hardens against future async additions and (b)
-    // keeps both dedup paths uniform.
+    // Atomic claim before the worker send. Currently this branch is sync
+    // from the top-of-function check to here, but keeping the claim as
+    // close to the enqueue as possible (a) hardens against future async
+    // additions in between, and (b) keeps both dedup sites uniform.
     if (!tryClaimBotMentionMessage(signal.messageId)) {
       logger.debug(`[bot-mention] Signal-file path skipping ${signal.messageId.substring(0, 12)}: WSClient claimed during signal processing`);
       return;
@@ -896,9 +973,29 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
   // oncall workingDir. Lark WSClient does not deliver bot-sent events, so
   // without this every bot-to-bot @mention into an oncall workspace where
   // the target lacks an active session would silent-drop here.
-  const oncallEntry = findOncallChatForAnyBot(signal.chatId);
+  let oncallEntry = findOncallChatForAnyBot(signal.chatId);
+  if (!oncallEntry) {
+    // Defaults can also fire on bot-mention signals — a brand-new group
+    // chat first observed through a sibling bot's @mention should still
+    // honor the target bot's defaultOncall flag. Keep the same safety gate as
+    // the WS dispatcher: only trusted botmux peers may create a new target
+    // session from a signal file. This avoids arbitrary files/messages from
+    // another bot app spending the default and bypassing the human mention path.
+    const mentionChatType: 'group' | 'p2p' = signal.chatType === 'p2p' ? 'p2p' : 'group';
+    if (isKnownPeerBot(config.session.dataDir, targetAppId, signal.senderOpenId)) {
+      oncallEntry = await maybeAutoBindDefaultOncall(targetAppId, signal.chatId, mentionChatType);
+    }
+  }
   if (!oncallEntry) {
     logger.debug(`[bot-mention] Target bot ${targetAppId} has no active worker at ${signal.scope ?? 'thread'}-scope anchor ${anchor.substring(0, 12)} and chat is not oncall-bound — leaving for WSClient auto-create path`);
+    return;
+  }
+  // Re-check dedup AFTER the maybeAutoBindDefaultOncall await — the WS path
+  // could have claimed and routed this messageId while we were resolving the
+  // default-oncall binding. Without this gate the auto-spawn path would fork
+  // a duplicate worker and the same prompt would land in two sessions.
+  if (!tryClaimBotMentionMessage(signal.messageId)) {
+    logger.debug(`[bot-mention] Signal-file auto-spawn skipping ${signal.messageId.substring(0, 12)}: WSClient claimed during maybeAutoBindDefaultOncall yield`);
     return;
   }
   spawnSessionForBotMention(signal, targetBot, oncallEntry, anchor).catch(err => {
@@ -972,7 +1069,8 @@ async function spawnSessionForBotMention(
     currentTurnTitle: title,
   };
   activeSessions.set(sessionKey(anchor, larkAppId), newDs);
-  markBotMentionMessageHandled(signal.messageId);
+  // Note: caller (processBotMentionSignal) already claimed signal.messageId
+  // via tryClaimBotMentionMessage before invoking us, so no mark here.
 
   const prompt = buildNewTopicPrompt(
     enrichedContent,
@@ -1006,7 +1104,8 @@ function startBotMentionWatcher(): void {
         const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
         if (!isSignalForMe(signal)) continue; // not for this daemon, leave for target
         unlinkSync(filePath);
-        processBotMentionSignal(signal);
+        void processBotMentionSignal(signal).catch(err =>
+          logger.error(`[bot-mention] processBotMentionSignal failed for ${file}: ${err}`));
       } catch (err) {
         logger.debug(`[bot-mention] Failed to process signal ${file}: ${err}`);
       }
@@ -1024,7 +1123,8 @@ function startBotMentionWatcher(): void {
         const signal: BotMentionSignal = JSON.parse(readFileSync(filePath, 'utf-8'));
         if (!isSignalForMe(signal)) return; // not for this daemon, leave for target
         unlinkSync(filePath);
-        processBotMentionSignal(signal);
+        void processBotMentionSignal(signal).catch(err =>
+          logger.error(`[bot-mention] processBotMentionSignal failed for ${filename}: ${err}`));
       } catch (err) {
         logger.debug(`[bot-mention] Failed to process signal ${filename}: ${err}`);
       }
