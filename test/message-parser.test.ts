@@ -101,10 +101,18 @@ describe('Interactive card parsing: Format A (API simplified)', () => {
     expect(result.content).toBe('[卡片: Empty Card]');
   });
 
-  it('should handle card with no title and no useful elements', () => {
+  it('should handle card with no title — image-only elements speak for themselves', () => {
+    // 没有 title 时不再 push 多余的 `[卡片]` 占位行；image 占位本身已足以说明
+    // 来源，并且对接收 bot 的 prompt 而言少一行噪声。
     const card = { elements: [[{ tag: 'img', image_key: 'img_xxx' }]] };
     const result = parseApiMessage(makeMsg('interactive', card));
-    expect(result.content).toBe('[卡片]\n[图片]');
+    expect(result.content).toBe('[图片]');
+  });
+
+  it('should fall back to "[卡片]" when title is absent AND no elements yield any content', () => {
+    const card = { elements: [] };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('[卡片]');
   });
 });
 

@@ -435,9 +435,12 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
 
     // --- Format A: Lark API simplified format ---
     // { title: "...", elements: [[{tag,text}, ...], ...] }
+    // 只有 title 存在时才 push 标识行；没 title 的卡片（例如 markdown 自动转
+    // 卡片的 outgoing 消息）让 elements 内容自己说话，避免在正文前堆一行
+    // 多余的 `[卡片]`。整张卡片真的没内容时下方 `parts.join('\n') || '[卡片]'`
+    // 会兜底返回占位。
     const title = card.title ?? card.header?.title?.content;
     if (title) parts.push(`[卡片: ${title}]`);
-    else parts.push('[卡片]');
 
     // v2 cards nest elements under `body`; fall back to legacy top-level.
     const rootElements = Array.isArray(card.body?.elements)
