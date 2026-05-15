@@ -13,8 +13,10 @@ import { describe, it, expect } from 'vitest';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import {
   DEFAULT_CARD_SCREENSHOT_ROWS,
+  DEFAULT_CARD_SCREENSHOT_TAIL_ROWS,
   resolveRenderDimensions,
   resolveScreenshotViewport,
+  resolveScreenshotViewportPlan,
 } from '../src/utils/render-dimensions.js';
 
 // xterm-headless processes writes asynchronously through an internal
@@ -60,7 +62,7 @@ describe('resolveRenderDimensions (worker init helper)', () => {
   });
 });
 
-describe('resolveScreenshotViewport (Lark card screenshot helper)', () => {
+describe('resolveScreenshotViewport (legacy single-slice helper)', () => {
   it('uses the full viewport when it is already compact', () => {
     expect(resolveScreenshotViewport(24, 10)).toEqual({ startY: 10, rows: 24 });
   });
@@ -74,6 +76,43 @@ describe('resolveScreenshotViewport (Lark card screenshot helper)', () => {
 
   it('accepts an explicit row cap for tests and future callers', () => {
     expect(resolveScreenshotViewport(50, 7, 20)).toEqual({ startY: 37, rows: 20 });
+  });
+});
+
+describe('resolveScreenshotViewportPlan (Lark card screenshot helper)', () => {
+  it('uses one full segment when the viewport is already compact', () => {
+    expect(resolveScreenshotViewportPlan(24, 10)).toEqual({
+      segments: [{ startY: 10, rows: 24 }],
+      rows: 24,
+    });
+  });
+
+  it('keeps top context and bottom status/input rows for tall terminal panes', () => {
+    expect(resolveScreenshotViewportPlan(57, 100)).toEqual({
+      segments: [
+        { startY: 100, rows: DEFAULT_CARD_SCREENSHOT_ROWS - DEFAULT_CARD_SCREENSHOT_TAIL_ROWS - 1, destRow: 0 },
+        { type: 'separator', destRow: DEFAULT_CARD_SCREENSHOT_ROWS - DEFAULT_CARD_SCREENSHOT_TAIL_ROWS - 1 },
+        {
+          startY: 100 + (57 - DEFAULT_CARD_SCREENSHOT_TAIL_ROWS),
+          rows: DEFAULT_CARD_SCREENSHOT_TAIL_ROWS,
+          destRow: DEFAULT_CARD_SCREENSHOT_ROWS - DEFAULT_CARD_SCREENSHOT_TAIL_ROWS,
+        },
+      ],
+      rows: DEFAULT_CARD_SCREENSHOT_ROWS,
+    });
+  });
+
+  it('anchors the tail segment to the bottom when using explicit total and tail caps', () => {
+    const plan = resolveScreenshotViewportPlan(50, 7, 20, 6);
+    expect(plan.segments.at(-1)).toMatchObject({ destRow: plan.rows - 6 });
+    expect(plan).toEqual({
+      segments: [
+        { startY: 7, rows: 13, destRow: 0 },
+        { type: 'separator', destRow: 13 },
+        { startY: 51, rows: 6, destRow: 14 },
+      ],
+      rows: 20,
+    });
   });
 });
 

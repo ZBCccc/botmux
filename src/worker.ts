@@ -42,7 +42,7 @@ import {
   MIN_RENDER_COLS,
   clamp,
   resolveRenderDimensions,
-  resolveScreenshotViewport,
+  resolveScreenshotViewportPlan,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
@@ -54,7 +54,7 @@ import type { SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
-import { captureToPng } from './utils/screenshot-renderer.js';
+import { capturePlanToPng } from './utils/screenshot-renderer.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
@@ -1610,7 +1610,7 @@ async function captureAndUpload(): Promise<void> {
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   const term = renderer.xterm;
-  const { startY, rows: screenshotRows } = resolveScreenshotViewport(
+  const screenshotPlan = resolveScreenshotViewportPlan(
     term.rows,
     term.buffer.active.baseY,
   );
@@ -1625,8 +1625,11 @@ async function captureAndUpload(): Promise<void> {
   let png: Buffer;
   try {
     const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-    const shotRows = clamp(screenshotRows, 1, MAX_RENDER_ROWS);
-    png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+    const shotRows = clamp(screenshotPlan.rows, 1, MAX_RENDER_ROWS);
+    const segments = screenshotPlan.rows === shotRows
+      ? screenshotPlan.segments
+      : resolveScreenshotViewportPlan(term.rows, term.buffer.active.baseY, shotRows).segments;
+    png = capturePlanToPng(term, { cols: shotCols, rows: shotRows, segments });
   } catch (err: any) {
     logError(`Screenshot render failed: ${err?.message ?? err}`);
     return;

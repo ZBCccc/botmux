@@ -9,6 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import xtermHeadless from '@xterm/headless';
+import type { ScreenshotSegment } from './render-dimensions.js';
 type Terminal = InstanceType<typeof xtermHeadless.Terminal>;
 
 // ─── Font registration ──────────────────────────────────────────────────────
@@ -171,11 +172,87 @@ export interface CaptureOpts {
   startY: number;
 }
 
-/** Capture a section of the terminal buffer to a PNG buffer. */
-export function captureToPng(terminal: Terminal, opts: CaptureOpts): Buffer {
+export interface CapturePlanOpts {
+  cols: number;
+  rows: number;
+  segments: ScreenshotSegment[];
+}
+
+type CanvasContext2D = ReturnType<ReturnType<typeof createCanvas>['getContext']>;
+
+function drawSeparator(ctx: CanvasContext2D, cols: number, destRow: number): void {
+  const y = PADDING + destRow * CELL_H;
+  const x = PADDING;
+  const width = cols * CELL_W;
+  ctx.fillStyle = '#24283b';
+  ctx.fillRect(x, y, width, CELL_H);
+  ctx.fillStyle = '#565f89';
+  ctx.font = fontSpec(false);
+  ctx.textBaseline = 'top';
+  ctx.fillText('⋯ omitted middle rows ⋯', x + 4, y + 2);
+}
+
+function drawTerminalLine(
+  ctx: CanvasContext2D,
+  terminal: Terminal,
+  cols: number,
+  sourceRow: number,
+  destRow: number,
+  currentBold: boolean,
+): boolean {
+  const line = terminal.buffer.active.getLine(sourceRow);
+  if (!line) return currentBold;
+
+  let col = 0;
+  while (col < cols) {
+    const cell = line.getCell(col);
+    if (!cell) { col++; continue; }
+    const w = cell.getWidth();
+    if (w === 0) { col++; continue; }
+
+    const ch = cell.getChars();
+    const x = PADDING + col * CELL_W;
+    const y = PADDING + destRow * CELL_H;
+
+    let fg = colorOf(cell, false) ?? FG;
+    let bg = colorOf(cell, true);
+    if (cell.isInverse()) {
+      const tmp = bg ?? BG;
+      bg = fg;
+      fg = tmp;
+    }
+
+    if (bg) {
+      ctx.fillStyle = bg;
+      ctx.fillRect(x, y, CELL_W * w, CELL_H);
+    }
+
+    if (ch && ch !== ' ') {
+      const bold = !!cell.isBold();
+      if (bold !== currentBold) {
+        currentBold = bold;
+        ctx.font = fontSpec(bold);
+      }
+      ctx.fillStyle = fg;
+      // Pictographs (emoji + dingbats) use bitmap metrics that don't align with
+      // text top-baseline — center them vertically in the cell instead.
+      if (isPictograph(ch)) {
+        ctx.textBaseline = 'middle';
+        ctx.fillText(ch, x, y + CELL_H / 2);
+        ctx.textBaseline = 'top';
+      } else {
+        ctx.fillText(ch, x, y + 2);
+      }
+    }
+
+    col += w;
+  }
+
+  return currentBold;
+}
+
+function captureSegmentsToPng(terminal: Terminal, cols: number, rows: number, segments: ScreenshotSegment[]): Buffer {
   ensureFontRegistered();
-  const { cols, rows, startY } = opts;
-  const buffer = terminal.buffer.active;
 
   const W = Math.ceil(PADDING * 2 + cols * CELL_W);
   const H = PADDING * 2 + rows * CELL_H;
@@ -189,56 +266,33 @@ export function captureToPng(terminal: Terminal, opts: CaptureOpts): Buffer {
   ctx.textBaseline = 'top';
   ctx.font = fontSpec(false);
   let currentBold = false;
+  let nextDestRow = 0;
 
-  for (let row = 0; row < rows; row++) {
-    const line = buffer.getLine(startY + row);
-    if (!line) continue;
-
-    let col = 0;
-    while (col < cols) {
-      const cell = line.getCell(col);
-      if (!cell) { col++; continue; }
-      const w = cell.getWidth();
-      if (w === 0) { col++; continue; }
-
-      const ch = cell.getChars();
-      const x = PADDING + col * CELL_W;
-      const y = PADDING + row * CELL_H;
-
-      let fg = colorOf(cell, false) ?? FG;
-      let bg = colorOf(cell, true);
-      if (cell.isInverse()) {
-        const tmp = bg ?? BG;
-        bg = fg;
-        fg = tmp;
-      }
-
-      if (bg) {
-        ctx.fillStyle = bg;
-        ctx.fillRect(x, y, CELL_W * w, CELL_H);
-      }
-
-      if (ch && ch !== ' ') {
-        const bold = !!cell.isBold();
-        if (bold !== currentBold) {
-          currentBold = bold;
-          ctx.font = fontSpec(bold);
-        }
-        ctx.fillStyle = fg;
-        // Pictographs (emoji + dingbats) use bitmap metrics that don't align with
-        // text top-baseline — center them vertically in the cell instead.
-        if (isPictograph(ch)) {
-          ctx.textBaseline = 'middle';
-          ctx.fillText(ch, x, y + CELL_H / 2);
-          ctx.textBaseline = 'top';
-        } else {
-          ctx.fillText(ch, x, y + 2);
-        }
-      }
-
-      col += w;
+  for (const segment of segments) {
+    const destStart = segment.destRow ?? nextDestRow;
+    if ('type' in segment) {
+      drawSeparator(ctx, cols, destStart);
+      currentBold = false;
+      ctx.font = fontSpec(false);
+      nextDestRow = destStart + 1;
+      continue;
     }
+
+    for (let row = 0; row < segment.rows; row++) {
+      currentBold = drawTerminalLine(ctx, terminal, cols, segment.startY + row, destStart + row, currentBold);
+    }
+    nextDestRow = destStart + segment.rows;
   }
 
   return canvas.toBuffer('image/png');
+}
+
+/** Capture a section of the terminal buffer to a PNG buffer. */
+export function captureToPng(terminal: Terminal, opts: CaptureOpts): Buffer {
+  return captureSegmentsToPng(terminal, opts.cols, opts.rows, [{ startY: opts.startY, rows: opts.rows }]);
+}
+
+/** Capture multiple terminal buffer sections with optional separator rows. */
+export function capturePlanToPng(terminal: Terminal, opts: CapturePlanOpts): Buffer {
+  return captureSegmentsToPng(terminal, opts.cols, opts.rows, opts.segments);
 }

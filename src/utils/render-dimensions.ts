@@ -43,6 +43,21 @@ export interface ScreenshotViewport {
   rows: number;
 }
 
+export interface ScreenshotSlice {
+  startY: number;
+  rows: number;
+  destRow?: number;
+}
+
+export type ScreenshotSeparator = { type: 'separator'; destRow?: number };
+
+export type ScreenshotSegment = ScreenshotSlice | ScreenshotSeparator;
+
+export interface ScreenshotViewportPlan {
+  segments: ScreenshotSegment[];
+  rows: number;
+}
+
 export interface RenderDimensionConfig {
   adoptMode?: boolean;
   adoptPaneCols?: number;
@@ -77,7 +92,16 @@ export function resolveRenderDimensions(cfg: RenderDimensionConfig): RenderDimen
  * terminal input/status area at the bottom. Keep the screenshot compact and
  * biased to the tail of the viewport where TUI prompts/statuslines live.
  */
-export const DEFAULT_CARD_SCREENSHOT_ROWS = 24;
+export const DEFAULT_CARD_SCREENSHOT_ROWS = 28;
+export const DEFAULT_CARD_SCREENSHOT_TAIL_ROWS = 8;
+
+function normalizeRows(value: number, fallback: number): number {
+  return Math.max(1, Math.round(Number.isFinite(value) ? value : fallback));
+}
+
+function normalizeBaseY(value: number): number {
+  return Math.max(0, Math.round(Number.isFinite(value) ? value : 0));
+}
 
 /** Pick the terminal viewport slice used for the Lark card screenshot. */
 export function resolveScreenshotViewport(
@@ -85,12 +109,68 @@ export function resolveScreenshotViewport(
   baseY: number,
   maxRows: number = DEFAULT_CARD_SCREENSHOT_ROWS,
 ): ScreenshotViewport {
-  const safeRows = Math.max(1, Math.round(Number.isFinite(terminalRows) ? terminalRows : DEFAULT_RENDER_ROWS));
-  const safeBaseY = Math.max(0, Math.round(Number.isFinite(baseY) ? baseY : 0));
-  const safeMaxRows = Math.max(1, Math.round(Number.isFinite(maxRows) ? maxRows : DEFAULT_CARD_SCREENSHOT_ROWS));
+  const safeRows = normalizeRows(terminalRows, DEFAULT_RENDER_ROWS);
+  const safeBaseY = normalizeBaseY(baseY);
+  const safeMaxRows = normalizeRows(maxRows, DEFAULT_CARD_SCREENSHOT_ROWS);
   const rows = Math.min(safeRows, safeMaxRows);
   return {
     startY: safeBaseY + Math.max(0, safeRows - rows),
     rows,
+  };
+}
+
+/**
+ * Pick terminal viewport segments for the Lark card screenshot.
+ *
+ * A single tail crop keeps prompt/statusline visible but can hide the main
+ * Claude body when the TUI has a large blank/input area below it. Keep top
+ * context plus the bottom input/status area, separated by one synthetic row,
+ * so the uploaded image stays compact without losing the important body.
+ */
+export function resolveScreenshotViewportPlan(
+  terminalRows: number,
+  baseY: number,
+  maxRows: number = DEFAULT_CARD_SCREENSHOT_ROWS,
+  tailRows: number = DEFAULT_CARD_SCREENSHOT_TAIL_ROWS,
+): ScreenshotViewportPlan {
+  const safeRows = normalizeRows(terminalRows, DEFAULT_RENDER_ROWS);
+  const safeBaseY = normalizeBaseY(baseY);
+  const safeMaxRows = normalizeRows(maxRows, DEFAULT_CARD_SCREENSHOT_ROWS);
+
+  if (safeRows <= safeMaxRows) {
+    return { segments: [{ startY: safeBaseY, rows: safeRows }], rows: safeRows };
+  }
+
+  if (safeMaxRows < 3) {
+    const tail = resolveScreenshotViewport(safeRows, safeBaseY, safeMaxRows);
+    return { segments: [tail], rows: tail.rows };
+  }
+
+  const separatorRows = 1;
+  const safeTailRows = Math.min(
+    normalizeRows(tailRows, DEFAULT_CARD_SCREENSHOT_TAIL_ROWS),
+    safeMaxRows - separatorRows - 1,
+  );
+  const headRows = Math.max(1, safeMaxRows - safeTailRows - separatorRows);
+  const tailStartOffset = safeRows - safeTailRows;
+
+  // If the slices touch/overlap under a tiny custom maxRows, fall back to one
+  // compact tail crop rather than duplicating rows around the separator.
+  if (headRows >= tailStartOffset) {
+    const tail = resolveScreenshotViewport(safeRows, safeBaseY, safeMaxRows);
+    return { segments: [tail], rows: tail.rows };
+  }
+
+  return {
+    segments: [
+      { startY: safeBaseY, rows: headRows, destRow: 0 },
+      { type: 'separator', destRow: headRows },
+      {
+        startY: safeBaseY + tailStartOffset,
+        rows: safeTailRows,
+        destRow: safeMaxRows - safeTailRows,
+      },
+    ],
+    rows: headRows + separatorRows + safeTailRows,
   };
 }
