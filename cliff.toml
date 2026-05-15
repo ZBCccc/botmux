@@ -14,12 +14,10 @@ body = """
 {%- if commit.remote.username %} — @{{ commit.remote.username }}{%- endif %}
 {% endfor -%}
 {%- endif -%}
-{%- set first_timers = github.contributors | filter(attribute="is_first_time", value=true) -%}
-{%- if first_timers | length > 0 %}
-## 新贡献者
-{% for contributor in first_timers -%}
-- @{{ contributor.username }} 在 [#{{ contributor.pr_number }}](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/pull/{{ contributor.pr_number }}) 首次贡献,感谢!
-{% endfor -%}
+{%- set pr_authors = github.contributors | filter(attribute="pr_number") -%}
+{%- if pr_authors | length > 0 %}
+## 感谢贡献者
+{% for c in pr_authors %}@{{ c.username }}{% if not loop.last %} {% endif %}{% endfor %}
 {%- endif %}
 """
 footer = ""
