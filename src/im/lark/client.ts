@@ -502,7 +502,7 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
 
 /** List chat-container messages since a given epoch (ms), most-recent first
  *  but returned chronologically (oldest → newest, capped at `pageSize`).
- *  Used by `botmux thread messages` for chat-scope sessions (普通群整群一会话):
+ *  Used by `botmux history` for chat-scope sessions (普通群整群一会话):
  *  no thread to walk, so we walk the chat itself. We page in Desc order so a
  *  long-running chat-scope session (hundreds of messages) returns its TAIL,
  *  not its head — that's the context the caller wants. */

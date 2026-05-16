@@ -108,26 +108,26 @@ botmux schedule add "每日11:00" "
 详见 \`botmux-send\` 技能的"顶层广播 / 跨群发布"章节。
 `;
 
-const THREAD_MESSAGES_SKILL = `---
-name: botmux-thread-messages
-description: 需要查看当前 Lark 话题的历史消息时触发。适合"看看这个话题之前聊了什么"、"最近的消息"、"上下文"类请求。在 CLI 会话内自动推断 session-id。
+const HISTORY_SKILL = `---
+name: botmux-history
+description: 需要查看当前飞书会话历史消息时触发。话题群拉话题内消息，普通群拉整群消息（从 session 创建起的最近 N 条）。适合"看看之前聊了什么"、"最近的消息"、"上下文"类请求。在 CLI 会话内自动推断 session-id。
 ---
 
-# botmux-thread-messages — 读取话题消息历史
+# botmux-history — 读取会话消息历史
 
-想回顾当前 Lark 话题里用户之前发过什么、别的机器人说了什么时使用。
+想回顾当前飞书会话里用户之前发过什么、别的机器人说了什么时使用。**话题群和普通群都支持**：话题群里只返回当前话题内的消息，普通群里返回整群从 session 创建起的最近 N 条。
 
 ## 用法
 
 \`\`\`bash
 # 拉取最近 50 条（默认）
-botmux thread messages
+botmux history
 
 # 拉取最近 100 条
-botmux thread messages --limit 100
+botmux history --limit 100
 
 # 指定 session-id（不在 CLI 会话内时用）
-botmux thread messages --session-id <uuid>
+botmux history --session-id <uuid>
 \`\`\`
 
 ## 输出
@@ -137,7 +137,9 @@ JSON 格式，字段：
 \`\`\`json
 {
   "sessionId": "...",
-  "threadId": "...",
+  "chatId": "...",
+  "scope": "thread" | "chat",
+  "rootMessageId": "...",     // 仅 scope=thread 时存在
   "messages": [
     { "messageId": "...", "senderId": "...", "senderType": "user|app", "msgType": "text|post|interactive", "content": "...", "createTime": "..." }
   ],
@@ -147,10 +149,59 @@ JSON 格式，字段：
 
 ## 注意
 
-- 只返回属于当前话题的消息（按 rootMessageId 过滤）
-- senderType="app" 表示机器人发的消息（包括 Claude Code / Codex / 其它 bot），"user" 表示用户
+- \`scope=thread\`：只返回属于当前话题的消息（按 rootMessageId 过滤）
+- \`scope=chat\`：返回当前群从 session 创建起的最近 N 条整群消息
+- \`senderType="app"\` 表示机器人发的消息（包括 Claude Code / Codex / 其它 bot），\`"user"\` 表示用户
 - **合并转发**消息会自动展开：\`msgType\` 变为 \`merge_forward_expanded\`，\`content\` 是 \`<forwarded_messages>...</forwarded_messages>\` XML（含 \`<participants>\` 别名表 + 嵌套 \`<msg from="A">\` 节点），与 daemon 实时事件路径一致
 - 需要先把 JSON 读进来再做总结，不要直接把 JSON 扔给用户
+`;
+
+const QUOTED_SKILL = `---
+name: botmux-quoted
+description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted om_xxx 查看]\` 提示时，用本技能按需读取被引用的那条消息内容。看到这种提示就该判断引用内容是否对当前任务必要，必要就调用，不必要就跳过。
+---
+
+# botmux-quoted — 读取被引用的消息
+
+用户在飞书里使用"引用回复" UI @ 机器人时，daemon 会在喂给你的 prompt 头部加一行：
+
+\`\`\`
+[用户引用了消息 用 botmux quoted om_xxx 查看]
+<用户的实际文字>
+\`\`\`
+
+看到这种提示，先判断引用内容是否对当前任务必要：必要就调用 \`botmux quoted om_xxx\` 拉取，不必要就忽略（不要无脑调用、污染上下文）。
+
+## 用法
+
+\`\`\`bash
+botmux quoted <message_id>
+\`\`\`
+
+\`message_id\` 直接从提示行里复制即可。
+
+## 输出
+
+JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`resources\` 列表：
+
+\`\`\`json
+{
+  "messageId": "om_xxx",
+  "senderId": "ou_xxx",
+  "senderType": "user|app",
+  "msgType": "text|post|interactive|image|file|merge_forward_expanded",
+  "content": "...",
+  "createTime": "1234567890000",
+  "resources": [{"type":"image","key":"img_v3_xxx","name":"img_v3_xxx.jpg"}]
+}
+\`\`\`
+
+## 注意
+
+- 图片/文件渲染成 \`[图片 N]\` / \`[文件 N: name.pdf]\` 占位符（与 \`botmux history\` 一致），实际附件 key 在 \`resources\` 列表里
+- 卡片消息会被解析成可读文本
+- 合并转发消息会自动展开
+- 当前不支持自动下载附件本地化；要看图片实际内容，目前只能让用户单独转发或 \`botmux send\` 询问
 `;
 
 const SEND_SKILL = `---
@@ -339,7 +390,15 @@ botmux send --mention "ou_yyy:Aiden" "请 @Aiden 帮忙处理"
 
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
-  { name: 'botmux-thread-messages', content: THREAD_MESSAGES_SKILL },
+  { name: 'botmux-history', content: HISTORY_SKILL },
+  { name: 'botmux-quoted', content: QUOTED_SKILL },
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
+];
+
+/** Skills that earlier botmux versions installed but no longer ship. The
+ *  installer cleans these up so renamed skills don't linger as duplicates
+ *  in the CLI's skills directory. */
+export const RETIRED_SKILL_NAMES: string[] = [
+  'botmux-thread-messages',
 ];

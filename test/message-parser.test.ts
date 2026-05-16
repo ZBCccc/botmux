@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, stripLeadingMentions } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions } from '../src/im/lark/message-parser.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -326,5 +326,39 @@ describe('stripLeadingMentions', () => {
       { name: 'CoCo' },
     ]);
     expect(out).toBe('/close');
+  });
+});
+
+// ─── parseEventMessage: parentId surfacing for quote-reply ────────────────
+
+describe('parseEventMessage: parentId surfacing', () => {
+  function makeEvent(extras: Partial<{ parent_id: string; root_id: string }>) {
+    return {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_msg',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'hello' }),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+        ...extras,
+      },
+    };
+  }
+
+  it('surfaces parent_id on the parsed message when the user used quote-reply', () => {
+    const { parsed } = parseEventMessage(makeEvent({ parent_id: 'om_quoted', root_id: 'om_quoted' }));
+    expect(parsed.parentId).toBe('om_quoted');
+  });
+
+  it('leaves parentId undefined when the event has no parent_id', () => {
+    const { parsed } = parseEventMessage(makeEvent({}));
+    expect(parsed.parentId).toBeUndefined();
+  });
+
+  it('treats empty-string parent_id as absent', () => {
+    const { parsed } = parseEventMessage(makeEvent({ parent_id: '' }));
+    expect(parsed.parentId).toBeUndefined();
   });
 });

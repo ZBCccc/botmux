@@ -252,7 +252,8 @@ When a CLI spawns inside a botmux session it automatically gets
 `~/.botmux/bin` on PATH plus a set of ready-to-use Skills:
 
 - `botmux send` — send a message to the current thread (text, images, files, @mention)
-- `botmux thread messages` — fetch thread history
+- `botmux history` — fetch session history (topic groups → in-thread, regular groups → whole chat)
+- `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s
 - `botmux schedule` — manage scheduled tasks
 
@@ -439,7 +440,8 @@ Run from inside a botmux-spawned CLI session — session context is auto-detecte
 |------------|-------------|
 | `botmux send [content]` | Send a message to the current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
 | `botmux bots list` | List bots in the current chat (includes `open_id` for `--mention`) |
-| `botmux thread messages [--limit N]` | Fetch thread message history (JSON) |
+| `botmux history [--limit N]` | Fetch session message history (JSON); topic groups → in-thread, regular groups → whole chat |
+| `botmux quoted <message_id>` | Fetch a single quoted message (JSON); the ID comes from the daemon-injected `[用户引用了消息 用 botmux quoted om_xxx 查看]` prefix |
 | `botmux schedule add <schedule> <prompt>` | Create a scheduled task bound to the current thread |
 | `botmux schedule list/remove/pause/resume/run` | Manage scheduled tasks |
 

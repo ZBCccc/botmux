@@ -1480,7 +1480,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --top-level                     发顶层消息（不回复进当前话题）
        --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
   bots list                            列出当前群聊中的机器人（含 open_id）
-  thread messages [--limit N]          拉取当前话题的消息历史 (JSON)
+  history [--limit N]                  拉取当前会话的消息历史 (JSON)，话题群 → 话题内，普通群 → 整群
+  quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -1715,42 +1716,47 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 }
 
-async function cmdThreadMessages(rest: string[]): Promise<void> {
+/** Resolve a CLI subcommand's larkAppId by walking the session marker. Common
+ *  prelude for `history` / `quoted` / similar commands that need to talk to
+ *  Lark on behalf of the session that spawned them. Exits with stderr on
+ *  failure so callers can stay focused on the happy path. */
+async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ sid: string; larkAppId: string; session: SessionData }> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
-  const limit = parseInt(argValue(rest, '--limit') ?? '50', 10);
-  const sessionIdArg = argValue(rest, '--session-id');
-
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
-    console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
+    console.error('无法推断 session-id。请在 Lark 话题/群里的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
   }
-
   const sessions = loadSessions();
   const s = sessions.get(sid);
   if (!s) {
     console.error(`未找到 session ${sid}`);
     process.exit(1);
   }
-
   if (!s.larkAppId) {
     console.error(`session ${sid} 缺少 larkAppId，无法获取消息`);
     process.exit(1);
   }
-
   // Ensure bot is registered so getBotClient works
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try {
     for (const cfg of loadBotConfigs()) registerBot(cfg);
   } catch { /* ignore */ }
+  return { sid, larkAppId: s.larkAppId, session: s };
+}
+
+async function cmdHistory(rest: string[]): Promise<void> {
+  const limit = parseInt(argValue(rest, '--limit') ?? '50', 10);
+  const sessionIdArg = argValue(rest, '--session-id');
+  const { sid, larkAppId: appId, session: s } = await resolveSessionAppId(sessionIdArg);
 
   const { listThreadMessages, listChatMessagesSince } = await import('./im/lark/client.js');
   const { parseApiMessage } = await import('./im/lark/message-parser.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
-  const appId = s.larkAppId;  // narrowed above; pin into a const so async closures keep the narrowing
   try {
     // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
-    // chat container instead, since the session was created.
+    // chat container since the session was created. Thread-scope sessions
+    // walk the thread container by root_id.
     const isChatScope = s.scope === 'chat';
     const raw = isChatScope
       ? await listChatMessagesSince(appId, s.chatId, Date.parse(s.createdAt) || 0, limit)
@@ -1767,12 +1773,52 @@ async function cmdThreadMessages(rest: string[]): Promise<void> {
     }));
     console.log(JSON.stringify({
       sessionId: sid,
-      ...(isChatScope ? { chatId: s.chatId, scope: 'chat' } : { threadId: s.rootMessageId, scope: 'thread' }),
+      chatId: s.chatId,
+      scope: isChatScope ? 'chat' : 'thread',
+      ...(isChatScope ? {} : { rootMessageId: s.rootMessageId }),
       messages,
       total: messages.length,
     }, null, 2));
   } catch (err: any) {
     console.error(`获取消息失败: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function cmdQuoted(rest: string[]): Promise<void> {
+  const sessionIdArg = argValue(rest, '--session-id');
+  // Positional message_id is required. The id comes verbatim from the
+  // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
+  // injects when the user used the Lark quote-reply UI.
+  const messageId = rest.find(a => !a.startsWith('-') && !a.startsWith('--'));
+  if (!messageId) {
+    console.error('用法: botmux quoted <message_id>');
+    process.exit(1);
+  }
+
+  const { larkAppId: appId } = await resolveSessionAppId(sessionIdArg);
+
+  const { getMessageDetail } = await import('./im/lark/client.js');
+  const { parseApiMessage, extractResources } = await import('./im/lark/message-parser.js');
+  const { expandMergeForward } = await import('./im/lark/merge-forward.js');
+  try {
+    const detail = await getMessageDetail(appId, messageId);
+    const msg = detail?.items?.[0];
+    if (!msg) {
+      console.error(`未找到消息 ${messageId}`);
+      process.exit(1);
+    }
+    const parsed = parseApiMessage(msg);
+    if (parsed.msgType === 'merge_forward') {
+      await expandMergeForward(appId, parsed.messageId, parsed);
+    }
+    const resources = extractResources(msg.msg_type ?? '', msg.body?.content ?? '');
+    console.log(JSON.stringify({
+      ...parsed,
+      resources,
+    }, null, 2));
+  } catch (err: any) {
+    console.error(`获取被引用消息失败: ${err.message}`);
     process.exit(1);
   }
 }
@@ -2400,10 +2446,18 @@ switch (command) {
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
+  case 'history':  await cmdHistory(process.argv.slice(3)); break;
+  case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'thread':   {
+    // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
+    // pre-rename scripts/skills surface the rename instead of "unknown command".
     const sub = process.argv[3] ?? '';
-    if (sub === 'messages' || sub === 'msgs') await cmdThreadMessages(process.argv.slice(4));
-    else { console.error(`用法: botmux thread messages [--limit N] [--session-id ID]`); process.exit(1); }
+    console.error(
+      sub === 'messages' || sub === 'msgs'
+        ? `\`botmux thread ${sub}\` 已重命名为 \`botmux history\` (跑普通群和话题群都用它)。`
+        : `\`botmux thread\` 已下线，请用 \`botmux history\``,
+    );
+    process.exit(1);
     break;
   }
   case 'autostart': {

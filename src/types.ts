@@ -69,6 +69,9 @@ export interface LarkMention {
 export interface LarkMessage {
   messageId: string;
   rootId: string;
+  /** Immediate parent — set when the user used the Lark "quote/reply"
+   *  UI to reference a specific earlier message. Empty otherwise. */
+  parentId?: string;
   senderId: string;
   senderType: string;
   msgType: string;

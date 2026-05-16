@@ -244,6 +244,7 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   const parsed: LarkMessage = {
     messageId: message.message_id,
     rootId: message.root_id ?? '',
+    parentId: message.parent_id || undefined,
     senderId: sender.sender_id?.open_id ?? '',
     senderType: sender.sender_type,
     msgType: message.message_type,

@@ -142,7 +142,8 @@ BACKEND_TYPE=pty botmux start
 CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一组开箱即用的 Skill：
 
 - `botmux send` — 向当前话题发消息（支持文本、图片、文件、@mention）
-- `botmux thread messages` — 读取当前话题的历史消息
+- `botmux history` — 读取当前会话历史消息（话题群拉话题内、普通群拉整群）
+- `botmux quoted <message_id>` — 用户用引用 UI @ 机器人时，按需读取被引用的那条消息
 - `botmux bots list` — 查询当前群聊的机器人及 open_id
 - `botmux schedule` — 增删改查定时任务
 
@@ -371,7 +372,8 @@ botmux autostart enable
 |------|------|
 | `botmux send [content]` | 向当前话题发消息。支持 stdin / heredoc / `--content-file` 传内容，`--images`/`--files`/`--mention` 附加资源 |
 | `botmux bots list` | 列出当前群聊中的机器人（含 open_id，供 `--mention` 使用） |
-| `botmux thread messages [--limit N]` | 拉取当前话题的消息历史（JSON） |
+| `botmux history [--limit N]` | 拉取当前会话的消息历史（JSON）；话题群 → 话题内，普通群 → 整群 |
+| `botmux quoted <message_id>` | 拉取被引用的单条消息（JSON），ID 取自 daemon 注入的 `[用户引用了消息 用 botmux quoted om_xxx 查看]` 提示行 |
 | `botmux schedule add <schedule> <prompt>` | 创建定时任务（自动绑定当前话题） |
 | `botmux schedule list/remove/pause/resume/run` | 管理定时任务 |
 

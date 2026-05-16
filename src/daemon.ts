@@ -666,7 +666,19 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const botSenderPrefix = isForeignBot
     ? `[来自 ${lookupForeignBotName(senderOpenIdForPrefix!, larkAppId)} 的 @mention]\n`
     : '';
-  const promptContent = botSenderPrefix + parsed.content;
+
+  // Quote-reply hint: when the user used the Lark "quote" UI to reference an
+  // earlier message, surface its message_id so the bot can opt-in fetch it via
+  // `botmux quoted`. Skip when parent_id == this thread's root (a plain thread
+  // reply with no specific quote, e.g. inside a 话题群) — that's not a
+  // user-visible quote, just thread plumbing.
+  const quotedId = parsed.parentId;
+  const threadRoot = scope === 'thread' ? anchor : null;
+  const quotePrefix = (quotedId && quotedId !== threadRoot && quotedId !== parsed.messageId)
+    ? `[用户引用了消息 用 botmux quoted ${quotedId} 查看]\n`
+    : '';
+
+  const promptContent = quotePrefix + botSenderPrefix + parsed.content;
   if (isForeignBot) {
     logger.info(
       `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +

@@ -255,7 +255,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
         '- 附带图片：`botmux send --images /path/to/img.png "说明文字"`',
         '- 附带文件：`botmux send --files /path/to/file.pdf "请查收"`',
-        '- 需要上下文时用 `botmux thread messages` 读取之前的对话。',
+        '- 需要上下文时用 `botmux history` 读取之前的对话。',
         '- 查看可协作的机器人：`botmux bots list`',
         '</botmux_routing>',
         ...identityBlock,
