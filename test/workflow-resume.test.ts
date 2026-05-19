@@ -1046,3 +1046,234 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
     expect(lookupInput).toBeUndefined();
   });
 });
+
+// ─── Step 8: wait recovery integration ─────────────────────────────────────
+
+describe('resume — Step 8: dangling wait resolutions', () => {
+  it('approved resolution → activitySucceeded recovery', async () => {
+    await bootstrapWith(
+      attemptCreated('a-wait', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: { activityId: 'a-wait', nodeId: 'n-1', waitKind: 'human-gate' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitResolved',
+        actor: 'human',
+        payload: { activityId: 'a-wait', resolution: 'approved', by: 'ou_alice' },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.waitRecoveryOutcomes).toHaveLength(1);
+    const w = r.waitRecoveryOutcomes[0];
+    expect(w.activityId).toBe('a-wait');
+    expect(w.kind).toBe('succeeded');
+    expect(w.source).toBe('resolved');
+    const p = w.terminalEvent.payload as { externalRefs: { resolution: string; by: string } };
+    expect(p.externalRefs).toMatchObject({ resolution: 'approved', by: 'ou_alice' });
+  });
+
+  it('rejected resolution → activityFailed/userFault recovery', async () => {
+    await bootstrapWith(
+      attemptCreated('a-wait', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: { activityId: 'a-wait', nodeId: 'n-1', waitKind: 'human-gate' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitResolved',
+        actor: 'human',
+        payload: {
+          activityId: 'a-wait',
+          resolution: 'rejected',
+          by: 'ou_alice',
+          comment: 'nope',
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    const w = r.waitRecoveryOutcomes[0];
+    expect(w.kind).toBe('failed');
+    const p = w.terminalEvent.payload as { error: { errorCode: string; errorClass: string; errorMessage: string } };
+    expect(p.error.errorCode).toBe('InputValidationFailed');
+    expect(p.error.errorClass).toBe('userFault');
+    expect(p.error.errorMessage).toMatch(/rejected by ou_alice/);
+    expect(p.error.errorMessage).toMatch(/nope/);
+  });
+
+  it('deadlineExceeded + onTimeout=fail (default) → activityFailed{WaitDeadlineExceeded}', async () => {
+    await bootstrapWith(
+      attemptCreated('a-wait', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: {
+          activityId: 'a-wait',
+          nodeId: 'n-1',
+          waitKind: 'time',
+          deadlineAt: 1_000_000,
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitDeadlineExceeded',
+        actor: 'scheduler',
+        payload: {
+          activityId: 'a-wait',
+          deadlineAt: 1_000_000,
+          exceededAtMs: 1_000_010,
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    const w = r.waitRecoveryOutcomes[0];
+    expect(w.kind).toBe('failed');
+    expect(w.source).toBe('deadlineExceeded');
+    const p = w.terminalEvent.payload as { error: { errorCode: string } };
+    expect(p.error.errorCode).toBe('WaitDeadlineExceeded');
+  });
+
+  it('deadlineExceeded + onTimeout=success → activitySucceeded{defaultedToTimeout}', async () => {
+    await bootstrapWith(
+      attemptCreated('a-wait', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: {
+          activityId: 'a-wait',
+          nodeId: 'n-1',
+          waitKind: 'time',
+          deadlineAt: 1_000_000,
+          onTimeout: 'success',
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitDeadlineExceeded',
+        actor: 'scheduler',
+        payload: {
+          activityId: 'a-wait',
+          deadlineAt: 1_000_000,
+          exceededAtMs: 1_000_010,
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    const w = r.waitRecoveryOutcomes[0];
+    expect(w.kind).toBe('succeeded');
+    const p = w.terminalEvent.payload as { externalRefs: { defaultedToTimeout: boolean } };
+    expect(p.externalRefs.defaultedToTimeout).toBe(true);
+  });
+
+  it('wait recovery does NOT trigger WorkerCrashed path', async () => {
+    await bootstrapWith(
+      attemptCreated('a-wait', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: { activityId: 'a-wait', nodeId: 'n-1', waitKind: 'human-gate' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitResolved',
+        actor: 'human',
+        payload: { activityId: 'a-wait', resolution: 'approved', by: 'x' },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.workerCrashedOutcomes).toEqual([]);
+    expect(r.waitRecoveryOutcomes).toHaveLength(1);
+  });
+
+  it('still-open wait (no resolution) stays dangling, no recovery', async () => {
+    await bootstrapWith(
+      attemptCreated('a-wait', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: { activityId: 'a-wait', nodeId: 'n-1', waitKind: 'human-gate' },
+      },
+      // No resolution.
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.waitRecoveryOutcomes).toEqual([]);
+    expect(r.workerCrashedOutcomes).toEqual([]);
+    const events = await log.readAll();
+    const terminals = events.filter(
+      (e) => e.type === 'activitySucceeded' || e.type === 'activityFailed',
+    );
+    expect(terminals).toEqual([]);
+  });
+
+  it('second resume after wait recovery does nothing', async () => {
+    await bootstrapWith(
+      attemptCreated('a-wait', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: { activityId: 'a-wait', nodeId: 'n-1', waitKind: 'human-gate' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitResolved',
+        actor: 'human',
+        payload: { activityId: 'a-wait', resolution: 'approved', by: 'x' },
+      },
+    );
+    const first = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(first.waitRecoveryOutcomes).toHaveLength(1);
+    const second = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(second.waitRecoveryOutcomes).toEqual([]);
+  });
+});

@@ -233,12 +233,22 @@ export const ActivityFailedPayload = z.object({
 
 // ─── Group 4 — Wait / Human (3) ─────────────────────────────────────────────
 
+/**
+ * Spec §6 open question #7 resolved at Step 8: `onTimeout` is part of
+ * the wait creation payload, not external node IR.  Recording it on the
+ * event lets resume materialize the right terminal for a dangling
+ * `waitDeadlineExceeded` without consulting external workflow state.
+ * Default is `fail` at the consumer (matches spec default behavior).
+ */
+export const WaitOnTimeoutEnum = z.enum(['fail', 'success']);
+
 export const WaitCreatedPayload = z.object({
   activityId: z.string(),
   nodeId: z.string(),
   waitKind: WaitKindEnum,
   deadlineAt: z.number().int().positive().optional(),
   prompt: z.string().optional(),
+  onTimeout: WaitOnTimeoutEnum.optional(),
 });
 
 export const WaitResolvedPayload = z.object({

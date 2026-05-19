@@ -101,6 +101,35 @@ export type AttemptState = {
     evidence: Record<string, unknown>;
     eventId: string;
   };
+  /**
+   * Wait state for human-gate / time / condition activities (Step 8).
+   * Populated by `waitCreated` and updated by `waitResolved` /
+   * `waitDeadlineExceeded`.  Resume reads this to recover dangling
+   * wait resolutions (resolved/exceeded but no terminal written).
+   */
+  wait?: {
+    waitKind: 'human-gate' | 'time' | 'condition';
+    deadlineAt?: number;
+    prompt?: string;
+    /** Default `fail` at the consumer.  Recorded only when waitCreated
+     *  carries the field; absent means caller never specified. */
+    onTimeout?: 'fail' | 'success';
+    /** Open when neither resolution nor deadline event has landed. */
+    resolution?:
+      | {
+          kind: 'resolved';
+          resolution: 'approved' | 'rejected' | 'external';
+          by: string;
+          comment?: string;
+          eventId: string;
+        }
+      | {
+          kind: 'deadlineExceeded';
+          deadlineAt: number;
+          exceededAtMs: number;
+          eventId: string;
+        };
+  };
   // terminal
   output?: OutputRef;
   externalRefs?: Record<string, unknown>;
@@ -171,6 +200,13 @@ export type Snapshot = {
    * activityIds with waitCreated but no waitResolved / waitDeadlineExceeded.
    */
   danglingWaits: string[];
+  /**
+   * activityIds whose wait was resolved (either by waitResolved or by
+   * waitDeadlineExceeded) but whose attempt never reached a terminal
+   * event.  Step 8 resume recovery materializes the terminal from the
+   * recorded resolution.  Disjoint from `danglingWaits`.
+   */
+  danglingWaitResolutions: string[];
 };
 
 // ─── Replay ─────────────────────────────────────────────────────────────────
@@ -529,17 +565,54 @@ export function replay(events: WorkflowEvent[]): Snapshot {
       // ─── Wait ───────────────────────────────────────────────────────
       case 'waitCreated': {
         const p = (e as WaitCreatedEvent).payload as WaitCreatedEvent['payload'];
-        if (!('ref' in p)) waitsOpen.add(p.activityId);
+        if (!('ref' in p)) {
+          waitsOpen.add(p.activityId);
+          const act = getActivity(p.activityId);
+          const at = currentAttempt(act);
+          if (at) {
+            at.wait = {
+              waitKind: p.waitKind,
+              deadlineAt: p.deadlineAt,
+              prompt: p.prompt,
+              onTimeout: p.onTimeout,
+            };
+          }
+        }
         break;
       }
       case 'waitResolved': {
         const p = (e as WaitResolvedEvent).payload as WaitResolvedEvent['payload'];
-        if (!('ref' in p)) waitsOpen.delete(p.activityId);
+        if (!('ref' in p)) {
+          waitsOpen.delete(p.activityId);
+          const act = getActivity(p.activityId);
+          const at = currentAttempt(act);
+          if (at && at.wait) {
+            at.wait.resolution = {
+              kind: 'resolved',
+              resolution: p.resolution,
+              by: p.by,
+              comment: p.comment,
+              eventId: e.eventId,
+            };
+          }
+        }
         break;
       }
       case 'waitDeadlineExceeded': {
         const p = (e as WaitDeadlineExceededEvent).payload as WaitDeadlineExceededEvent['payload'];
-        if (!('ref' in p)) waitsOpen.delete(p.activityId);
+        if (!('ref' in p)) {
+          waitsOpen.delete(p.activityId);
+          const act = getActivity(p.activityId);
+          const at = currentAttempt(act);
+          if (at && at.wait) {
+            at.wait.resolution = {
+              kind: 'deadlineExceeded',
+              deadlineAt: p.deadlineAt,
+              exceededAtMs: p.exceededAtMs,
+              eventId: e.eventId,
+            };
+          }
+        }
         break;
       }
 
@@ -603,6 +676,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
   // ─── Compute dangling sets ────────────────────────────────────────────
   const danglingActivities: string[] = [];
   const danglingEffectAttempted: string[] = [];
+  const danglingWaitResolutions: string[] = [];
   for (const a of activities.values()) {
     const latest = a.attempts.length > 0 ? a.attempts[a.attempts.length - 1] : undefined;
     if (!latest) continue;
@@ -615,6 +689,12 @@ export function replay(events: WorkflowEvent[]): Snapshot {
       danglingActivities.push(a.activityId);
       if (latest.effectAttempted) {
         danglingEffectAttempted.push(a.activityId);
+      }
+      // A wait that has a recorded resolution (resolved or
+      // deadlineExceeded) but no terminal event is recoverable: write
+      // the matching activity-terminal during resume.
+      if (latest.wait?.resolution) {
+        danglingWaitResolutions.push(a.activityId);
       }
     }
   }
@@ -629,6 +709,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
     lastSeq,
     danglingActivities,
     danglingEffectAttempted,
+    danglingWaitResolutions,
     danglingWaits,
   };
 }

@@ -161,6 +161,22 @@ export type WorkerCrashedOutcome = {
 };
 
 /**
+ * Recovery of a wait whose resolution event landed but whose activity
+ * terminal was never written (crash between `waitResolved` /
+ * `waitDeadlineExceeded` and the terminal).  Step 8: replay surfaces
+ * these as `Snapshot.danglingWaitResolutions`; resume materializes the
+ * terminal from the recorded resolution.
+ */
+export type WaitRecoveryOutcome = {
+  activityId: string;
+  attemptId: string;
+  /** What the recovery decided to write. */
+  kind: 'succeeded' | 'failed';
+  source: 'resolved' | 'deadlineExceeded';
+  terminalEvent: ActivitySucceededEvent | ActivityFailedEvent;
+};
+
+/**
  * Reconcile failures that resume DELIBERATELY does not terminate (codex
  * F3): a retryable provider failure during idempotentSubmit might mean
  * "request landed, response lost", and writing a manual terminal there
@@ -186,6 +202,7 @@ export type ResumeResult = {
   reconcileOutcomes: ReconcileOutcome[];
   workerCrashedOutcomes: WorkerCrashedOutcome[];
   transientFailures: TransientReconcileFailure[];
+  waitRecoveryOutcomes: WaitRecoveryOutcome[];
 };
 
 // ─── Resume orchestrator ────────────────────────────────────────────────────
@@ -245,14 +262,26 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
     else if (result.kind === 'transient') transientFailures.push(result.failure);
   }
 
+  // Step 8: wait recovery — `waitResolved` / `waitDeadlineExceeded`
+  // landed but the activity terminal didn't.  Materialize the terminal
+  // from the recorded resolution so the next replay sees a clean
+  // terminal state.
+  const waitRecoveryOutcomes: WaitRecoveryOutcome[] = [];
+  for (const activityId of snapshot.danglingWaitResolutions) {
+    const recovery = await recoverWaitResolution(ctx, snapshot, activityId);
+    if (recovery) waitRecoveryOutcomes.push(recovery);
+  }
+
   // Worker-crashed path: dangling activity, no effectAttempted, no
-  // open wait → activityFailed{WorkerCrashed, retryable}.
+  // open wait, no recoverable wait resolution → activityFailed{WorkerCrashed, retryable}.
   const workerCrashedOutcomes: WorkerCrashedOutcome[] = [];
   const reconciled = new Set(snapshot.danglingEffectAttempted);
   const waitingActivities = new Set(snapshot.danglingWaits);
+  const waitRecovered = new Set(snapshot.danglingWaitResolutions);
   for (const activityId of snapshot.danglingActivities) {
     if (reconciled.has(activityId)) continue;
     if (waitingActivities.has(activityId)) continue;
+    if (waitRecovered.has(activityId)) continue;
     const activity = snapshot.activities.get(activityId);
     if (!activity) continue;
     const latest = activity.attempts[activity.attempts.length - 1];
@@ -280,7 +309,137 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
     reconcileOutcomes,
     workerCrashedOutcomes,
     transientFailures,
+    waitRecoveryOutcomes,
   };
+}
+
+// ─── Wait recovery (Step 8) ────────────────────────────────────────────────
+
+async function recoverWaitResolution(
+  ctx: ResumeContext,
+  snapshot: Snapshot,
+  activityId: string,
+): Promise<WaitRecoveryOutcome | null> {
+  const activity = snapshot.activities.get(activityId);
+  if (!activity) return null;
+  const latest = activity.attempts[activity.attempts.length - 1];
+  if (!latest?.wait?.resolution) return null;
+  const r = latest.wait.resolution;
+
+  if (r.kind === 'resolved') {
+    // approved | external → activitySucceeded.
+    // rejected           → activityFailed { InputValidationFailed, userFault }.
+    if (r.resolution === 'rejected') {
+      const terminalEvent = (await ctx.log.append({
+        runId: ctx.runId,
+        type: 'activityFailed',
+        actor: 'system',
+        payload: {
+          activityId,
+          attemptId: latest.attemptId,
+          error: {
+            errorCode: 'InputValidationFailed',
+            errorClass: 'userFault',
+            errorMessage: `Recovered wait terminal: rejected by ${r.by}${
+              r.comment ? `: ${r.comment}` : ''
+            }`,
+          },
+        },
+      })) as ActivityFailedEvent;
+      return {
+        activityId,
+        attemptId: latest.attemptId,
+        kind: 'failed',
+        source: 'resolved',
+        terminalEvent,
+      };
+    }
+    // approved | external
+    const externalRefs: Record<string, unknown> = {
+      resolution: r.resolution,
+      by: r.by,
+      ...(r.comment ? { comment: r.comment } : {}),
+    };
+    const terminalEvent = await writeRecoverySucceeded(
+      ctx,
+      activityId,
+      latest.attemptId,
+      externalRefs,
+    );
+    return {
+      activityId,
+      attemptId: latest.attemptId,
+      kind: 'succeeded',
+      source: 'resolved',
+      terminalEvent,
+    };
+  }
+
+  // deadlineExceeded
+  const policy = latest.wait.onTimeout ?? 'fail';
+  if (policy === 'success') {
+    const externalRefs = { defaultedToTimeout: true, deadlineAt: r.deadlineAt };
+    const terminalEvent = await writeRecoverySucceeded(
+      ctx,
+      activityId,
+      latest.attemptId,
+      externalRefs,
+    );
+    return {
+      activityId,
+      attemptId: latest.attemptId,
+      kind: 'succeeded',
+      source: 'deadlineExceeded',
+      terminalEvent,
+    };
+  }
+  const terminalEvent = (await ctx.log.append({
+    runId: ctx.runId,
+    type: 'activityFailed',
+    actor: 'system',
+    payload: {
+      activityId,
+      attemptId: latest.attemptId,
+      error: {
+        errorCode: 'WaitDeadlineExceeded',
+        errorClass: 'userFault',
+        errorMessage: `Recovered wait terminal: deadline (${r.deadlineAt}) exceeded at ${r.exceededAtMs}`,
+      },
+    },
+  })) as ActivityFailedEvent;
+  return {
+    activityId,
+    attemptId: latest.attemptId,
+    kind: 'failed',
+    source: 'deadlineExceeded',
+    terminalEvent,
+  };
+}
+
+async function writeRecoverySucceeded(
+  ctx: ResumeContext,
+  activityId: string,
+  attemptId: string,
+  externalRefs: Record<string, unknown>,
+): Promise<ActivitySucceededEvent> {
+  const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
+  const outputHash = await sha256Hex(outputBuf);
+  return (await ctx.log.append({
+    runId: ctx.runId,
+    type: 'activitySucceeded',
+    actor: 'system',
+    payload: {
+      activityId,
+      attemptId,
+      outputRef: {
+        outputHash: `sha256:${outputHash}`,
+        outputBytes: outputBuf.length,
+        outputSchemaVersion: 1,
+        contentType: 'application/json',
+      },
+      externalRefs,
+    },
+  })) as ActivitySucceededEvent;
 }
 
 // ─── Reconcile decision tree ────────────────────────────────────────────────
