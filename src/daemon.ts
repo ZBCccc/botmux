@@ -76,9 +76,11 @@ import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/l
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
-import type { WorkflowRuntimeContext } from './workflows/runtime.js';
+import type { WorkflowRuntimeContext, WorkerSpawnFn } from './workflows/runtime.js';
 import { runLoop } from './workflows/loop.js';
 import type { RunLoopResult } from './workflows/loop.js';
+import { createWorkflowDaemonSpawn } from './workflows/daemon-spawn.js';
+import { createDaemonSpawnFn } from './workflows/spawn-bot.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -348,6 +350,30 @@ function cleanupWorkflowRun(runId: string): void {
   }
 }
 
+/**
+ * Build the daemon-backed WorkerSpawnFn lazily.  We avoid touching
+ * bot-registry at module-init time (it isn't loaded yet); each call
+ * resolves credentials by the workflow node's `bot` name, falling
+ * back to the IM larkAppId if the bot rename hasn't propagated.
+ */
+function workflowSpawnFn(): WorkerSpawnFn {
+  const daemonDeps = createWorkflowDaemonSpawn({
+    resolveLarkCredentials: (botName) => {
+      const bot = getAllBots().find(
+        (b) => b.config.name === botName || b.botName === botName || b.config.larkAppId === botName,
+      );
+      if (!bot) {
+        throw new Error(`workflow: bot '${botName}' not found in registry`);
+      }
+      return {
+        larkAppId: bot.config.larkAppId,
+        larkAppSecret: bot.config.larkAppSecret,
+      };
+    },
+  });
+  return createDaemonSpawnFn(daemonDeps);
+}
+
 async function handleWorkflowCommandIfAny(
   content: string,
   anchor: string,
@@ -364,6 +390,7 @@ async function handleWorkflowCommandIfAny(
     },
     {
       attachWorkflowEventWatcher,
+      spawnSubagent: workflowSpawnFn(),
       runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId),
       onRunCreated: async (info) => {
         try {
