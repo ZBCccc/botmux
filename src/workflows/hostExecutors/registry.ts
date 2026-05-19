@@ -6,9 +6,13 @@ import {
 } from './botmux-schedule.js';
 import {
   feishuSendExecutor,
-  feishuSendReconciler,
   parseFeishuSendInput,
 } from './feishu-send.js';
+import {
+  feishuReplyExecutor,
+  parseFeishuReplyInput,
+} from './feishu-reply.js';
+import { feishuImReconciler } from './feishu-im.js';
 import type { SideEffectingExecutor } from './types.js';
 
 export type RegisteredHostExecutor<Input = unknown, Output = unknown> = {
@@ -34,12 +38,19 @@ export function createDefaultHostExecutorRegistry(): HostExecutorRegistry {
         parseInput: parseFeishuSendInput,
       } satisfies RegisteredHostExecutor,
     ],
+    [
+      'feishu-reply',
+      {
+        executor: feishuReplyExecutor,
+        parseInput: parseFeishuReplyInput,
+      } satisfies RegisteredHostExecutor,
+    ],
   ]);
 }
 
 export function createDefaultProviderReconcilers(): Map<string, ProviderReconciler> {
   return new Map([
     [botmuxScheduleReconciler.provider, botmuxScheduleReconciler],
-    [feishuSendReconciler.provider, feishuSendReconciler],
+    [feishuImReconciler.provider, feishuImReconciler],
   ]);
 }

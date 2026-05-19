@@ -1,5 +1,8 @@
+import { z } from 'zod';
+
 import { replyMessage } from '../../im/lark/client.js';
 import { PROVIDER_TTL_MS } from '../events/schema.js';
+import type { ProviderReconciler } from '../resume.js';
 import type { SideEffectingExecutor } from './types.js';
 import { classifyFeishuError } from './feishu-send.js';
 
@@ -15,6 +18,18 @@ export type FeishuReplyInput = {
 export type FeishuReplyOutput = {
   messageId: string;
 };
+
+const FeishuReplyInputSchema = z.object({
+  larkAppId: z.string().min(1),
+  rootMessageId: z.string().min(1),
+  content: z.string(),
+  msgType: z.string().min(1).optional(),
+  replyInThread: z.boolean().optional(),
+});
+
+export function parseFeishuReplyInput(input: unknown): FeishuReplyInput {
+  return FeishuReplyInputSchema.parse(input);
+}
 
 /**
  * `feishu-reply` is similar to `feishu-send` but the canonical input
@@ -54,3 +69,47 @@ export const feishuReplyExecutor: SideEffectingExecutor<FeishuReplyInput, Feishu
 
   classifyError: classifyFeishuError,
 };
+
+export const feishuReplyReconciler: ProviderReconciler = {
+  provider: 'feishu-im',
+  requiresEffectInput: true,
+
+  async idempotentSubmit(idempotencyKey, input) {
+    let parsed: FeishuReplyInput;
+    try {
+      parsed = parseFeishuReplyInput(input);
+    } catch (err) {
+      return {
+        ok: false,
+        errorCode: 'InputValidationFailed',
+        errorClass: 'manual',
+        errorMessage: err instanceof Error ? err.message : String(err),
+        evidence: { source: 'idempotentSubmit', reason: 'invalid_effect_input' },
+      };
+    }
+
+    try {
+      const { externalRefs } = await feishuReplyExecutor.invoke(parsed, idempotencyKey);
+      return {
+        ok: true,
+        externalRefs,
+        evidence: { source: 'idempotentSubmit', externalRefs },
+      };
+    } catch (err) {
+      const classification = classifyFeishuError(err) ?? defaultFeishuClassification(err);
+      return {
+        ok: false,
+        ...classification,
+        evidence: { source: 'idempotentSubmit' },
+      };
+    }
+  },
+};
+
+function defaultFeishuClassification(err: unknown) {
+  return {
+    errorCode: 'UnknownProviderError' as const,
+    errorClass: 'manual' as const,
+    errorMessage: err instanceof Error ? err.message : String(err),
+  };
+}

@@ -454,7 +454,7 @@ describe('feishuSendExecutor.canonicalInput', () => {
 });
 
 describe('default hostExecutor registry', () => {
-  it('registers botmux-schedule and feishu-send executors/reconcilers', async () => {
+  it('registers botmux-schedule and Feishu IM executors/reconcilers', async () => {
     const {
       createDefaultHostExecutorRegistry,
       createDefaultProviderReconcilers,
@@ -462,12 +462,18 @@ describe('default hostExecutor registry', () => {
 
     expect(createDefaultHostExecutorRegistry().has('botmux-schedule')).toBe(true);
     expect(createDefaultHostExecutorRegistry().has('feishu-send')).toBe(true);
+    expect(createDefaultHostExecutorRegistry().has('feishu-reply')).toBe(true);
     expect(createDefaultProviderReconcilers().has('botmux-schedule')).toBe(true);
     expect(createDefaultProviderReconcilers().has('feishu-im')).toBe(true);
   });
 });
 
 describe('feishuReplyExecutor.canonicalInput', () => {
+  afterEach(() => {
+    vi.doUnmock('../src/im/lark/client.js');
+    vi.resetModules();
+  });
+
   it('pins root_message_id (spike test 3c: parent ignored by Feishu uuid)', async () => {
     const { feishuReplyExecutor } = await import(
       '../src/workflows/hostExecutors/feishu-reply.js'
@@ -506,6 +512,131 @@ describe('feishuReplyExecutor.canonicalInput', () => {
       }),
     );
     expect(a).not.toBe(b);
+  });
+
+  it('parseFeishuReplyInput validates the workflow input shape', async () => {
+    const { parseFeishuReplyInput } = await import(
+      '../src/workflows/hostExecutors/feishu-reply.js'
+    );
+    expect(parseFeishuReplyInput({
+      larkAppId: 'cli_x',
+      rootMessageId: 'om_parent',
+      content: 'hello',
+      replyInThread: true,
+    })).toEqual({
+      larkAppId: 'cli_x',
+      rootMessageId: 'om_parent',
+      content: 'hello',
+      replyInThread: true,
+    });
+    expect(() => parseFeishuReplyInput({ larkAppId: 'cli_x', content: 'hello' })).toThrow();
+  });
+
+  it('invoke forwards the runtime idempotencyKey to replyMessage uuid', async () => {
+    vi.resetModules();
+    const replyMessage = vi.fn(async () => 'om_reply_1');
+    vi.doMock('../src/im/lark/client.js', () => ({
+      sendMessage: vi.fn(),
+      replyMessage,
+      MessageWithdrawnError: class MessageWithdrawnError extends Error {},
+    }));
+    const { feishuReplyExecutor } = await import(
+      '../src/workflows/hostExecutors/feishu-reply.js'
+    );
+
+    const result = await feishuReplyExecutor.invoke(
+      {
+        larkAppId: 'cli_x',
+        rootMessageId: 'om_parent',
+        content: 'reply',
+        replyInThread: true,
+      },
+      'wf_reply_key',
+    );
+
+    expect(replyMessage).toHaveBeenCalledWith(
+      'cli_x',
+      'om_parent',
+      'reply',
+      'text',
+      true,
+      'wf_reply_key',
+    );
+    expect(result).toEqual({
+      output: { messageId: 'om_reply_1' },
+      externalRefs: { messageId: 'om_reply_1' },
+    });
+  });
+
+  it('single feishu-im reconciler dispatches reply input by rootMessageId', async () => {
+    vi.resetModules();
+    const replyMessage = vi.fn(async () => 'om_replied');
+    const sendMessage = vi.fn(async () => 'om_sent');
+    vi.doMock('../src/im/lark/client.js', () => ({
+      sendMessage,
+      replyMessage,
+      MessageWithdrawnError: class MessageWithdrawnError extends Error {},
+    }));
+    const { feishuImReconciler } = await import(
+      '../src/workflows/hostExecutors/feishu-im.js'
+    );
+
+    const result = await feishuImReconciler.idempotentSubmit!('wf_same_uuid', {
+      larkAppId: 'cli_x',
+      rootMessageId: 'om_parent',
+      content: 'reply',
+      replyInThread: false,
+    });
+
+    expect(feishuImReconciler.provider).toBe('feishu-im');
+    expect(feishuImReconciler.requiresEffectInput).toBe(true);
+    expect(replyMessage).toHaveBeenCalledWith(
+      'cli_x',
+      'om_parent',
+      'reply',
+      'text',
+      false,
+      'wf_same_uuid',
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: true,
+      externalRefs: { messageId: 'om_replied' },
+      evidence: { source: 'idempotentSubmit', externalRefs: { messageId: 'om_replied' } },
+    });
+  });
+
+  it('single feishu-im reconciler still dispatches send input by chatId', async () => {
+    vi.resetModules();
+    const replyMessage = vi.fn(async () => 'om_replied');
+    const sendMessage = vi.fn(async () => 'om_sent');
+    vi.doMock('../src/im/lark/client.js', () => ({
+      sendMessage,
+      replyMessage,
+      MessageWithdrawnError: class MessageWithdrawnError extends Error {},
+    }));
+    const { feishuImReconciler } = await import(
+      '../src/workflows/hostExecutors/feishu-im.js'
+    );
+
+    const result = await feishuImReconciler.idempotentSubmit!('wf_same_uuid', {
+      larkAppId: 'cli_x',
+      chatId: 'oc_chat',
+      content: 'send',
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      'cli_x',
+      'oc_chat',
+      'send',
+      'text',
+      'wf_same_uuid',
+    );
+    expect(replyMessage).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: true,
+      externalRefs: { messageId: 'om_sent' },
+    });
   });
 });
 
