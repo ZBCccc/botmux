@@ -30,6 +30,15 @@ export const ErrorCodeEnum = z.enum([
   'WaitDeadlineExceeded',
   'TtlExpired',
   'UnknownProviderError',
+  // Step 7 round 1 recovery codes:
+  //  InputUnrecoverable — reconciler requires the original effect input
+  //    to re-submit, but the daemon cannot load it (no callback, callback
+  //    threw, or returned undefined).  Always manual class.
+  //  CorruptLog — replay/recovery detected an inconsistent event log
+  //    (e.g. reconcileResult{decision=replayed} but no terminal event
+  //    found).  Always manual class.
+  'InputUnrecoverable',
+  'CorruptLog',
 ]);
 export type ErrorCode = z.infer<typeof ErrorCodeEnum>;
 

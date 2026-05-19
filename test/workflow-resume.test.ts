@@ -111,15 +111,49 @@ describe('resume — resumeStarted audit entry', () => {
     expect(payload.lastSeenEventId).toMatch(/-1$/); // runCreated is seq 1
   });
 
-  it('rejects resume against an empty log (no runCreated to project)', async () => {
-    // No bootstrap — log is empty.  Resume writes resumeStarted as audit
-    // entry, then tries to replay; replay rejects logs that don't begin
-    // with runCreated.  The resumeStarted IS written before the throw
-    // (audit semantics), which is fine — it just records "a resume was
-    // attempted against a run that has no creation event".
+  it('rejects resume against an empty log (preflight, no events written)', async () => {
+    // Round 1 F4: preflight rejects bad inputs BEFORE writing
+    // resumeStarted, so the run event log is never polluted by a
+    // failed resume attempt.
+    await expect(
+      resume({ log, runId: RUN_ID, daemonId: 'd-1', reconcilers: emptyReconcilers() }),
+    ).rejects.toThrow(/cannot resume an empty event log/);
+    const events = await log.readAll();
+    expect(events).toEqual([]);
+  });
+
+  it('rejects resume when the first event is not runCreated (preflight)', async () => {
+    // Forge a log starting with runStarted by appending it as if
+    // someone had pre-seeded the file.  EventLog.append rejects this
+    // path so we have to bypass it with direct file write.
+    await log.append({
+      runId: RUN_ID,
+      type: 'runCreated',
+      actor: 'scheduler',
+      payload: {
+        workflowId: 'wf-demo',
+        revisionId: 'rev-001',
+        inputRef: sampleOutputRef,
+        initiator: 'tester',
+      },
+    });
+    // Drop the runCreated line so the first event is something else.
+    // Direct fs write to simulate corruption:
+    const { promises: fs } = await import('node:fs');
+    const path = log.eventsFile;
+    const content = await fs.readFile(path, 'utf-8');
+    const lines = content.split('\n').filter(Boolean);
+    const obj = JSON.parse(lines[0]);
+    obj.type = 'runStarted';
+    obj.payload = {};
+    await fs.writeFile(path, JSON.stringify(obj) + '\n', 'utf-8');
+
     await expect(
       resume({ log, runId: RUN_ID, daemonId: 'd-1', reconcilers: emptyReconcilers() }),
     ).rejects.toThrow(/first event must be runCreated/);
+    const events = await log.readAll();
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe('runStarted');
   });
 
   it('rejects runId mismatch between ctx and log', async () => {
@@ -327,7 +361,10 @@ describe('resume — completedByIdempotentSubmit via idempotentSubmit', () => {
     expect(sp.externalRefs).toEqual({ messageId: 'om_xxx' });
   });
 
-  it('falls back to manual when idempotentSubmit errors', async () => {
+  it('keeps the activity dangling when idempotentSubmit returns retryable (F3)', async () => {
+    // Round 1 F3: retryable failure must NOT terminate the attempt.
+    // The provider may have received the request and dropped the
+    // response; writing manual terminal would freeze a wrong state.
     await bootstrapWith(
       attemptCreated('a-feishu', 'at-1'),
       effectAttempted('a-feishu', 'at-1', 'feishu-im', 'wf_abc', 1000, PROVIDER_TTL_MS['feishu-im']),
@@ -350,12 +387,58 @@ describe('resume — completedByIdempotentSubmit via idempotentSubmit', () => {
       reconcilers: new Map([['feishu-im', reconciler]]),
       now: () => 1001,
     });
+    expect(r.reconcileOutcomes).toEqual([]);
+    expect(r.transientFailures).toHaveLength(1);
+    const t = r.transientFailures[0];
+    expect(t.activityId).toBe('a-feishu');
+    expect(t.errorCode).toBe('NetworkError');
+    expect(t.errorClass).toBe('retryable');
+    // No terminal in the event log — activity stays dangling for the
+    // next resume to retry.
+    const events = await log.readAll();
+    const terminals = events.filter(
+      (e) =>
+        (e.type === 'activitySucceeded' || e.type === 'activityFailed') &&
+        (e.payload as { activityId: string }).activityId === 'a-feishu',
+    );
+    expect(terminals).toEqual([]);
+    // No reconcileResult written either — preserves the option to
+    // retry the decision tree from scratch next cycle.
+    const reconciles = events.filter((e) => e.type === 'reconcileResult');
+    expect(reconciles).toEqual([]);
+  });
+
+  it('still writes manual terminal when idempotentSubmit returns fatal/userFault', async () => {
+    await bootstrapWith(
+      attemptCreated('a-feishu', 'at-1'),
+      effectAttempted('a-feishu', 'at-1', 'feishu-im', 'wf_abc', 1000, PROVIDER_TTL_MS['feishu-im']),
+    );
+    const reconciler: ProviderReconciler = {
+      provider: 'feishu-im',
+      async idempotentSubmit() {
+        return {
+          ok: false,
+          errorCode: 'IdempotencyInputMismatch',
+          errorClass: 'fatal',
+          errorMessage: 'inputHash mismatch on retry',
+        };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['feishu-im', reconciler]]),
+      now: () => 1001,
+    });
+    expect(r.transientFailures).toEqual([]);
+    expect(r.reconcileOutcomes).toHaveLength(1);
     const o = r.reconcileOutcomes[0];
     expect(o.decision).toBe('manual');
     expect(o.capability).toBe('idempotentSubmit');
     const ep = o.terminalEvent!.payload as { error: { errorCode: string; errorClass: string } };
-    expect(ep.error.errorCode).toBe('NetworkError');
-    expect(ep.error.errorClass).toBe('manual'); // resume escalates retryable→manual
+    expect(ep.error.errorCode).toBe('IdempotencyInputMismatch');
+    expect(ep.error.errorClass).toBe('manual');
   });
 });
 
@@ -546,5 +629,305 @@ describe('resume — event order', () => {
     const reconcileIdx = types.indexOf('reconcileResult');
     expect(resumeIdx).toBeGreaterThan(-1);
     expect(reconcileIdx).toBeGreaterThan(resumeIdx);
+  });
+});
+
+// ─── F1 recovery — reconcileResult written, terminal missing ───────────────
+
+describe('resume — F1: crash between reconcileResult and terminal', () => {
+  it('completedByIdempotentSubmit reuses recorded evidence; provider is NOT called', async () => {
+    // Simulate: first resume crashed AFTER writing reconcileResult but
+    // BEFORE writing activitySucceeded.  Second resume must finish the
+    // job from the recorded evidence, not by re-querying the provider.
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_x', 1, Number.MAX_SAFE_INTEGER),
+      // Manually written reconcileResult — simulates the first resume's
+      // half-completed work surviving the crash.
+      {
+        runId: RUN_ID,
+        type: 'reconcileResult',
+        actor: 'system',
+        payload: {
+          activityId: 'a-1',
+          idempotencyKey: 'wf_x',
+          capability: 'readOnlyLookup',
+          decision: 'completedByIdempotentSubmit',
+          evidence: { source: 'getTask', externalRefs: { taskId: 'wf_x' } },
+        },
+      },
+    );
+    let providerCalled = false;
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      async readOnlyLookup() {
+        providerCalled = true;
+        return { found: true, externalRefs: { taskId: 'wf_x' } };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+    });
+    expect(providerCalled).toBe(false);
+    expect(r.reconcileOutcomes).toHaveLength(1);
+    const o = r.reconcileOutcomes[0];
+    expect(o.recovered).toBe(true);
+    expect(o.decision).toBe('completedByIdempotentSubmit');
+    expect(o.terminalEvent?.type).toBe('activitySucceeded');
+    expect(o.reconcileEvent).toBeNull(); // recovery does NOT write a new reconcileResult
+    const sp = o.terminalEvent!.payload as { externalRefs: { taskId: string } };
+    expect(sp.externalRefs).toEqual({ taskId: 'wf_x' });
+  });
+
+  it('manual recovery writes activityFailed using the recorded errorCode', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'feishu-im', 'wf_y', 1000, PROVIDER_TTL_MS['feishu-im']),
+      {
+        runId: RUN_ID,
+        type: 'reconcileResult',
+        actor: 'system',
+        payload: {
+          activityId: 'a-1',
+          idempotencyKey: 'wf_y',
+          capability: 'idempotentSubmit',
+          decision: 'manual',
+          evidence: { reason: 'no_capability', errorCode: 'IdempotencyInputMismatch' },
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+      now: () => 1001,
+    });
+    expect(r.reconcileOutcomes).toHaveLength(1);
+    const o = r.reconcileOutcomes[0];
+    expect(o.recovered).toBe(true);
+    expect(o.decision).toBe('manual');
+    const ep = o.terminalEvent!.payload as { error: { errorCode: string; errorClass: string } };
+    expect(ep.error.errorCode).toBe('IdempotencyInputMismatch');
+    expect(ep.error.errorClass).toBe('manual');
+  });
+
+  it('freshRetry recovery returns the recorded decision; writes no terminal', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_z', 1, Number.MAX_SAFE_INTEGER),
+      {
+        runId: RUN_ID,
+        type: 'reconcileResult',
+        actor: 'system',
+        payload: {
+          activityId: 'a-1',
+          idempotencyKey: 'wf_z',
+          capability: 'readOnlyLookup',
+          decision: 'freshRetry',
+          evidence: { source: 'getTask', returned: 'undefined' },
+        },
+      },
+    );
+    let providerCalled = false;
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      async readOnlyLookup() {
+        providerCalled = true;
+        return { found: true, externalRefs: { taskId: 'wf_z' } };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+    });
+    expect(providerCalled).toBe(false);
+    const o = r.reconcileOutcomes[0];
+    expect(o.recovered).toBe(true);
+    expect(o.decision).toBe('freshRetry');
+    expect(o.terminalEvent).toBeNull();
+  });
+
+  it('TTL boundary does NOT override a recorded completedByIdempotentSubmit', async () => {
+    // The strongest correctness test for F1: even if TTL has now
+    // expired, recovery from a prior "completed" decision still
+    // succeeds — because the first resume already proved the effect
+    // landed, the TTL boundary is moot.
+    const longAgo = 1000;
+    const ttl = 60_000;
+    const farFuture = longAgo + ttl + 1_000_000;
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'feishu-im', 'wf_late', longAgo, ttl),
+      {
+        runId: RUN_ID,
+        type: 'reconcileResult',
+        actor: 'system',
+        payload: {
+          activityId: 'a-1',
+          idempotencyKey: 'wf_late',
+          capability: 'idempotentSubmit',
+          decision: 'completedByIdempotentSubmit',
+          evidence: { externalRefs: { messageId: 'om_late' } },
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map(), // no reconciler — recovery shouldn't need one
+      now: () => farFuture,
+    });
+    const o = r.reconcileOutcomes[0];
+    expect(o.recovered).toBe(true);
+    expect(o.decision).toBe('completedByIdempotentSubmit');
+    const sp = o.terminalEvent!.payload as { externalRefs: { messageId: string } };
+    expect(sp.externalRefs).toEqual({ messageId: 'om_late' });
+  });
+});
+
+// ─── F2 — reconciler input passthrough ─────────────────────────────────────
+
+describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
+  it('passes the loaded input to readOnlyLookup', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_q', 1, Number.MAX_SAFE_INTEGER),
+    );
+    let lookupInput: unknown = null;
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      async readOnlyLookup(_key, input) {
+        lookupInput = input;
+        return { found: true, externalRefs: { taskId: 'wf_q' } };
+      },
+    };
+    await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+      async loadEffectInput(activityId, attemptId) {
+        expect(activityId).toBe('a-1');
+        expect(attemptId).toBe('at-1');
+        return { schedule: '30m', prompt: 'hi' };
+      },
+    });
+    expect(lookupInput).toEqual({ schedule: '30m', prompt: 'hi' });
+  });
+
+  it('passes the loaded input to idempotentSubmit', async () => {
+    await bootstrapWith(
+      attemptCreated('a-feishu', 'at-1'),
+      effectAttempted('a-feishu', 'at-1', 'feishu-im', 'wf_p', 1000, PROVIDER_TTL_MS['feishu-im']),
+    );
+    let submitInput: unknown = null;
+    const reconciler: ProviderReconciler = {
+      provider: 'feishu-im',
+      requiresEffectInput: true,
+      async idempotentSubmit(_key, input) {
+        submitInput = input;
+        return { ok: true, externalRefs: { messageId: 'om_p' } };
+      },
+    };
+    await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['feishu-im', reconciler]]),
+      now: () => 1001,
+      async loadEffectInput() {
+        return { chatId: 'oc_abc', content: 'hi' };
+      },
+    });
+    expect(submitInput).toEqual({ chatId: 'oc_abc', content: 'hi' });
+  });
+
+  it('writes manual/InputUnrecoverable when requiresEffectInput=true and no loader', async () => {
+    await bootstrapWith(
+      attemptCreated('a-feishu', 'at-1'),
+      effectAttempted('a-feishu', 'at-1', 'feishu-im', 'wf_p', 1000, PROVIDER_TTL_MS['feishu-im']),
+    );
+    let submitCalled = false;
+    const reconciler: ProviderReconciler = {
+      provider: 'feishu-im',
+      requiresEffectInput: true,
+      async idempotentSubmit() {
+        submitCalled = true;
+        return { ok: true, externalRefs: { messageId: 'om_p' } };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['feishu-im', reconciler]]),
+      now: () => 1001,
+      // No loadEffectInput
+    });
+    expect(submitCalled).toBe(false);
+    const o = r.reconcileOutcomes[0];
+    expect(o.decision).toBe('manual');
+    const ep = o.terminalEvent!.payload as { error: { errorCode: string } };
+    expect(ep.error.errorCode).toBe('InputUnrecoverable');
+  });
+
+  it('writes manual/InputUnrecoverable when loadEffectInput throws', async () => {
+    await bootstrapWith(
+      attemptCreated('a-feishu', 'at-1'),
+      effectAttempted('a-feishu', 'at-1', 'feishu-im', 'wf_p', 1000, PROVIDER_TTL_MS['feishu-im']),
+    );
+    const reconciler: ProviderReconciler = {
+      provider: 'feishu-im',
+      requiresEffectInput: true,
+      async idempotentSubmit() {
+        return { ok: true, externalRefs: {} };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['feishu-im', reconciler]]),
+      now: () => 1001,
+      async loadEffectInput() {
+        throw new Error('storage offline');
+      },
+    });
+    const o = r.reconcileOutcomes[0];
+    expect(o.decision).toBe('manual');
+    const ep = o.terminalEvent!.payload as { error: { errorCode: string; errorMessage: string } };
+    expect(ep.error.errorCode).toBe('InputUnrecoverable');
+    expect(ep.error.errorMessage).toMatch(/storage offline/);
+  });
+
+  it('passes undefined input to reconcilers that do NOT require it', async () => {
+    await bootstrapWith(
+      attemptCreated('a-sched', 'at-1'),
+      effectAttempted('a-sched', 'at-1', 'botmux-schedule', 'wf_q', 1, Number.MAX_SAFE_INTEGER),
+    );
+    let lookupInput: unknown = 'not-touched';
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      // requiresEffectInput unset → optional
+      async readOnlyLookup(_key, input) {
+        lookupInput = input;
+        return { found: true, externalRefs: { taskId: 'wf_q' } };
+      },
+    };
+    await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+      // No loadEffectInput
+    });
+    expect(lookupInput).toBeUndefined();
   });
 });

@@ -86,6 +86,21 @@ export type AttemptState = {
      *  `eventId` parsing. */
     attemptedAtMs: number;
   };
+  /**
+   * Latest reconcileResult matched to this attempt by idempotencyKey.
+   * Resume consults this BEFORE re-running the decision tree: if a
+   * previous resume crashed between writing reconcileResult and the
+   * terminal event, replay surfaces the prior decision so the next
+   * resume can finish what the first started (codex Step 7 round 1
+   * finding 1).  reconcileResult.payload doesn't carry attemptId — we
+   * match by idempotencyKey, which uniquely identifies the attempt.
+   */
+  latestReconcileResult?: {
+    decision: 'replayed' | 'completedByIdempotentSubmit' | 'manual' | 'freshRetry';
+    capability: 'readOnlyLookup' | 'idempotentSubmit' | 'none';
+    evidence: Record<string, unknown>;
+    eventId: string;
+  };
   // terminal
   output?: OutputRef;
   externalRefs?: Record<string, unknown>;
@@ -541,12 +556,39 @@ export function replay(events: WorkflowEvent[]): Snapshot {
 
       // ─── System / Recovery ──────────────────────────────────────────
       case 'workerLost':
-      case 'resumeStarted':
-      case 'reconcileResult': {
+      case 'resumeStarted': {
         // No deterministic state projection during replay.  Resume logic
         // (Step 7) reads these events directly to drive recovery; replay
         // just preserves them in the event order for downstream use.
-        void (e as WorkerLostEvent | ResumeStartedEvent | ReconcileResultEvent);
+        void (e as WorkerLostEvent | ResumeStartedEvent);
+        break;
+      }
+      case 'reconcileResult': {
+        // Project the latest reconcileResult onto the matching attempt
+        // (by idempotencyKey).  Resume uses this to recover from a
+        // crash that landed between reconcileResult and the terminal
+        // event — without this projection the next resume would re-run
+        // the decision tree and risk a different (possibly wrong)
+        // outcome (codex Step 7 round 1 finding 1).
+        const p = (e as ReconcileResultEvent).payload as ReconcileResultEvent['payload'];
+        if (!('ref' in p)) {
+          // Linear scan: workflows have small attempt counts, no need
+          // to index by idempotencyKey.
+          for (const act of activities.values()) {
+            const at = act.attempts.find(
+              (x) => x.effectAttempted?.idempotencyKey === p.idempotencyKey,
+            );
+            if (at) {
+              at.latestReconcileResult = {
+                decision: p.decision,
+                capability: p.capability,
+                evidence: p.evidence,
+                eventId: e.eventId,
+              };
+              break;
+            }
+          }
+        }
         break;
       }
 

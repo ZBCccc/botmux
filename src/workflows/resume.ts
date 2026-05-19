@@ -15,6 +15,22 @@
  *     leaves the attempt dangling — the scheduler (Step 8+) is
  *     responsible for spawning the actual replacement attempt.
  *   - Dangling waits are left alone (waiting for external signal).
+ *
+ * Round 1 fixes (codex review of `1d14081`):
+ *   F1 — replay surfaces the latest reconcileResult per attempt; resume
+ *        consumes it before re-running the decision tree, so a crash
+ *        between reconcileResult and the terminal event is recoverable.
+ *   F2 — reconcilers receive the materialized effect input via the
+ *        caller-supplied `loadEffectInput` callback.  Reconcilers that
+ *        require input (e.g. Feishu — chatId/rootMessageId/content can't
+ *        be reconstructed from idempotencyKey alone) fail explicitly
+ *        when input is unrecoverable.
+ *   F3 — `retryable` failures from idempotentSubmit do NOT terminate
+ *        the attempt; the activity stays dangling and is surfaced in
+ *        `ResumeResult.transientFailures` for the caller to retry.
+ *   F4 — `resumeStarted` is written ONLY after a preflight validates
+ *        the log is replayable; bad inputs throw without polluting the
+ *        run event log.
  */
 
 import type { EventLog } from './events/append.js';
@@ -54,23 +70,38 @@ export type IdempotentSubmitResult =
  * Per-provider capability bundle.  Resume looks up the reconciler by the
  * `effectAttempted.provider` field; missing entries fall through to
  * manual/UnknownProviderError.
+ *
+ * Reconcilers receive the materialized effect input alongside the
+ * idempotencyKey: providers like Feishu can't re-construct the request
+ * body from the key alone (the key is a hash, not the body).  When the
+ * caller doesn't supply `loadEffectInput`, resume treats the input as
+ * `undefined`; reconcilers that NEED input MUST declare so via
+ * `requiresEffectInput` so resume can fail fast with a clear error
+ * instead of letting the reconciler silently misbehave.
  */
 export interface ProviderReconciler {
   readonly provider: string;
+  /**
+   * When `true`, resume refuses to call this reconciler without a
+   * materialized effect input — i.e. it writes manual/InputUnrecoverable
+   * if `loadEffectInput` is absent or throws.  Feishu sets this; schedule
+   * does not (idempotencyKey is the full key).
+   */
+  readonly requiresEffectInput?: boolean;
   /**
    * Pure read against the provider keyed by `idempotencyKey`.  Has no
    * side effects; safe to call from resume even when we don't intend to
    * complete the effect.  Schedule has it (`getTask(id)`); Feishu does
    * not (no uuid-reverse-lookup API).
    */
-  readOnlyLookup?(idempotencyKey: string): Promise<ReadOnlyLookupResult>;
+  readOnlyLookup?(idempotencyKey: string, input: unknown): Promise<ReadOnlyLookupResult>;
   /**
    * Re-submit the effect with the same `idempotencyKey`.  MAY produce
    * the side effect for real (if the original pre-invoke crash never
    * reached the provider); provider dedupe inside TTL guarantees the
    * second submit returns the original ref instead of a duplicate.
    */
-  idempotentSubmit?(idempotencyKey: string): Promise<IdempotentSubmitResult>;
+  idempotentSubmit?(idempotencyKey: string, input: unknown): Promise<IdempotentSubmitResult>;
 }
 
 export type ResumeContext = {
@@ -82,6 +113,21 @@ export type ResumeContext = {
   daemonId: string;
   /** Reconcilers keyed by provider name (`feishu-im`, `botmux-schedule`). */
   reconcilers: Map<string, ProviderReconciler>;
+  /**
+   * Load the materialized effect input that was passed to the original
+   * attempt.  Required for providers that re-submit (Feishu).  Resume
+   * passes the returned value to the reconciler's readOnlyLookup /
+   * idempotentSubmit.
+   *
+   * v0: the caller (daemon) decides where to persist or recover this —
+   * in-memory while alive, or some external storage on cold start.
+   * Resume only consumes the callback.
+   *
+   * Returning `undefined` is treated as "input unrecoverable" and
+   * triggers the manual/InputUnrecoverable path for reconcilers that
+   * declared `requiresEffectInput`.
+   */
+  loadEffectInput?(activityId: string, attemptId: string): Promise<unknown>;
   /** Injectable clock for deterministic tests.  Defaults to Date.now. */
   now?: () => number;
 };
@@ -100,14 +146,36 @@ export type ReconcileOutcome = {
    * issues a new attempt later, not Step 7's job).
    */
   terminalEvent: ActivitySucceededEvent | ActivityFailedEvent | null;
-  /** The reconcileResult event written. */
-  reconcileEvent: ReconcileResultEvent;
+  /** The reconcileResult event written, or null if this outcome reused
+   *  a pre-existing reconcileResult (recovery path — codex F1). */
+  reconcileEvent: ReconcileResultEvent | null;
+  /** True when this outcome recovered a prior crashed reconcile cycle
+   *  rather than running the decision tree from scratch. */
+  recovered: boolean;
 };
 
 export type WorkerCrashedOutcome = {
   activityId: string;
   attemptId: string;
   terminalEvent: ActivityFailedEvent;
+};
+
+/**
+ * Reconcile failures that resume DELIBERATELY does not terminate (codex
+ * F3): a retryable provider failure during idempotentSubmit might mean
+ * "request landed, response lost", and writing a manual terminal there
+ * would freeze the activity in a wrong terminal state.  Resume reports
+ * these back to the caller and leaves the activity dangling so the next
+ * resume cycle can retry.
+ */
+export type TransientReconcileFailure = {
+  activityId: string;
+  attemptId: string;
+  provider: string;
+  idempotencyKey: string;
+  errorCode: string;
+  errorClass: 'retryable';
+  errorMessage: string;
 };
 
 export type ResumeResult = {
@@ -117,6 +185,7 @@ export type ResumeResult = {
   snapshot: Snapshot;
   reconcileOutcomes: ReconcileOutcome[];
   workerCrashedOutcomes: WorkerCrashedOutcome[];
+  transientFailures: TransientReconcileFailure[];
 };
 
 // ─── Resume orchestrator ────────────────────────────────────────────────────
@@ -129,41 +198,55 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
   }
   const now = ctx.now ?? Date.now;
 
-  // 1. Write resumeStarted audit entry BEFORE replay — the audit entry
-  //    itself is a recoverable signal that a resume cycle began on this
-  //    daemon, even if the cycle itself crashes mid-way.
+  // F4: Preflight BEFORE writing resumeStarted.  Bad logs (empty / no
+  // runCreated / cross-runId contamination) throw without polluting the
+  // run event log — audit goes to the daemon logger, not the canonical
+  // per-run event stream.
   const preEvents = await ctx.log.readAll();
-  // The payload schema requires a string; use the empty string as the
-  // sentinel for "we resumed against an empty log" rather than allowing
-  // null at the envelope.  In practice resume should only run after
-  // `runCreated`, but the sentinel keeps the function total.
-  const lastSeenEventId = preEvents.length > 0 ? preEvents[preEvents.length - 1].eventId : '';
+  if (preEvents.length === 0) {
+    throw new Error(
+      `resume(${ctx.runId}): cannot resume an empty event log — no runCreated to project from.`,
+    );
+  }
+  if (preEvents[0].type !== 'runCreated') {
+    throw new Error(
+      `resume(${ctx.runId}): first event must be runCreated, got ${preEvents[0].type} (corrupt log; not appending resumeStarted).`,
+    );
+  }
+  // We let `replay` enforce cross-runId, but check up front so the
+  // diagnostic is colocated with the preflight.
+  if (preEvents[0].runId !== ctx.runId) {
+    throw new Error(
+      `resume(${ctx.runId}): runCreated.runId is ${preEvents[0].runId}, log/ctx are ${ctx.runId} (corrupt log; not appending resumeStarted).`,
+    );
+  }
+
+  // Preflight passed — now write the audit entry.
   const resumeStartedEvent = (await ctx.log.append({
     runId: ctx.runId,
     type: 'resumeStarted',
     actor: 'system',
     payload: {
       daemonId: ctx.daemonId,
-      lastSeenEventId,
+      lastSeenEventId: preEvents[preEvents.length - 1].eventId,
     },
   })) as ResumeStartedEvent;
 
-  // 2. Replay (including resumeStarted itself — it doesn't affect snapshot
-  //    projection but keeps the read consistent).
+  // Re-read so the snapshot includes the resumeStarted (replay treats
+  // it as a no-op projection — keeping the read consistent).
   const allEvents = await ctx.log.readAll();
   const snapshot = replay(allEvents);
 
-  // 3. Reconcile dangling effectAttempted activities.
   const reconcileOutcomes: ReconcileOutcome[] = [];
+  const transientFailures: TransientReconcileFailure[] = [];
   for (const activityId of snapshot.danglingEffectAttempted) {
-    const outcome = await reconcileOne(ctx, snapshot, activityId, now());
-    if (outcome) reconcileOutcomes.push(outcome);
+    const result = await reconcileOne(ctx, snapshot, activityId, now());
+    if (result.kind === 'outcome') reconcileOutcomes.push(result.outcome);
+    else if (result.kind === 'transient') transientFailures.push(result.failure);
   }
 
-  // 4. Worker-crashed path: dangling activity, no effectAttempted, no
-  //    open wait.  Treat as worker died mid-execution → activityFailed
-  //    with retryable/WorkerCrashed.  Human-gate (waitCreated dangling)
-  //    is intentionally left alone — it's waiting on external signal.
+  // Worker-crashed path: dangling activity, no effectAttempted, no
+  // open wait → activityFailed{WorkerCrashed, retryable}.
   const workerCrashedOutcomes: WorkerCrashedOutcome[] = [];
   const reconciled = new Set(snapshot.danglingEffectAttempted);
   const waitingActivities = new Set(snapshot.danglingWaits);
@@ -196,37 +279,55 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
     snapshot,
     reconcileOutcomes,
     workerCrashedOutcomes,
+    transientFailures,
   };
 }
 
 // ─── Reconcile decision tree ────────────────────────────────────────────────
+
+type ReconcileStepResult =
+  | { kind: 'outcome'; outcome: ReconcileOutcome }
+  | { kind: 'transient'; failure: TransientReconcileFailure }
+  | { kind: 'skipped' };
 
 async function reconcileOne(
   ctx: ResumeContext,
   snapshot: Snapshot,
   activityId: string,
   nowMs: number,
-): Promise<ReconcileOutcome | null> {
+): Promise<ReconcileStepResult> {
   const activity = snapshot.activities.get(activityId);
-  if (!activity) return null;
+  if (!activity) return { kind: 'skipped' };
   const latest = activity.attempts[activity.attempts.length - 1];
-  if (!latest || !latest.effectAttempted) return null;
+  if (!latest || !latest.effectAttempted) return { kind: 'skipped' };
 
   const ea = latest.effectAttempted;
+
+  // F1: recovery path — if a previous resume already wrote a
+  // reconcileResult for this attempt but crashed before the terminal,
+  // resume the consequences instead of re-running the decision tree.
+  // Re-running risks a DIFFERENT decision (TTL crosses, provider state
+  // changes), so we honor the recorded choice.
+  if (latest.latestReconcileResult) {
+    return recoverFromReconcileResult(ctx, activityId, latest, ea);
+  }
+
   const reconciler = ctx.reconcilers.get(ea.provider);
 
   // Case A — unknown provider.  No way to confirm; manual/UnknownProvider.
   if (!reconciler) {
-    return writeManual(
-      ctx,
-      activityId,
-      latest.attemptId,
-      ea.idempotencyKey,
-      ea.provider,
-      'none',
-      'UnknownProviderError',
-      `No reconciler registered for provider "${ea.provider}".`,
-      { reason: 'no_reconciler' },
+    return outcome(
+      await writeManual(
+        ctx,
+        activityId,
+        latest.attemptId,
+        ea.idempotencyKey,
+        ea.provider,
+        'none',
+        'UnknownProviderError',
+        `No reconciler registered for provider "${ea.provider}".`,
+        { reason: 'no_reconciler' },
+      ),
     );
   }
 
@@ -236,100 +337,295 @@ async function reconcileOne(
   // force at attempt time is what matters.
   const ttlExpired = nowMs - ea.attemptedAtMs > ea.idempotencyTtlMs;
   if (ttlExpired) {
-    return writeManual(
-      ctx,
-      activityId,
-      latest.attemptId,
-      ea.idempotencyKey,
-      ea.provider,
-      'none',
-      'TtlExpired',
-      `Provider TTL (${ea.idempotencyTtlMs}ms) elapsed before resume could reconcile.`,
-      {
-        reason: 'ttl_expired',
-        attemptedAtMs: ea.attemptedAtMs,
-        nowMs,
-        idempotencyTtlMs: ea.idempotencyTtlMs,
-      },
+    return outcome(
+      await writeManual(
+        ctx,
+        activityId,
+        latest.attemptId,
+        ea.idempotencyKey,
+        ea.provider,
+        'none',
+        'TtlExpired',
+        `Provider TTL (${ea.idempotencyTtlMs}ms) elapsed before resume could reconcile.`,
+        {
+          reason: 'ttl_expired',
+          attemptedAtMs: ea.attemptedAtMs,
+          nowMs,
+          idempotencyTtlMs: ea.idempotencyTtlMs,
+        },
+      ),
+    );
+  }
+
+  // F2: materialize effect input via the caller's loader.  Some
+  // reconcilers can work without it (schedule); others (Feishu) MUST
+  // have it.
+  let effectInput: unknown = undefined;
+  let inputLoadError: Error | null = null;
+  if (ctx.loadEffectInput) {
+    try {
+      effectInput = await ctx.loadEffectInput(activityId, latest.attemptId);
+    } catch (err) {
+      inputLoadError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+  if (
+    reconciler.requiresEffectInput &&
+    (inputLoadError !== null || effectInput === undefined)
+  ) {
+    return outcome(
+      await writeManual(
+        ctx,
+        activityId,
+        latest.attemptId,
+        ea.idempotencyKey,
+        ea.provider,
+        'none',
+        'InputUnrecoverable',
+        inputLoadError
+          ? `Failed to load effect input for reconcile: ${inputLoadError.message}`
+          : `Reconciler "${ea.provider}" requires effect input, but ctx.loadEffectInput returned undefined / was not provided.`,
+        { reason: 'input_unrecoverable', hadLoader: !!ctx.loadEffectInput },
+      ),
     );
   }
 
   // Case C — readOnlyLookup available.  Prefer it: pure read, no side
   // effect risk.  Schedule has it.
   if (reconciler.readOnlyLookup) {
-    const lookup = await reconciler.readOnlyLookup(ea.idempotencyKey);
+    const lookup = await reconciler.readOnlyLookup(ea.idempotencyKey, effectInput);
     if (lookup.found) {
-      return writeCompletedByIdempotentSubmit(
+      return outcome(
+        await writeCompletedByIdempotentSubmit(
+          ctx,
+          activityId,
+          latest.attemptId,
+          ea.idempotencyKey,
+          ea.provider,
+          'readOnlyLookup',
+          lookup.externalRefs,
+          lookup.evidence ?? {},
+        ),
+      );
+    }
+    return outcome(
+      await writeFreshRetry(
         ctx,
         activityId,
         latest.attemptId,
         ea.idempotencyKey,
         ea.provider,
         'readOnlyLookup',
-        lookup.externalRefs,
-        lookup.evidence ?? {},
-      );
-    }
-    // Not found → freshRetry.  We DO NOT write a terminal event; the
-    // scheduler will issue a new attempt with the same attemptId /
-    // idempotencyKey.  Resume's job ends with the reconcileResult.
-    return writeFreshRetry(
-      ctx,
-      activityId,
-      latest.attemptId,
-      ea.idempotencyKey,
-      ea.provider,
-      'readOnlyLookup',
-      lookup.evidence ?? { found: false },
+        lookup.evidence ?? { found: false },
+      ),
     );
   }
 
-  // Case D — idempotentSubmit only (Feishu).  Re-submitting inside TTL
-  // is safe: provider dedupe returns the original ref if a previous
-  // submit landed, or completes the effect for the first time if the
-  // pre-invoke crash predated the provider receiving anything.
+  // Case D — idempotentSubmit only (Feishu).
   if (reconciler.idempotentSubmit) {
-    const submit = await reconciler.idempotentSubmit(ea.idempotencyKey);
+    const submit = await reconciler.idempotentSubmit(ea.idempotencyKey, effectInput);
     if (submit.ok) {
-      return writeCompletedByIdempotentSubmit(
+      return outcome(
+        await writeCompletedByIdempotentSubmit(
+          ctx,
+          activityId,
+          latest.attemptId,
+          ea.idempotencyKey,
+          ea.provider,
+          'idempotentSubmit',
+          submit.externalRefs,
+          submit.evidence ?? {},
+        ),
+      );
+    }
+    // F3: retryable failures stay dangling.  Provider may have received
+    // the request and dropped the response; writing manual terminal
+    // would freeze the activity in a wrong state and short-circuit the
+    // next resume from retrying.  We log to the caller as a transient
+    // failure and let the activity remain dangling.
+    if (submit.errorClass === 'retryable') {
+      return {
+        kind: 'transient',
+        failure: {
+          activityId,
+          attemptId: latest.attemptId,
+          provider: ea.provider,
+          idempotencyKey: ea.idempotencyKey,
+          errorCode: submit.errorCode,
+          errorClass: 'retryable',
+          errorMessage: submit.errorMessage,
+        },
+      };
+    }
+    // fatal / userFault / manual — these are decisive; write manual
+    // terminal so a human inspects.  Note the manual escalation here is
+    // intentional and bounded to non-retryable cases.
+    return outcome(
+      await writeManual(
         ctx,
         activityId,
         latest.attemptId,
         ea.idempotencyKey,
         ea.provider,
         'idempotentSubmit',
-        submit.externalRefs,
-        submit.evidence ?? {},
-      );
-    }
-    // Re-submit failed.  If retryable we still go manual here — Step 7
-    // doesn't make retry decisions, and a manual reconcileResult lets a
-    // human inspect before retry policy reactivates.
-    return writeManual(
+        submit.errorCode,
+        submit.errorMessage,
+        submit.evidence ?? { errorClass: submit.errorClass },
+      ),
+    );
+  }
+
+  // Case E — reconciler exists but exposes no capability.  Manual.
+  return outcome(
+    await writeManual(
       ctx,
       activityId,
       latest.attemptId,
       ea.idempotencyKey,
       ea.provider,
-      'idempotentSubmit',
-      submit.errorCode,
-      submit.errorMessage,
-      submit.evidence ?? { errorClass: submit.errorClass },
-    );
-  }
-
-  // Case E — reconciler exists but exposes no capability.  Manual.
-  return writeManual(
-    ctx,
-    activityId,
-    latest.attemptId,
-    ea.idempotencyKey,
-    ea.provider,
-    'none',
-    'UnknownProviderError',
-    `Reconciler for "${ea.provider}" exposes neither readOnlyLookup nor idempotentSubmit.`,
-    { reason: 'no_capability' },
+      'none',
+      'UnknownProviderError',
+      `Reconciler for "${ea.provider}" exposes neither readOnlyLookup nor idempotentSubmit.`,
+      { reason: 'no_capability' },
+    ),
   );
+}
+
+function outcome(o: ReconcileOutcome): ReconcileStepResult {
+  return { kind: 'outcome', outcome: o };
+}
+
+// ─── F1 recovery: a prior reconcileResult exists, terminal does not ─────────
+
+async function recoverFromReconcileResult(
+  ctx: ResumeContext,
+  activityId: string,
+  latest: AttemptState,
+  ea: NonNullable<AttemptState['effectAttempted']>,
+): Promise<ReconcileStepResult> {
+  const rr = latest.latestReconcileResult!;
+  switch (rr.decision) {
+    case 'completedByIdempotentSubmit': {
+      // Re-derive externalRefs from the recorded evidence.  We wrote it
+      // there during the first resume so this recovery is decoupled
+      // from the provider being reachable now.
+      const evidence = rr.evidence;
+      const externalRefs =
+        (evidence as { externalRefs?: Record<string, unknown> }).externalRefs ??
+        {};
+      const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
+      const outputHash = await sha256Hex(outputBuf);
+      const terminalEvent = (await ctx.log.append({
+        runId: ctx.runId,
+        type: 'activitySucceeded',
+        actor: 'system',
+        payload: {
+          activityId,
+          attemptId: latest.attemptId,
+          outputRef: {
+            outputHash: `sha256:${outputHash}`,
+            outputBytes: outputBuf.length,
+            outputSchemaVersion: 1,
+            contentType: 'application/json',
+          },
+          externalRefs,
+        },
+      })) as ActivitySucceededEvent;
+      return outcome({
+        activityId,
+        attemptId: latest.attemptId,
+        idempotencyKey: ea.idempotencyKey,
+        provider: ea.provider,
+        capability: rr.capability,
+        decision: 'completedByIdempotentSubmit',
+        evidence: rr.evidence,
+        terminalEvent,
+        reconcileEvent: null,
+        recovered: true,
+      });
+    }
+    case 'manual': {
+      const evidence = rr.evidence;
+      const errorCode =
+        (evidence as { errorCode?: string }).errorCode ?? 'UnknownProviderError';
+      const terminalEvent = (await ctx.log.append({
+        runId: ctx.runId,
+        type: 'activityFailed',
+        actor: 'system',
+        payload: {
+          activityId,
+          attemptId: latest.attemptId,
+          error: {
+            errorCode,
+            errorClass: 'manual',
+            errorMessage: `Recovered from prior crashed reconcile cycle (decision=manual, errorCode=${errorCode}).`,
+          },
+        },
+      })) as ActivityFailedEvent;
+      return outcome({
+        activityId,
+        attemptId: latest.attemptId,
+        idempotencyKey: ea.idempotencyKey,
+        provider: ea.provider,
+        capability: rr.capability,
+        decision: 'manual',
+        evidence: rr.evidence,
+        terminalEvent,
+        reconcileEvent: null,
+        recovered: true,
+      });
+    }
+    case 'freshRetry': {
+      // No terminal to write — scheduler picks up the dangling attempt
+      // (the prior reconcileResult survived the crash and is the
+      // authoritative decision).
+      return outcome({
+        activityId,
+        attemptId: latest.attemptId,
+        idempotencyKey: ea.idempotencyKey,
+        provider: ea.provider,
+        capability: rr.capability,
+        decision: 'freshRetry',
+        evidence: rr.evidence,
+        terminalEvent: null,
+        reconcileEvent: null,
+        recovered: true,
+      });
+    }
+    case 'replayed': {
+      // Replayed means a terminal already existed when reconcileResult
+      // was written.  If we landed here, that terminal got lost — which
+      // is a corrupt-log scenario, not a recoverable one.  Surface as
+      // manual to flag the inconsistency.
+      const terminalEvent = (await ctx.log.append({
+        runId: ctx.runId,
+        type: 'activityFailed',
+        actor: 'system',
+        payload: {
+          activityId,
+          attemptId: latest.attemptId,
+          error: {
+            errorCode: 'CorruptLog',
+            errorClass: 'manual',
+            errorMessage:
+              'Prior reconcileResult decision=replayed but no terminal event present — log inconsistency.',
+          },
+        },
+      })) as ActivityFailedEvent;
+      return outcome({
+        activityId,
+        attemptId: latest.attemptId,
+        idempotencyKey: ea.idempotencyKey,
+        provider: ea.provider,
+        capability: rr.capability,
+        decision: 'manual',
+        evidence: { ...rr.evidence, originalDecision: 'replayed' },
+        terminalEvent,
+        reconcileEvent: null,
+        recovered: true,
+      });
+    }
+  }
 }
 
 // ─── Event writers (one per terminal decision) ──────────────────────────────
@@ -357,9 +653,6 @@ async function writeCompletedByIdempotentSubmit(
     },
   })) as ReconcileResultEvent;
 
-  // Outcome is success — write activitySucceeded.  outputRef is a
-  // content-addressed reference to the externalRefs blob (same shape as
-  // executeSideEffect's success path).
   const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
   const outputHash = await sha256Hex(outputBuf);
   const terminalEvent = (await ctx.log.append({
@@ -389,6 +682,7 @@ async function writeCompletedByIdempotentSubmit(
     evidence,
     terminalEvent,
     reconcileEvent,
+    recovered: false,
   };
 }
 
@@ -423,6 +717,7 @@ async function writeFreshRetry(
     evidence,
     terminalEvent: null,
     reconcileEvent,
+    recovered: false,
   };
 }
 
@@ -473,6 +768,7 @@ async function writeManual(
     evidence,
     terminalEvent,
     reconcileEvent,
+    recovered: false,
   };
 }
 
