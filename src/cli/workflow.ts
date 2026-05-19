@@ -104,6 +104,18 @@ async function cmdWorkflowRun(rest: string[]): Promise<void> {
   if (!def) return;
   validateParams(def, params);
 
+  // Bootstrap the in-memory bot registry so hostExecutors like
+  // feishu-send can resolve `larkAppId` → Lark client.  IM path inherits
+  // the daemon's already-registered bots; the standalone CLI doesn't.
+  try {
+    const { registerBot, loadBotConfigs } = await import('../bot-registry.js');
+    for (const cfg of loadBotConfigs()) registerBot(cfg);
+  } catch {
+    // Missing/invalid bots.json is fine — workflows that don't touch
+    // Feishu still run; the host executor will surface a clear
+    // "Bot not registered" error if one does.
+  }
+
   const log = new EventLog(runId, getRunsDir());
   const botResolver: BotResolver = () => ({});
   const spawnSubagent = createStubSpawnFn(echoHandler);
