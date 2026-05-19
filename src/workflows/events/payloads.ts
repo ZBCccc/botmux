@@ -295,6 +295,47 @@ export const ResumeStartedPayload = z.object({
   lastSeenEventId: z.string(),
 });
 
+/**
+ * `reconcileResult.evidence` v0 convention (spec §6 Q4 — standardization
+ * deferred to v0.x+, but the per-provider shape used by the v0 runtime
+ * is fixed here so dashboards and resume recovery can parse it without
+ * provider-specific knowledge).
+ *
+ * Common keys (any provider, any decision):
+ *   - `externalRefs`?: Record<string, unknown>
+ *       Provider-returned ref (messageId / taskId / ...) — required
+ *       for `completedByIdempotentSubmit` decisions, recovery uses it
+ *       to materialize `activitySucceeded.payload.externalRefs`.
+ *   - `errorCode`?: string
+ *       Recorded errorCode for `manual` decisions — recovery uses it
+ *       to materialize `activityFailed.payload.error.errorCode`.
+ *
+ * Manual-only keys (decision='manual'):
+ *   - `reason`?: 'ttl_expired' | 'no_reconciler' | 'no_capability'
+ *                | 'input_unrecoverable' | 'missing_external_refs'
+ *   - `attemptedAtMs`, `nowMs`, `idempotencyTtlMs`?: number
+ *       Populated when reason='ttl_expired' for forensics.
+ *   - `originalDecision`?: ReconcileDecision
+ *       When recovery escalates from a corrupt prior decision (e.g.
+ *       replayed/manual without terminal), the original decision the
+ *       prior reconcile wrote is preserved here.
+ *   - `corruptReason`?: 'missing_external_refs'
+ *   - `reconcileEventId`?: string
+ *       eventId of the originating reconcileResult (recovery cross-ref).
+ *
+ * `freshRetry` evidence is provider-specific; v0 puts whatever the
+ * reconciler returned from `readOnlyLookup({ found: false })` here.
+ *
+ * Per-provider conventions (v0):
+ *   - `botmux-schedule` readOnlyLookup: `{ source: 'getTask',
+ *     returned: 'task' | 'undefined' }`
+ *   - `feishu-im` idempotentSubmit: `{ source: 'create-or-reply' }` or
+ *     similar; provider just returns externalRefs on success.
+ *
+ * Future work: lock these per-provider shapes via discriminated
+ * schemas keyed on `(decision, capability, provider)`.  Tracked in
+ * spec §6 Q4.
+ */
 export const ReconcileResultPayload = z.object({
   activityId: z.string(),
   idempotencyKey: z.string().min(1).max(50),

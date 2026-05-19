@@ -121,16 +121,111 @@ describe('cancel — requestCancel', () => {
     expect(snap.danglingCancels).toContain('a-1');
   });
 
-  it('replay does NOT auto-fan-out node-target cancel onto activities (Step 10 scheduler concern)', async () => {
+  it('replay fans out node-target cancel onto activities under that node (Step 10)', async () => {
     await bootstrap('a-1', 'at-1');
-    await requestCancel(log, {
+    const req = await requestCancel(log, {
       target: { kind: 'node', nodeId: 'n-1' },
       reason: 'node abort',
       by: 'sys',
     });
     const snap = replay(await log.readAll());
+    const cr = snap.activities.get('a-1')?.attempts[0].cancelRequest;
+    expect(cr).toMatchObject({
+      cancelOriginEventId: req.eventId,
+      requestedBy: 'sys',
+      reason: 'node abort',
+      delivered: false,
+    });
+    expect(snap.danglingCancels).toContain('a-1');
+  });
+
+  it('replay fan-out skips activities under a DIFFERENT node', async () => {
+    // Two activities on different nodes; cancel target = n-1, only a-1
+    // should be marked.
+    await log.append(runCreated);
+    await log.append(attemptCreated('a-1', 'at-1', 'n-1'));
+    await log.append(attemptCreated('a-2', 'at-2', 'n-2'));
+    await requestCancel(log, {
+      target: { kind: 'node', nodeId: 'n-1' },
+      reason: 'r',
+      by: 'b',
+    });
+    const snap = replay(await log.readAll());
+    expect(snap.activities.get('a-1')?.attempts[0].cancelRequest).toBeDefined();
+    expect(snap.activities.get('a-2')?.attempts[0].cancelRequest).toBeUndefined();
+    expect(snap.danglingCancels).toEqual(['a-1']);
+  });
+
+  it('replay fans out run-target cancel onto ALL active activities', async () => {
+    await log.append(runCreated);
+    await log.append(attemptCreated('a-1', 'at-1', 'n-1'));
+    await log.append(attemptCreated('a-2', 'at-2', 'n-2'));
+    await log.append(attemptCreated('a-3', 'at-3', 'n-3'));
+    const req = await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'kill it all',
+      by: 'sys',
+    });
+    const snap = replay(await log.readAll());
+    for (const id of ['a-1', 'a-2', 'a-3']) {
+      const cr = snap.activities.get(id)?.attempts[0].cancelRequest;
+      expect(cr?.cancelOriginEventId).toBe(req.eventId);
+    }
+    expect(new Set(snap.danglingCancels)).toEqual(new Set(['a-1', 'a-2', 'a-3']));
+  });
+
+  it('replay fan-out does NOT mark already-terminal activities', async () => {
+    await log.append(runCreated);
+    await log.append(attemptCreated('a-1', 'at-1'));
+    // Terminate a-1 BEFORE the cancel.
+    await log.append({
+      runId: RUN_ID,
+      type: 'activitySucceeded',
+      actor: 'worker',
+      payload: {
+        activityId: 'a-1',
+        attemptId: 'at-1',
+        outputRef: sampleOutputRef,
+      },
+    });
+    await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'r',
+      by: 'b',
+    });
+    const snap = replay(await log.readAll());
     expect(snap.activities.get('a-1')?.attempts[0].cancelRequest).toBeUndefined();
-    expect(snap.danglingCancels).not.toContain('a-1');
+    expect(snap.danglingCancels).toEqual([]);
+  });
+
+  it('replay fan-out does NOT mark activities created AFTER the cancel (scheduler responsibility)', async () => {
+    await log.append(runCreated);
+    await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'r',
+      by: 'b',
+    });
+    await log.append(attemptCreated('a-1', 'at-1'));
+    const snap = replay(await log.readAll());
+    expect(snap.activities.get('a-1')?.attempts[0].cancelRequest).toBeUndefined();
+  });
+
+  it('overlapping cancels keep the FIRST cancelOriginEventId', async () => {
+    await bootstrap('a-1', 'at-1');
+    const first = await requestCancel(log, {
+      target: { kind: 'activity', activityId: 'a-1' },
+      reason: 'first',
+      by: 'alice',
+    });
+    await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'second',
+      by: 'bob',
+    });
+    const snap = replay(await log.readAll());
+    const cr = snap.activities.get('a-1')?.attempts[0].cancelRequest;
+    expect(cr?.cancelOriginEventId).toBe(first.eventId);
+    expect(cr?.requestedBy).toBe('alice'); // first wins
   });
 });
 

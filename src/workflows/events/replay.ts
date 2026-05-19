@@ -644,28 +644,58 @@ export function replay(events: WorkflowEvent[]): Snapshot {
 
       // ─── Control ────────────────────────────────────────────────────
       case 'cancelRequested': {
-        // Step 9: project the request onto the targeted activity (or
-        // every activity, for run-level cancel).  Step 10 will refine
-        // the node→activity fan-out; for now we only project the
-        // direct activity-target form, which is what the host API
-        // emits in v0.  Node/run targets are recorded but do not
-        // automatically fan out into per-activity dangling state.
+        // Step 9 + Step 10: project the request onto the targeted
+        // entity.  Spec §2.5 cancel chain expects scheduler to "broadcast
+        // to all non-terminal nodes, send cancel to each running activity"
+        // — replay treats this as a deterministic semantic projection
+        // (no need to materialize per-activity events): a node-level
+        // cancel marks every in-flight activity linked to that node;
+        // a run-level cancel marks every in-flight activity.
+        //
+        // Activities created AFTER the cancelRequested are intentionally
+        // NOT auto-marked here — the scheduler should refuse to spawn
+        // new attempts under a cancelled run/node.  If it does anyway,
+        // those activities go through the regular WorkerCrashed/reconcile
+        // recovery paths.
         const p = (e as CancelRequestedEvent).payload as CancelRequestedEvent['payload'];
         if (!('ref' in p)) {
-          if (p.target.kind === 'activity') {
-            const act = getActivity(p.target.activityId);
+          const markActivity = (act: ActivityState) => {
             const at = currentAttempt(act);
-            if (at) {
-              at.cancelRequest = {
-                cancelOriginEventId: e.eventId,
-                requestedBy: p.by,
-                reason: p.reason,
-                delivered: at.cancelRequest?.delivered ?? false,
-              };
+            if (!at) return;
+            const isTerminal =
+              at.status === 'succeeded' ||
+              at.status === 'failed' ||
+              at.status === 'timedOut' ||
+              at.status === 'cancelled';
+            if (isTerminal) return; // cancel doesn't override terminals
+            // First cancel wins — later overlapping cancels don't rewrite
+            // the cancelOriginEventId so the audit chain stays pointing
+            // at the originating event.
+            if (at.cancelRequest) return;
+            at.cancelRequest = {
+              cancelOriginEventId: e.eventId,
+              requestedBy: p.by,
+              reason: p.reason,
+              delivered: false,
+            };
+          };
+          switch (p.target.kind) {
+            case 'activity': {
+              markActivity(getActivity(p.target.activityId));
+              break;
+            }
+            case 'node': {
+              const nodeId = p.target.nodeId;
+              for (const act of activities.values()) {
+                if (act.ownerNodeId === nodeId) markActivity(act);
+              }
+              break;
+            }
+            case 'run': {
+              for (const act of activities.values()) markActivity(act);
+              break;
             }
           }
-          // node/run targets: recorded for audit; scheduler (Step 10)
-          // owns the fan-out decision.
         }
         break;
       }

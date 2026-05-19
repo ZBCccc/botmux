@@ -1450,9 +1450,11 @@ describe('resume — Step 9: dangling cancel recovery', () => {
     expect(second.cancelRecoveryOutcomes).toEqual([]);
   });
 
-  it('node/run-target cancel does NOT trigger activity recovery in v0 (Step 10 scheduler concern)', async () => {
+  it('node-target cancel fans out to activities under that node (Step 10)', async () => {
+    // Step 10: replay-level fan-out marks activities under a node-cancel
+    // as cancel-pending; resume completes them via activityCanceled.
     await bootstrapWith(
-      attemptCreated('a-1', 'at-1'),
+      attemptCreated('a-1', 'at-1', 'n-1'),
       {
         runId: RUN_ID,
         type: 'cancelRequested',
@@ -1470,9 +1472,88 @@ describe('resume — Step 9: dangling cancel recovery', () => {
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
-    expect(r.cancelRecoveryOutcomes).toEqual([]);
-    // The activity is still dangling; gets WorkerCrashed because there
-    // was no fan-out from node→activity in v0.  Step 10 will refine.
+    expect(r.cancelRecoveryOutcomes).toHaveLength(1);
+    expect(r.cancelRecoveryOutcomes[0].activityId).toBe('a-1');
+    expect(r.workerCrashedOutcomes).toEqual([]);
+  });
+
+  it('run-target cancel fans out to ALL in-flight activities (Step 10)', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1', 'n-1'),
+      attemptCreated('a-2', 'at-2', 'n-2'),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'run', runId: RUN_ID },
+          reason: 'kill run',
+          by: 'b',
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.cancelRecoveryOutcomes).toHaveLength(2);
+    expect(new Set(r.cancelRecoveryOutcomes.map((o) => o.activityId))).toEqual(
+      new Set(['a-1', 'a-2']),
+    );
+    expect(r.workerCrashedOutcomes).toEqual([]);
+  });
+});
+
+// ─── Step 10: workerLost integration ────────────────────────────────────────
+
+describe('resume — Step 10: workerLost recovery (Step 7 handles consequences)', () => {
+  it('workerLost + dangling effectAttempted → reconcile path (Step 7) handles it', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_x', 1, Number.MAX_SAFE_INTEGER),
+      {
+        runId: RUN_ID,
+        type: 'workerLost',
+        actor: 'system',
+        payload: { workerId: 'w-7', lostActivityIds: ['a-1'] },
+      },
+    );
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      async readOnlyLookup() {
+        return { found: true, externalRefs: { taskId: 'wf_x' } };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+    });
+    expect(r.reconcileOutcomes).toHaveLength(1);
+    expect(r.reconcileOutcomes[0].decision).toBe('completedByIdempotentSubmit');
+    expect(r.workerCrashedOutcomes).toEqual([]);
+  });
+
+  it('workerLost + dangling pure activity → WorkerCrashed path', async () => {
+    await bootstrapWith(
+      attemptCreated('a-pure', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'workerLost',
+        actor: 'system',
+        payload: { workerId: 'w-7', lostActivityIds: ['a-pure'] },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
     expect(r.workerCrashedOutcomes).toHaveLength(1);
+    expect(r.workerCrashedOutcomes[0].activityId).toBe('a-pure');
   });
 });
