@@ -1,9 +1,8 @@
-import { randomUUID } from 'node:crypto';
-
 import { loadBotConfigs, getAllBots } from '../../bot-registry.js';
 import { EventLog } from '../../workflows/events/append.js';
 import { loadWorkflowDefinition } from '../../workflows/loader.js';
 import { getRunsDir } from '../../workflows/runs-dir.js';
+import { mintWorkflowRunId } from '../../workflows/run-id.js';
 import { createRun, type BotResolver } from '../../workflows/run-init.js';
 import { runLoop, type RunLoopResult } from '../../workflows/loop.js';
 import { createStubSpawnFn } from '../../workflows/spawn-bot.js';
@@ -170,9 +169,7 @@ export async function executeWorkflowCommand(
 }
 
 export function createWorkflowRunId(workflowId: string, nowMs = Date.now()): string {
-  const safeWorkflowId = workflowId.replace(/[^A-Za-z0-9_.-]/g, '_');
-  const ts = new Date(nowMs).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
-  return `workflow-${safeWorkflowId}-${ts}-${randomUUID().slice(0, 8)}`;
+  return mintWorkflowRunId(workflowId, nowMs);
 }
 
 export function resolveBotSnapshot(botName: string): BotSnapshot | undefined {

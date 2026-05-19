@@ -10,12 +10,11 @@
  * keeps the CLI route the simplest possible smoke test.
  */
 
-import { randomUUID } from 'node:crypto';
-
 import { EventLog } from '../workflows/events/append.js';
 import { parseWorkflowDefinition } from '../workflows/definition.js';
 import { loadWorkflowDefinition } from '../workflows/loader.js';
 import { runLoop } from '../workflows/loop.js';
+import { mintWorkflowRunId } from '../workflows/run-id.js';
 import { createRun, type BotResolver } from '../workflows/run-init.js';
 import { getRunsDir } from '../workflows/runs-dir.js';
 import {
@@ -93,7 +92,7 @@ async function cmdWorkflowRun(rest: string[]): Promise<void> {
     console.error('用法: botmux workflow run <id> [--param key=value ...]');
     process.exit(1);
   }
-  const runId = argValue(rest, '--run-id') ?? mintRunId(id);
+  const runId = argValue(rest, '--run-id') ?? mintWorkflowRunId(id);
   const params = collectParams(rest);
 
   const def = await loadWorkflowDefinition(id).catch((err: Error) => {
@@ -134,11 +133,6 @@ const echoHandler: StubSpawnHandler = (input) => ({
   bot: input.botName,
   activityId: input.activityId,
 });
-
-function mintRunId(workflowId: string): string {
-  const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  return `${workflowId}-${ts}-${randomUUID().slice(0, 8)}`;
-}
 
 function collectParams(rest: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};

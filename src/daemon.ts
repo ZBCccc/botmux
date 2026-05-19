@@ -314,11 +314,10 @@ export function attachWorkflowEventWatcher(runId: string, ctx?: WorkflowRuntimeC
   return watcher;
 }
 
-async function driveWorkflowRun(runId: string): Promise<RunLoopResult | undefined> {
+async function driveWorkflowRun(runId: string): Promise<RunLoopResult> {
   const entry = workflowRuns.get(runId);
   if (!entry) {
-    logger.warn(`[workflow:${runId}] re-entry requested but runtime context is not registered`);
-    return undefined;
+    throw new Error(`workflow runtime context not registered: ${runId}`);
   }
   if (entry.running) return entry.running;
 
@@ -365,10 +364,7 @@ async function handleWorkflowCommandIfAny(
     },
     {
       attachWorkflowEventWatcher,
-      runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId).then((r) => {
-        if (!r) throw new Error(`workflow runtime context not registered: ${ctx.log.runId}`);
-        return r;
-      }),
+      runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId),
       onRunCreated: async (info) => {
         try {
           await sessionReply(
@@ -404,7 +400,11 @@ function formatWorkflowCommandResult(result: Extract<WorkflowCommandResult, { ok
     result.loopResult.reason === 'awaiting-wait'
       ? '等待审批'
       : result.loopResult.reason;
-  return `Workflow loop stopped: ${status}\nrunId: ${result.runId}`;
+  const next =
+    result.loopResult.reason === 'awaiting-wait'
+      ? '\n请在群里查看审批卡，点击后 workflow 会继续执行。'
+      : '';
+  return `Workflow loop stopped: ${status}\nrunId: ${result.runId}${next}`;
 }
 
 function getActiveCount(): number {
