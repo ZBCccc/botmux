@@ -2648,15 +2648,11 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   let botEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
-  const botByCli = new Map<string, BotInfoEntry>();
-  for (const b of botEntries) botByCli.set(b.cliId, b);
-
   try {
     const { listChatBotMembers } = await import('./im/lark/client.js');
     const chatBots = await listChatBotMembers(appId, s.chatId);
     const result = chatBots.map(cb => {
-      const info = botByCli.get(cb.name);
-      return { name: cb.displayName, openId: cb.openId, isSelf: info?.larkAppId === appId };
+      return { name: cb.displayName, openId: cb.openId, isSelf: cb.larkAppId === appId };
     });
     console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
   } catch (err: any) {
