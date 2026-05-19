@@ -1,8 +1,7 @@
-import { join } from 'node:path';
-import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { EventLog } from '../../workflows/events/append.js';
+import { getRunsDir } from '../../workflows/runs-dir.js';
 import {
   resolveWait,
   type ResolveWaitInput,
@@ -42,7 +41,7 @@ export function isWorkflowApprovalAction(action?: string): boolean {
 }
 
 export function workflowRunsDir(): string {
-  return process.env.WORKFLOW_RUNS_DIR ?? join(config.session.dataDir, 'workflow-runs');
+  return getRunsDir();
 }
 
 export function workflowFrozenStoreId(runId: string): string {

@@ -70,10 +70,12 @@ import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoF
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
+import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
@@ -271,6 +273,32 @@ function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
+}
+
+export function attachWorkflowEventWatcher(runId: string): WorkflowEventWatcher {
+  const existing = workflowEventWatchers.get(runId);
+  if (existing) return existing;
+  const watcher = new WorkflowEventWatcher(
+    runId,
+    async (event) => {
+      await handleWorkflowFanoutEvent(event);
+    },
+    {
+      onError: (err) => logger.warn(
+        `[workflow:${runId}] fanout failed: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    },
+  );
+  workflowEventWatchers.set(runId, watcher);
+  watcher.ready.catch((err) => {
+    workflowEventWatchers.delete(runId);
+    logger.warn(
+      `[workflow:${runId}] watcher failed to start: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  });
+  return watcher;
 }
 
 function getActiveCount(): number {
@@ -1215,6 +1243,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     shuttingDown = true;
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
     scheduler.stopScheduler();
+    for (const watcher of workflowEventWatchers.values()) watcher.close();
+    workflowEventWatchers.clear();
     clearInterval(descriptorHeartbeat);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });

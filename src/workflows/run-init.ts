@@ -21,6 +21,11 @@ import { canonicalJsonStringify, computeRevisionId } from './definition.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
 import type { BotSnapshot, OutputRef } from './events/payloads.js';
+import {
+  snapshotWorkflowDefinition,
+  writeRunChatBinding,
+  type RunChatBinding,
+} from './loader.js';
 import type {
   RunCreatedEvent,
   RunStartedEvent,
@@ -47,6 +52,8 @@ export type CreateRunInput = {
    * spec (e.g. from a registry cache).  Defaults to `computeRevisionId(def)`.
    */
   revisionId?: string;
+  /** Chat target used by fan-out to push approval cards for this run. */
+  chatBinding?: RunChatBinding;
 };
 
 export type CreateRunResult = {
@@ -59,6 +66,11 @@ export async function createRun(
   log: EventLog,
   input: CreateRunInput,
 ): Promise<CreateRunResult> {
+  await snapshotWorkflowDefinition(log.runId, input.def, { runDir: log.runDir });
+  if (input.chatBinding) {
+    await writeRunChatBinding(log.runId, input.chatBinding, { runDir: log.runDir });
+  }
+
   const inputRef = await writeRunInputBlob(log, input.params);
   const revisionId = input.revisionId ?? computeRevisionId(input.def);
   const botSnapshots = collectBotSnapshots(input.def, input.botResolver);
