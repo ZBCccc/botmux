@@ -19,10 +19,11 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
+import { writeEffectInputSidecar } from './effect-input.js';
 import { writeJsonBlob } from './blob.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
-import type { BotSnapshot, ErrorClass, OutputRef } from './events/payloads.js';
+import type { BotSnapshot, ErrorClass, ErrorCode, OutputRef } from './events/payloads.js';
 import { replay, type Snapshot } from './events/replay.js';
 import type {
   ActivityFailedEvent,
@@ -43,6 +44,9 @@ import type {
   DispatchWorkAction,
 } from './orchestrator.js';
 import { createWait } from './wait.js';
+import { executeSideEffect } from './hostExecutors/protocol.js';
+import type { HostExecutorRegistry, RegisteredHostExecutor } from './hostExecutors/registry.js';
+import type { HostExecutorContext } from './hostExecutors/types.js';
 
 // ─── Worker spawn contract ────────────────────────────────────────────────
 
@@ -101,6 +105,7 @@ export type WorkflowRuntimeContext = {
   log: EventLog;
   def: WorkflowDefinition;
   spawnSubagent: WorkerSpawnFn;
+  hostExecutors?: HostExecutorRegistry;
   /** Wall-clock source — injectable for deterministic tests. */
   now?: () => number;
 };
@@ -164,6 +169,50 @@ async function writeSessionSidecar(
   const dir = await attemptSidecarDir(log, activityId, attemptId);
   const file = join(dir, 'session.json');
   await fs.writeFile(file, JSON.stringify(session, null, 2), 'utf-8');
+}
+
+async function resolveWorkflowIdentity(
+  ctx: WorkflowRuntimeContext,
+  snapshot?: Snapshot,
+): Promise<{ workflowId: string; revisionId: string }> {
+  const snap = snapshot ?? replay(await ctx.log.readAll());
+  if (!snap.run.workflowId || !snap.run.revisionId) {
+    throw new Error(`workflow identity missing for run ${ctx.log.runId}`);
+  }
+  return { workflowId: snap.run.workflowId, revisionId: snap.run.revisionId };
+}
+
+async function failHostExecutor(
+  ctx: WorkflowRuntimeContext,
+  activityId: string,
+  attemptId: string,
+  error: { errorCode: ErrorCode; errorClass: ErrorClass; errorMessage: string },
+): Promise<Extract<DispatchWorkResult, { kind: 'failed' }>> {
+  await ctx.log.append({
+    runId: ctx.log.runId,
+    type: 'activityFailed',
+    actor: 'scheduler',
+    payload: {
+      activityId,
+      attemptId,
+      error,
+    },
+  });
+  return {
+    kind: 'failed',
+    attemptId,
+    errorClass: error.errorClass,
+    errorCode: error.errorCode,
+    errorMessage: error.errorMessage,
+  };
+}
+
+function executeRegisteredHostExecutor<I, O>(
+  registered: RegisteredHostExecutor<I, O>,
+  hostCtx: HostExecutorContext,
+  input: unknown,
+) {
+  return executeSideEffect(hostCtx, input as I, registered.executor);
 }
 
 // ─── dispatchGate ─────────────────────────────────────────────────────────
@@ -256,10 +305,6 @@ export async function dispatchWork(
   const attemptId = workAttemptId(action.activityId, attemptNumber);
   const node = action.node;
 
-  // hostExecutor path: until Slice E wires the executor registry, write a
-  // terminal `activityFailed{manual}` so the orchestrator can advance past
-  // the node (otherwise next tick re-emits the same dispatchWork → infinite
-  // loop).  Codex round-1 blocker on Slice B.
   if (node.type === 'hostExecutor') {
     const inputRef = await writeJsonBlob(ctx.log, {
       kind: 'hostExecutor',
@@ -278,27 +323,64 @@ export async function dispatchWork(
         inputRef,
       },
     });
-    const errorMessage = `hostExecutor '${node.executor}' not registered — executor registry not yet wired (Slice E).`;
-    await ctx.log.append({
-      runId: ctx.log.runId,
-      type: 'activityFailed',
-      actor: 'scheduler',
-      payload: {
+
+    const registered = ctx.hostExecutors?.get(node.executor);
+    if (!registered) {
+      return failHostExecutor(ctx, action.activityId, attemptId, {
+        errorCode: 'UnknownProviderError',
+        errorClass: 'manual',
+        errorMessage: `hostExecutor '${node.executor}' is not registered.`,
+      });
+    }
+
+    let parsedInput: unknown;
+    try {
+      parsedInput = registered.parseInput(node.input);
+    } catch (err) {
+      return failHostExecutor(ctx, action.activityId, attemptId, {
+        errorCode: 'InputValidationFailed',
+        errorClass: 'userFault',
+        errorMessage: truncateRuntimeErrorMessage(err instanceof Error ? err.message : String(err)),
+      });
+    }
+
+    await writeEffectInputSidecar(ctx.log, action.activityId, attemptId, parsedInput);
+    const identity = await resolveWorkflowIdentity(ctx, options.snapshot);
+    const result = await executeRegisteredHostExecutor(
+      registered,
+      {
+        log: ctx.log,
+        runId: ctx.log.runId,
+        workflowId: identity.workflowId,
+        revisionId: identity.revisionId,
+        nodeId: action.nodeId,
         activityId: action.activityId,
         attemptId,
-        error: {
-          errorCode: 'UnknownProviderError',
-          errorClass: 'manual',
-          errorMessage,
-        },
       },
-    });
+      parsedInput,
+    );
+    if (result.ok) {
+      if ('ref' in result.event.payload) {
+        throw new Error('hostExecutor activitySucceeded unexpectedly used payload ref');
+      }
+      return {
+        kind: 'succeeded',
+        attemptId,
+        outputRef: result.event.payload.outputRef,
+        session: {
+          sessionId: `host-${action.activityId}-${attemptId}`,
+          botName: node.executor,
+          startedAt: nowMs(ctx),
+          endedAt: nowMs(ctx),
+        },
+      };
+    }
     return {
       kind: 'failed',
       attemptId,
-      errorClass: 'manual',
-      errorCode: 'UnknownProviderError',
-      errorMessage,
+      errorClass: result.error.errorClass,
+      errorCode: result.error.errorCode,
+      errorMessage: result.error.errorMessage,
     };
   }
 
@@ -387,6 +469,11 @@ export async function dispatchWork(
     errorMessage: spawnResult.errorMessage,
     session: spawnResult.session,
   };
+}
+
+function truncateRuntimeErrorMessage(msg: string): string {
+  const max = 2048;
+  return msg.length > max ? msg.slice(0, max - 3) + '...' : msg;
 }
 
 // ─── completeNodeSucceeded ───────────────────────────────────────────────

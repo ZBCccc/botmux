@@ -1,8 +1,12 @@
+import { z } from 'zod';
+
 import {
   createTask,
+  getTask,
   IdempotencyConflictError,
 } from '../../services/schedule-store.js';
 import type { ParsedSchedule } from '../../types.js';
+import type { ProviderReconciler } from '../resume.js';
 import type { SideEffectingExecutor } from './types.js';
 
 export type ScheduleInput = {
@@ -28,6 +32,32 @@ export type ScheduleInput = {
 export type ScheduleOutput = {
   taskId: string;
 };
+
+const ParsedScheduleSchema = z.object({
+  kind: z.enum(['once', 'interval', 'cron']),
+  runAt: z.string().optional(),
+  minutes: z.number().optional(),
+  expr: z.string().optional(),
+  display: z.string(),
+});
+
+const ScheduleInputSchema = z.object({
+  name: z.string().min(1),
+  schedule: z.string().min(1),
+  parsed: ParsedScheduleSchema,
+  prompt: z.string(),
+  workingDir: z.string().min(1),
+  chatId: z.string().min(1),
+  rootMessageId: z.string().optional(),
+  scope: z.enum(['thread', 'chat']).optional(),
+  larkAppId: z.string().optional(),
+  repeat: z.object({ times: z.number().int().nonnegative().nullable() }).optional(),
+  deliver: z.enum(['origin', 'local']).optional(),
+});
+
+export function parseScheduleInput(input: unknown): ScheduleInput {
+  return ScheduleInputSchema.parse(input);
+}
 
 /**
  * `botmux-schedule` hostExecutor.  Calls `schedule-store.createTask`
@@ -98,5 +128,25 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       };
     }
     return null;
+  },
+};
+
+export const botmuxScheduleReconciler: ProviderReconciler = {
+  provider: 'botmux-schedule',
+
+  async readOnlyLookup(idempotencyKey) {
+    const task = getTask(idempotencyKey);
+    if (!task) {
+      return {
+        found: false,
+        evidence: { source: 'getTask', returned: 'undefined' },
+      };
+    }
+    const externalRefs = { taskId: task.id };
+    return {
+      found: true,
+      externalRefs,
+      evidence: { source: 'getTask', externalRefs },
+    };
   },
 };

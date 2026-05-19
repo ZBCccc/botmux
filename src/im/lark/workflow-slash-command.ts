@@ -6,6 +6,7 @@ import { mintWorkflowRunId } from '../../workflows/run-id.js';
 import { createRun, type BotResolver } from '../../workflows/run-init.js';
 import { runLoop, type RunLoopResult } from '../../workflows/loop.js';
 import { createStubSpawnFn } from '../../workflows/spawn-bot.js';
+import { createDefaultHostExecutorRegistry } from '../../workflows/hostExecutors/registry.js';
 import type { WorkflowDefinition, ParamDef } from '../../workflows/definition.js';
 import type { BotSnapshot } from '../../workflows/events/payloads.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from '../../workflows/runtime.js';
@@ -135,7 +136,12 @@ export async function executeWorkflowCommand(
     const botResolver = deps.botResolver ?? resolveBotSnapshot;
     const create = deps.createRunFn ?? createRun;
     const spawnSubagent = deps.spawnSubagent ?? defaultStubSpawn;
-    const ctx: WorkflowRuntimeContext = { log, def, spawnSubagent };
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def,
+      spawnSubagent,
+      hostExecutors: createDefaultHostExecutorRegistry(),
+    };
 
     await create(log, {
       def,

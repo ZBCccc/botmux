@@ -31,6 +31,11 @@ import {
   type WorkerSpawnFn,
 } from '../src/workflows/runtime.js';
 import { resolveWait } from '../src/workflows/wait.js';
+import { loadEffectInputSidecar } from '../src/workflows/effect-input.js';
+import type {
+  HostExecutorRegistry,
+  RegisteredHostExecutor,
+} from '../src/workflows/hostExecutors/registry.js';
 
 const RUN_ID = 'run-runtime-test-01';
 const noopResolver: BotResolver = () => ({});
@@ -88,6 +93,35 @@ const crashSpawn: WorkerSpawnFn = async () => ({
   errorClass: 'retryable',
   errorMessage: 'fake crash',
 });
+
+function fakeHostRegistry(): HostExecutorRegistry {
+  const registered: RegisteredHostExecutor<{ msg: string }, { ok: true }> = {
+    parseInput(input) {
+      if (
+        typeof input !== 'object' ||
+        input === null ||
+        typeof (input as { msg?: unknown }).msg !== 'string'
+      ) {
+        throw new Error('msg is required');
+      }
+      return { msg: (input as { msg: string }).msg };
+    },
+    executor: {
+      provider: 'test-host',
+      idempotencyTtlMs: 60_000,
+      canonicalInput(input) {
+        return input;
+      },
+      async invoke(input, idempotencyKey) {
+        return {
+          output: { ok: true },
+          externalRefs: { idempotencyKey, msg: input.msg },
+        };
+      },
+    },
+  };
+  return new Map([['test-host', registered]]);
+}
 
 let baseDir: string;
 beforeEach(() => {
@@ -246,7 +280,7 @@ describe('dispatchWork — subagent', () => {
     expect(p.error.errorClass).toBe('retryable');
   });
 
-  it('hostExecutor writes attemptCreated + activityFailed{manual} terminal in v0', async () => {
+  it('unknown hostExecutor writes attemptCreated + activityFailed{manual} terminal', async () => {
     const def = parseWorkflowDefinition({
       workflowId: 'wf-host',
       version: 1,
@@ -280,6 +314,96 @@ describe('dispatchWork — subagent', () => {
     const snap = replay(events);
     const next = decideNextActions(snap, def);
     expect(next.map((a) => a.kind)).toEqual(['completeNodeFailed']);
+  });
+
+  it('registered hostExecutor writes effectAttempted + activitySucceeded and effect-input sidecar', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-host',
+      version: 1,
+      nodes: {
+        h: {
+          type: 'hostExecutor',
+          executor: 'test-host',
+          input: { msg: 'hi' },
+        },
+      },
+    });
+    const { log, ctx } = await bootstrap(def, successSpawn);
+    ctx.hostExecutors = fakeHostRegistry();
+
+    const result = await dispatchWork(ctx, {
+      kind: 'dispatchWork',
+      nodeId: 'h',
+      activityId: workActivityId(RUN_ID, 'h'),
+      node: def.nodes.h!,
+    });
+
+    expect(result.kind).toBe('succeeded');
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'runStarted',
+      'attemptCreated',
+      'effectAttempted',
+      'activitySucceeded',
+    ]);
+    const effect = events.find((e) => e.type === 'effectAttempted')!;
+    expect(effect.payload).toMatchObject({
+      provider: 'test-host',
+      inputHash: expect.stringMatching(/^sha256:/),
+    });
+    const success = events.find((e) => e.type === 'activitySucceeded')!;
+    expect(success.payload).toMatchObject({
+      externalRefs: {
+        msg: 'hi',
+      },
+    });
+    expect(await loadEffectInputSidecar(log, workActivityId(RUN_ID, 'h'), result.attemptId)).toEqual({
+      msg: 'hi',
+    });
+  });
+
+  it('hostExecutor input validation fails before effectAttempted', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-host',
+      version: 1,
+      nodes: {
+        h: {
+          type: 'hostExecutor',
+          executor: 'test-host',
+          input: { wrong: 'shape' },
+        },
+      },
+    });
+    const { log, ctx } = await bootstrap(def, successSpawn);
+    ctx.hostExecutors = fakeHostRegistry();
+
+    const result = await dispatchWork(ctx, {
+      kind: 'dispatchWork',
+      nodeId: 'h',
+      activityId: workActivityId(RUN_ID, 'h'),
+      node: def.nodes.h!,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'failed',
+      errorCode: 'InputValidationFailed',
+      errorClass: 'userFault',
+    });
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'runStarted',
+      'attemptCreated',
+      'activityFailed',
+    ]);
+    const failed = events.find((e) => e.type === 'activityFailed')!;
+    expect(failed.payload).toMatchObject({
+      error: {
+        errorCode: 'InputValidationFailed',
+        errorClass: 'userFault',
+      },
+    });
   });
 });
 

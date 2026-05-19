@@ -419,6 +419,42 @@ describe('botmuxScheduleExecutor invoke()', () => {
     expect(cls?.errorCode).toBe('IdempotencyConflict');
     expect(cls?.errorClass).toBe('fatal');
   });
+
+  it('reconciler readOnlyLookup returns task externalRefs by idempotency key', async () => {
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { session: { get dataDir() { return tempDataDir; } } },
+    }));
+    vi.doMock('../src/utils/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+
+    const { botmuxScheduleExecutor, botmuxScheduleReconciler } = await import(
+      '../src/workflows/hostExecutors/botmux-schedule.js'
+    );
+    const idemKey = 'wf_test_schedule_lookup';
+    await botmuxScheduleExecutor.invoke(
+      {
+        name: 'Lookup',
+        schedule: '0 9 * * *',
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '0 9 * * *' },
+        prompt: 'do',
+        workingDir: '/wd',
+        chatId: 'oc_x',
+      },
+      idemKey,
+    );
+
+    await expect(botmuxScheduleReconciler.readOnlyLookup!(idemKey, undefined)).resolves.toMatchObject({
+      found: true,
+      externalRefs: { taskId: idemKey },
+      evidence: { source: 'getTask', externalRefs: { taskId: idemKey } },
+    });
+    await expect(botmuxScheduleReconciler.readOnlyLookup!('missing', undefined)).resolves.toMatchObject({
+      found: false,
+      evidence: { source: 'getTask', returned: 'undefined' },
+    });
+  });
 });
 
 // ─── feishuSendExecutor error classifier ────────────────────────────────────
