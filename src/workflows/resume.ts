@@ -34,6 +34,7 @@
  */
 
 import type { EventLog } from './events/append.js';
+import { computeInputHash } from './events/idempotency.js';
 import { replay, type Snapshot, type AttemptState } from './events/replay.js';
 import type {
   ActivityCanceledEvent,
@@ -103,6 +104,18 @@ export interface ProviderReconciler {
    * second submit returns the original ref instead of a duplicate.
    */
   idempotentSubmit?(idempotencyKey: string, input: unknown): Promise<IdempotentSubmitResult>;
+  /**
+   * Canonical form of the loaded effect input — used at resume time to
+   * recompute `inputHash` and compare against `effectAttempted.inputHash`.
+   * MUST mirror the executor's `canonicalInput` exactly; mismatched
+   * canonicalization across resume/dispatch silently breaks idempotency.
+   *
+   * Reconcilers with `requiresEffectInput=true` SHOULD implement this;
+   * resume writes `IdempotencyInputMismatch/manual` if a tampered or
+   * drifted sidecar would otherwise reach the provider with a different
+   * body than the original attempt promised.
+   */
+  canonicalInput?(input: unknown): unknown;
 }
 
 export type ResumeContext = {
@@ -881,6 +894,52 @@ async function captureEvidence(
         : `Reconciler "${ea.provider}" requires effect input, but ctx.loadEffectInput returned undefined / was not provided.`,
       { reason: 'input_unrecoverable', hadLoader: !!ctx.loadEffectInput, ...extra },
     );
+  }
+
+  // F2.5: inputHash guard.  When a sidecar was successfully loaded, the
+  // body we're about to hand the reconciler MUST canonicalize to the
+  // hash that was recorded on `effectAttempted`.  Sidecar tampering,
+  // schema drift, or manual edits would otherwise silently produce a
+  // re-submit with a different body — Feishu would dedupe by uuid and
+  // return the original messageId, but our workflow audit trail would
+  // record the tampered input as "successful".
+  //
+  // Only enforced when the reconciler declares `canonicalInput` so the
+  // contract is opt-in per provider.  For `requiresEffectInput=true`
+  // reconcilers without a `canonicalInput`, fail loud: this is a
+  // config error (a Feishu-flavored reconciler that can't canonicalize
+  // its own input).
+  if (effectInput !== undefined) {
+    if (reconciler.canonicalInput) {
+      const recomputed = computeInputHash(reconciler.canonicalInput(effectInput));
+      if (recomputed !== ea.inputHash) {
+        return await writeReconcileResultManual(
+          ctx,
+          activityId,
+          ea,
+          'none',
+          'IdempotencyInputMismatch',
+          `Reconciler "${ea.provider}" loaded effect input whose canonical hash (${recomputed}) does not match the recorded effectAttempted.inputHash (${ea.inputHash}). Sidecar tampered or schema drifted; not calling provider.`,
+          {
+            reason: 'inputhash_mismatch',
+            recordedHash: ea.inputHash,
+            recomputedHash: recomputed,
+            source: 'hashGuard',
+            ...extra,
+          },
+        );
+      }
+    } else if (reconciler.requiresEffectInput) {
+      return await writeReconcileResultManual(
+        ctx,
+        activityId,
+        ea,
+        'none',
+        'IdempotencyInputMismatch',
+        `Reconciler "${ea.provider}" declares requiresEffectInput=true but exposes no canonicalInput — cannot verify the loaded sidecar matches effectAttempted.inputHash. Not calling provider.`,
+        { reason: 'no_canonicalInput', source: 'hashGuard', ...extra },
+      );
+    }
   }
 
   // Case C — readOnlyLookup available.  Prefer it: pure read, no side

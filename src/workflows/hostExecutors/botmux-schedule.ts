@@ -134,6 +134,16 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
 export const botmuxScheduleReconciler: ProviderReconciler = {
   provider: 'botmux-schedule',
 
+  // Schedule reconciler doesn't load effect input (idempotencyKey is
+  // self-sufficient), so the resume-side hash guard never fires.  We
+  // still expose `canonicalInput` for interface uniformity — anyone
+  // re-using the reconciler in a context that DOES load sidecars (e.g.
+  // future ScheduleStore variants requiring body verification) gets the
+  // same check for free.
+  canonicalInput(input) {
+    return botmuxScheduleExecutor.canonicalInput(input as ScheduleInput);
+  },
+
   async readOnlyLookup(idempotencyKey) {
     const task = getTask(idempotencyKey);
     if (!task) {

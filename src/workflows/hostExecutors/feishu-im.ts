@@ -15,6 +15,22 @@ export const feishuImReconciler: ProviderReconciler = {
   provider: 'feishu-im',
   requiresEffectInput: true,
 
+  canonicalInput(input) {
+    // The hash guard in resume needs to canonicalize via the SAME shape
+    // the original executor used.  Dispatch by input discriminator —
+    // identical logic to idempotentSubmit's routing.
+    if (isRecord(input) && Object.prototype.hasOwnProperty.call(input, 'rootMessageId')) {
+      return feishuReplyReconciler.canonicalInput!(input);
+    }
+    if (isRecord(input) && Object.prototype.hasOwnProperty.call(input, 'chatId')) {
+      return feishuSendReconciler.canonicalInput!(input);
+    }
+    // Unknown shape: return the input verbatim so the recomputed hash
+    // ends up SHA-stable but different from the original; the guard
+    // surfaces this as a mismatch rather than swallowing it.
+    return input;
+  },
+
   async idempotentSubmit(idempotencyKey, input) {
     if (isRecord(input) && Object.prototype.hasOwnProperty.call(input, 'rootMessageId')) {
       return feishuReplyReconciler.idempotentSubmit!(idempotencyKey, input);

@@ -80,6 +80,10 @@ export const feishuSendReconciler: ProviderReconciler = {
   provider: 'feishu-im',
   requiresEffectInput: true,
 
+  canonicalInput(input) {
+    return feishuSendExecutor.canonicalInput(input as FeishuSendInput);
+  },
+
   async idempotentSubmit(idempotencyKey, input) {
     let parsed: FeishuSendInput;
     try {

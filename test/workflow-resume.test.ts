@@ -65,6 +65,7 @@ function effectAttempted(
   idempotencyKey: string,
   attemptedAtMs?: number,
   ttlMs?: number,
+  inputHash?: string,
 ): EventDraft {
   return {
     runId: RUN_ID,
@@ -74,7 +75,7 @@ function effectAttempted(
       activityId,
       attemptId,
       idempotencyKey,
-      inputHash: 'sha256:' + 'd'.repeat(64),
+      inputHash: inputHash ?? 'sha256:' + 'd'.repeat(64),
       idempotencyTtlMs: ttlMs ?? PROVIDER_TTL_MS['feishu-im'],
       provider,
     },
@@ -938,14 +939,29 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
   });
 
   it('passes the loaded input to idempotentSubmit', async () => {
+    const loaded = { chatId: 'oc_abc', content: 'hi' };
+    // Hash guard added in inputHash slice: provide canonicalInput on the
+    // reconciler AND seed effectAttempted with the matching hash so the
+    // guard lets the call through.  Identity canonical = literal input.
+    const { computeInputHash } = await import('../src/workflows/events/idempotency.js');
+    const matchingHash = computeInputHash(loaded);
     await bootstrapWith(
       attemptCreated('a-feishu', 'at-1'),
-      effectAttempted('a-feishu', 'at-1', 'feishu-im', 'wf_p', 1000, PROVIDER_TTL_MS['feishu-im']),
+      effectAttempted(
+        'a-feishu',
+        'at-1',
+        'feishu-im',
+        'wf_p',
+        1000,
+        PROVIDER_TTL_MS['feishu-im'],
+        matchingHash,
+      ),
     );
     let submitInput: unknown = null;
     const reconciler: ProviderReconciler = {
       provider: 'feishu-im',
       requiresEffectInput: true,
+      canonicalInput(input) { return input; },
       async idempotentSubmit(_key, input) {
         submitInput = input;
         return { ok: true, externalRefs: { messageId: 'om_p' } };
@@ -958,10 +974,10 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
       reconcilers: new Map([['feishu-im', reconciler]]),
       now: () => 1001,
       async loadEffectInput() {
-        return { chatId: 'oc_abc', content: 'hi' };
+        return loaded;
       },
     });
-    expect(submitInput).toEqual({ chatId: 'oc_abc', content: 'hi' });
+    expect(submitInput).toEqual(loaded);
   });
 
   it('writes manual/InputUnrecoverable when requiresEffectInput=true and no loader', async () => {
