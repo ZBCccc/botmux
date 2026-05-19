@@ -25,7 +25,7 @@ const FeishuReplyInputSchema = z.object({
   content: z.string(),
   msgType: z.string().min(1).optional(),
   replyInThread: z.boolean().optional(),
-});
+}).strict();
 
 export function parseFeishuReplyInput(input: unknown): FeishuReplyInput {
   return FeishuReplyInputSchema.parse(input);

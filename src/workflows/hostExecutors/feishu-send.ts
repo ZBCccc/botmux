@@ -31,7 +31,7 @@ const FeishuSendInputSchema = z.object({
   chatId: z.string().min(1),
   content: z.string(),
   msgType: z.string().min(1).optional(),
-});
+}).strict();
 
 export function parseFeishuSendInput(input: unknown): FeishuSendInput {
   return FeishuSendInputSchema.parse(input);

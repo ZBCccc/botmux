@@ -369,6 +369,12 @@ describe('feishuSendExecutor.canonicalInput', () => {
       content: 'hello',
     });
     expect(() => parseFeishuSendInput({ chatId: 'oc_y', content: 'hello' })).toThrow();
+    expect(() => parseFeishuSendInput({
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      rootMessageId: 'om_parent',
+      content: 'ambiguous',
+    })).toThrow(/Unrecognized key/);
   });
 
   it('invoke forwards the runtime idempotencyKey to sendMessage uuid', async () => {
@@ -530,6 +536,12 @@ describe('feishuReplyExecutor.canonicalInput', () => {
       replyInThread: true,
     });
     expect(() => parseFeishuReplyInput({ larkAppId: 'cli_x', content: 'hello' })).toThrow();
+    expect(() => parseFeishuReplyInput({
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      rootMessageId: 'om_parent',
+      content: 'ambiguous',
+    })).toThrow(/Unrecognized key/);
   });
 
   it('invoke forwards the runtime idempotencyKey to replyMessage uuid', async () => {
