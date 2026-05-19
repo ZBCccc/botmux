@@ -1,0 +1,43 @@
+{
+  "workflowId": "hello",
+  "version": 1,
+  "params": {
+    "name": { "type": "string", "required": true }
+  },
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "greet": {
+      "type": "subagent",
+      "bot": "claude-loopy",
+      "prompt": "Greet {{params.name}} in a friendly tone. Return JSON: {\"greeting\": string}.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["greeting"],
+        "properties": { "greeting": { "type": "string" } }
+      }
+    },
+    "confirm": {
+      "type": "subagent",
+      "bot": "claude-loopy",
+      "depends": ["greet"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": "Should we send this greeting? Preview: {{greet.output}}",
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "prompt": "Echo the greeting from {{greet.output}} back as the final, signed-off message. Return JSON: {\"message\": string}.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["message"],
+        "properties": { "message": { "type": "string" } }
+      }
+    }
+  }
+}

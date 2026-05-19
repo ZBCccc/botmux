@@ -3081,6 +3081,11 @@ switch (command) {
   case 'rm':      cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'workflow': {
+    const { cmdWorkflow } = await import('./cli/workflow.js');
+    await cmdWorkflow(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;

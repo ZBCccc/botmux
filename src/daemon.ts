@@ -66,16 +66,25 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
+import {
+  executeWorkflowCommand,
+  type WorkflowCommandResult,
+} from './im/lark/workflow-slash-command.js';
+import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
+import type { WorkflowRuntimeContext } from './workflows/runtime.js';
+import { runLoop } from './workflows/loop.js';
+import type { RunLoopResult } from './workflows/loop.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
+const workflowRuns = new Map<string, { ctx: WorkflowRuntimeContext; running?: Promise<RunLoopResult> }>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
@@ -275,7 +284,11 @@ function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
 }
 
-export function attachWorkflowEventWatcher(runId: string): WorkflowEventWatcher {
+export function attachWorkflowEventWatcher(runId: string, ctx?: WorkflowRuntimeContext): WorkflowEventWatcher {
+  if (ctx) {
+    const existingRun = workflowRuns.get(runId);
+    workflowRuns.set(runId, { ...existingRun, ctx });
+  }
   const existing = workflowEventWatchers.get(runId);
   if (existing) return existing;
   const watcher = new WorkflowEventWatcher(
@@ -299,6 +312,99 @@ export function attachWorkflowEventWatcher(runId: string): WorkflowEventWatcher 
     );
   });
   return watcher;
+}
+
+async function driveWorkflowRun(runId: string): Promise<RunLoopResult | undefined> {
+  const entry = workflowRuns.get(runId);
+  if (!entry) {
+    logger.warn(`[workflow:${runId}] re-entry requested but runtime context is not registered`);
+    return undefined;
+  }
+  if (entry.running) return entry.running;
+
+  entry.running = runLoop(entry.ctx)
+    .then((result) => {
+      logger.info(`[workflow:${runId}] loop stopped: ${result.reason} (ticks=${result.ticks})`);
+      if (result.reason === 'terminal') cleanupWorkflowRun(runId);
+      return result;
+    })
+    .catch((err) => {
+      logger.warn(`[workflow:${runId}] loop failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    })
+    .finally(() => {
+      const current = workflowRuns.get(runId);
+      if (current) current.running = undefined;
+    });
+
+  return entry.running;
+}
+
+function cleanupWorkflowRun(runId: string): void {
+  workflowRuns.delete(runId);
+  const watcher = workflowEventWatchers.get(runId);
+  if (watcher) {
+    watcher.close();
+    workflowEventWatchers.delete(runId);
+  }
+}
+
+async function handleWorkflowCommandIfAny(
+  content: string,
+  anchor: string,
+  chatId: string,
+  larkAppId: string,
+  initiator: string | undefined,
+): Promise<boolean> {
+  const result = await executeWorkflowCommand(
+    {
+      content,
+      chatId,
+      larkAppId,
+      initiator: initiator ?? 'unknown',
+    },
+    {
+      attachWorkflowEventWatcher,
+      runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId).then((r) => {
+        if (!r) throw new Error(`workflow runtime context not registered: ${ctx.log.runId}`);
+        return r;
+      }),
+      onRunCreated: async (info) => {
+        try {
+          await sessionReply(
+            anchor,
+            `Workflow started: ${info.workflowId}\nrunId: ${info.runId}\nWeb: ${workflowRunDetailUrl(info.runId)}`,
+            'text',
+            larkAppId,
+          );
+        } catch (err) {
+          logger.warn(`[workflow:${info.runId}] failed to send start reply: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    },
+  );
+  if (!result.handled) return false;
+
+  if (!result.ok) {
+    await sessionReply(
+      anchor,
+      `Workflow 启动失败：${result.error}${result.usage ? `\n${result.usage}` : ''}`,
+      'text',
+      larkAppId,
+    );
+    return true;
+  }
+
+  await sessionReply(anchor, formatWorkflowCommandResult(result), 'text', larkAppId);
+  return true;
+}
+
+function formatWorkflowCommandResult(result: Extract<WorkflowCommandResult, { ok: true }>): string {
+  const status =
+    result.loopResult.reason === 'awaiting-wait'
+      ? '等待审批'
+      : result.loopResult.reason;
+  return `Workflow loop stopped: ${status}\nrunId: ${result.runId}`;
 }
 
 function getActiveCount(): number {
@@ -362,6 +468,11 @@ const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
+  workflowApprovalResolved: (runId) => {
+    driveWorkflowRun(runId).catch((err) => {
+      logger.warn(`[workflow:${runId}] re-entry after approval failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  },
 };
 
 // ─── Event handling ──────────────────────────────────────────────────────────
@@ -471,6 +582,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const botCfg = getBot(larkAppId).config;
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
+
+  if (await handleWorkflowCommandIfAny(cmdContent, anchor, chatId, larkAppId, senderOpenId)) {
+    return;
+  }
 
   // Intercept daemon commands in new topics (no session needed for some commands)
   const invocation = parseSlashCommandInvocation(cmdContent);
@@ -764,6 +879,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         .catch(err => logger.error(`Failed to reply login result: ${err}`));
       return;
     }
+  }
+
+  if (await handleWorkflowCommandIfAny(
+    cmdContent,
+    anchor,
+    ctxChatId ?? data?.message?.chat_id,
+    larkAppId,
+    parsed.senderId || data?.sender?.sender_id?.open_id,
+  )) {
+    return;
   }
 
   // Intercept daemon commands
@@ -1245,6 +1370,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     scheduler.stopScheduler();
     for (const watcher of workflowEventWatchers.values()) watcher.close();
     workflowEventWatchers.clear();
+    workflowRuns.clear();
     clearInterval(descriptorHeartbeat);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });

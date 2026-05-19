@@ -9,7 +9,11 @@ import { getBot, getAllBots } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
 import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, getCliDisplayName, truncateContent } from './card-builder.js';
-import { handleWorkflowApprovalAction, isWorkflowApprovalAction } from './workflow-card-handler.js';
+import {
+  handleWorkflowApprovalAction,
+  isWorkflowApprovalAction,
+  type WorkflowApprovalHandlerDeps,
+} from './workflow-card-handler.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
@@ -28,6 +32,8 @@ export interface CardHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
   lastRepoScan: Map<string, ProjectInfo[]>;
+  workflowApprovalDeps?: WorkflowApprovalHandlerDeps;
+  workflowApprovalResolved?: (runId: string) => void | Promise<void>;
 }
 
 interface CardActionData {
@@ -167,7 +173,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
 
   if (isWorkflowApprovalAction(value?.action)) {
-    return handleWorkflowApprovalAction(data);
+    const result = await handleWorkflowApprovalAction(data, deps.workflowApprovalDeps);
+    const runId = value?.run_id;
+    if (result?.ok && !result.duplicate && runId) {
+      await deps.workflowApprovalResolved?.(runId);
+    }
+    return result;
   }
 
   // Handle session card button actions (restart/close)
