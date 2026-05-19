@@ -1,0 +1,21 @@
+{
+  "workflowId": "feishu-send-demo",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "send-text": {
+      "type": "hostExecutor",
+      "executor": "feishu-send",
+      "input": {
+        "larkAppId": "cli_demo_PLACEHOLDER",
+        "chatId": "oc_demo_PLACEHOLDER",
+        "content": "feishu-send-demo: hello from workflow A2",
+        "msgType": "text"
+      }
+    }
+  }
+}
