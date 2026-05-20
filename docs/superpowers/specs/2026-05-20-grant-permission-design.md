@@ -1,7 +1,7 @@
 # 群内授权（`/grant` · `/revoke` · 授权卡片）设计
 
 日期：2026-05-20
-状态：待评审（Codex review）
+状态：v2 — 已纳入 Codex review 全部 8 项（见文末处置表）
 
 ## 背景与动机
 
@@ -59,8 +59,30 @@ chatGrants?: { [chatId: string]: string[] };
 `BotState` 不新增字段——`chatGrants` 直接读 `bot.config.chatGrants`（与 oncall 的
 `oncallChats` 一样走 in-memory config）。
 
+**⚠️ 必须进 `parseBotConfigFile` 白名单**：`bot-registry.ts:278-292` 用字段白名单重建
+`BotConfig`，未列出的字段重启后被丢弃。所以除了加 interface 字段，还要在解析处显式读取、
+**校验过滤**（只保留 `chatId: string` → `string[]`，逐项 `typeof === 'string'`）并回填
+`chatGrants`，否则 grant-store 写入 `bots.json` 后重启不进内存。
+
+### 授权范围语义（Codex review #2 — 关键澄清）
+**「授权本群」= 仅放行「与机器人对话/喂 prompt」，不授予 daemon 管理命令权。**
+
+理由：`chatGrants` 若同时进 `canOperate`，本群授权用户就能跑 `/cd`、`/restart`、`/repo`、
+`/schedule`，尤其 `/oncall bind`（把整个群对所有人开放）、`/adopt`、`get_write_link`（写终端
+链接）——这比「让某人在本群用机器人」大一档，是权限膨胀。用户原话是「加使用权限/授权人」，
+语义就是「能用」，管理权应保留给 owner / 全局 allowedUsers。
+
+因此：
+- `chatGrants` **只进 `canTalk`，绝不进 `canOperate`**。
+- 卡片敏感动作已走 `canOperate`（`card-handler.ts:152`），故自动不受 chatGrant 影响——
+  只要不把 chatGrant 加进 canOperate 即可。
+- **但 daemon 命令路径在非 oncall 群没查 canOperate**（`daemon.ts:455-464` / `760-768` 仅在
+  `isChatOncallBoundForAnyBot` 时才查）。chat-granted 用户能过 `canTalk` 到达命令分支，存在缺口。
+  **修复**：把这两处的 oncall 前置条件去掉，改为**所有群**的 daemon 命令都要求 `canOperate`
+  （对现有 allowedUsers 用户是 no-op，因为他们本就过 canOperate；只挡住 chat-granted 用户）。
+
 ### 闸门改动
-`canTalk` 和 `canOperate` 各加一条放行规则（在现有 `allowedUsers` 检查之外）：
+仅 `canTalk` 增加一条放行规则（`canOperate` **不动**）：
 
 ```ts
 function hasChatGrant(larkAppId, chatId, openId): boolean {
@@ -70,9 +92,10 @@ function hasChatGrant(larkAppId, chatId, openId): boolean {
 ```
 
 - `canTalk`：oncall 放行 → known peer bot 放行 → `allowedUsers` 命中 → **`chatGrants` 命中** → 否则拒。
-- `canOperate`：`allowedUsers` 命中 → **`chatGrants` 命中** → 否则拒。
+- `canOperate`：维持现状（`allowedUsers` 命中），**不加 chatGrants**。
+- daemon 命令路径：去掉 oncall 前置，统一要求 `canOperate`（见上）。
 
-注意：开放模式（`allowedUsers` 为空）下两个闸门本就返回 `true`，`chatGrants` 不影响。
+注意：开放模式（`allowedUsers` 为空）下闸门本就返回 `true`，`chatGrants` 不影响。
 
 ## 持久化层：`grant-store.ts`
 
@@ -82,6 +105,12 @@ function hasChatGrant(larkAppId, chatId, openId): boolean {
 `writeRawConfigAtomic` / `findEntryIndex` / `requireConfigPath` 抽到共享模块
 `src/services/config-store.ts`，`oncall-store.ts` 与新 `grant-store.ts` 都从它 import。
 （纯提取，不改行为；让两个 store 共享同一把跨进程文件锁。）
+
+**⚠️ 文件权限（Codex review #5）**：`bots.json` 含 `appSecret`，setup 写它用 `0o600`
+（`bots-store.ts:9-13`），但 oncall-store 现有 `writeRawConfigAtomic` 的临时文件没指定 mode
+（`oncall-store.ts:29-32`），rename 后会把 `bots.json` 落成 umask 默认权限（可能 0644）。
+抽取时**顺手修掉**：temp 文件以 `{ mode: 0o600 }` 写入，并在 rename 前 `fchmod`/写入即正确，
+保证最终文件保持 `0o600`。（这是抽取附带的安全修复，不是行为回归。）
 
 `grant-store.ts` 暴露：
 
@@ -98,17 +127,37 @@ removeChatGrant(larkAppId, chatId, openId): Promise<{ok:true; existed:boolean} |
 `config.chatGrants`）→ `logger.info`。`removeGlobalGrant` 同时从 `allowedUsers` 和
 `resolvedAllowedUsers` 删除。
 
+**⚠️ 防误删致开放模式（Codex review #1 — Critical）**：开放模式（`allowedUsers` 为空 →
+全员可用）和「无人授权」用的是同一个空数组，语义相反。若 `removeGlobalGrant` 删掉**最后一个**
+全局 `open_id`（尤其 owner 自己），受限 bot 会反向变成**全员开放**。
+**修复**：`removeGlobalGrant` 增加守卫——当移除后 `allowedUsers` 会变空时，**拒绝并返回
+`reason:'would_open_bot'`**；同样禁止撤销当前 owner 的全局授权。撤销不能制造「空 = 开放」。
+（如果将来要支持「彻底锁死无人可用」，需引入显式 `restricted: true` 状态，本期不做。）
+
 **revoke 语义**：`/revoke @user` 做「彻底撤销」——同时调用 `removeChatGrant(本群)` 和
-`removeGlobalGrant`，回执里说明实际移除了哪些范围（本群/全局/无）。理由：撤销应彻底切断，
-不留半开状态；用户明确要的就是 `/revoke @xx` 这种一键收回。
+`removeGlobalGrant`，回执里说明实际移除了哪些范围（本群/全局/无/被守卫拒绝）。理由：撤销应
+彻底切断；用户要的就是 `/revoke @xx` 一键收回。受上面守卫约束：不会把全局清空。
+
+**⚠️ revoke 不清理历史副作用（Codex review #8）**：被撤销用户此前用 `/schedule` 建的定时任务
+不会被 revoke 停掉（schedule task 当前无 creator open_id、无运行时权限复查，
+`schedule-store.ts:126-168`）。本期**明确不处理**，仅在回执/文档说明；如需联动需另加 creator
+字段与撤销时禁用策略（独立任务）。
 
 ## 命令层：`im/lark/grant-command.ts`
 
-`/grant`、`/revoke` 是**元命令**，必须在 dispatcher 路由/spawn 之前拦截（与 `/introduce`
-同款，`event-dispatcher.ts:782`），否则会被当成 prompt 喂给 CLI 会话。
+`/grant`、`/revoke` 是**元命令**，必须在 dispatcher 路由/spawn 之前拦截，否则会被当成 prompt
+喂给 CLI 会话。但**不能照搬 `/introduce` 的「无条件拦截」**（Codex review #3）：`/introduce`
+（`event-dispatcher.ts:779-783`）有意让每个被 @ 的 bot 各自记录 mentions，所以无条件；而 `/grant`
+若裸发，在多 bot 群里可能被多个 daemon 重复处理，或（若飞书只推 @bot 消息）根本收不到。
+
+**修复**：
+- 入口 B 固定为 **`@bot /grant @user`**——拦截时先 `isBotMentioned(larkAppId, message, senderOpenId)`
+  确认本 bot 被 @，否则不处理（p2p / 单 bot 群可放宽）。
+- 解析 target mention 时**排除 bot 自己的 open_id**（不能直接取 `message.mentions[0]`，否则会把
+  被 @ 的机器人自己当成授权对象）。取第一个非本 bot 的人类 mention。
 
 新增 `tryHandleGrantCommand(larkAppId, message, senderOpenId, chatId, ...)`，在 introduce
-拦截之后调用；命中 `/grant` 或 `/revoke` 则处理并返回 `true`（短路）。
+拦截之后调用；命中且本 bot 被 @ 时处理并返回 `true`（短路）。
 
 ### `/grant`
 - 解析文本（容忍 `@_user_N` 占位符 → 从 `message.mentions` 取 `open_id`，与 message-parser 同款解析）。
@@ -132,30 +181,42 @@ removeChatGrant(larkAppId, chatId, openId): Promise<{ok:true; existed:boolean} |
 
 - 文案：「用户 @<申请人> 申请使用我，请 @<owner> 选择授权范围」（卡片正文 mention owner，
   保证 owner 收到红点）。
-- 按钮三枚，`value` 各带 action + 上下文：
-  - `[ 授权本群 ]` → `{ action: 'grant_chat', target_open_id, chat_id }`
-  - `[ 全局授权 ]` → `{ action: 'grant_global', target_open_id, chat_id }`
-  - `[ 拒绝 ]` → `{ action: 'grant_deny', target_open_id, chat_id }`
+- 按钮三枚，`value` 各带 action + 上下文 + **nonce**：
+  - `[ 授权本群 ]` → `{ action: 'grant_chat', target_open_id, chat_id, nonce }`
+  - `[ 全局授权 ]` → `{ action: 'grant_global', target_open_id, chat_id, nonce }`
+  - `[ 拒绝 ]` → `{ action: 'grant_deny', target_open_id, chat_id, nonce }`
 - 入口 A 与入口 B 用同一张卡，仅文案前缀略不同（「申请使用」vs「请选择对 @X 的授权范围」）。
+
+**⚠️ nonce 防旧卡重放（Codex review #6 — 关键）**：发卡时生成随机 `nonce`，写进 pending 表
+（key=`bot:chat:target`，value 含 nonce）。card-handler 处理 grant action 前先校验
+**pending 仍存在且 nonce 匹配**；否则只 toast「该授权请求已失效」。这样 `/revoke` 清 pending、
+或 daemon 重启清空内存表后，**旧卡片点击一律失效**——owner 误点过期卡不会重新授权。内存表
+重启重置在这里反而是安全特性。
 
 ### 卡片点击处理（card-handler.ts）
 
 在 `handleCardAction` **靠前**处理这三个 action（在现有 session 解析逻辑之前），
 因为它们不绑定 DaemonSession（无 `root_id`/`ds`）：
 
-1. **owner 闸门（强）**：`operatorOpenId !== getOwnerOpenId(larkAppId)` → toast「仅 owner 可操作」，不改任何状态。
-   注意：这里比现有 `isSensitive` 的 `allowedUsers` 闸门更严，必须等于 owner 本人。
-2. `grant_chat` → `addChatGrant`；`grant_global` → `addGlobalGrant`；`grant_deny` → 不授权。
-3. 三种都更新卡片为终态（「✅ 已授权本群 / ✅ 已全局授权 / 🚫 已拒绝」），按钮置灰/移除，避免重复点击。
-4. 清理该 `(bot,chat,target)` 的 pending 节流记录。
+1. **owner 闸门（强）**：必须用**当前 app** 的 `operator.open_id === getOwnerOpenId(larkAppId)`
+   → 否则 toast「仅 owner 可操作」，不改任何状态。比现有 `isSensitive` 的 `canOperate` 更严。
+2. **nonce 校验**：pending 表里该 `(bot,chat,target)` 仍存在且 nonce 匹配 → 继续；否则 toast
+   「该授权请求已失效」（旧卡 / revoke 后 / 重启后）。
+3. `grant_chat` → `addChatGrant`；`grant_global` → `addGlobalGrant`；`grant_deny` → 不授权。
+4. 三种都更新卡片为终态（「✅ 已授权本群 / ✅ 已全局授权 / 🚫 已拒绝」），按钮置灰/移除，避免重复点击。
+5. 清理该 `(bot,chat,target)` 的 pending 记录。
 
 ## 入口 A：无权限者自助申请
 
-改 `event-dispatcher.ts:884` 的 `access === 'not_allowed'` 分支（`!ownsSession` 时）：
-原本回「⚠️ 无操作权限」，改为：
+改 `event-dispatcher.ts:884` 的 `access === 'not_allowed'` 分支：原本回「⚠️ 无操作权限」，改为：
 
 - 若**开放模式**（无 owner）→ 维持原逻辑（理论上开放模式不会进 not_allowed，但兜底保留）。
 - 否则：发**授权卡片**（@owner，申请人 = `senderOpenId`），代替「无操作权限」文本。
+
+**⚠️ 覆盖 ownsSession 场景（Codex review #7）**：现有逻辑在 `ownsSession === true` 时连
+「无操作权限」都不回（`event-dispatcher.ts:884-888`），会漏掉「普通群已有 chat-scope session、
+无权限者来 @ 申请」的场景。目标是「无权限者 @机器人就弹申请卡」，所以 `access === 'not_allowed'`
+**无论 ownsSession 真假都走节流+卡片**；只是**绝不把该消息送进已有 session**（不喂 prompt）。
 
 ### 节流（必须）
 避免无权限者每发一句就刷一张卡。用**内存** Map：
@@ -172,27 +233,52 @@ key = `${larkAppId}:${chatId}:${requesterOpenId}`
 
 | 文件 | 改动 |
 | --- | --- |
-| `src/services/config-store.ts` | **新增**：从 oncall-store 提取的共享 rmw/锁/IO helper |
+| `src/services/config-store.ts` | **新增**：从 oncall-store 提取的共享 rmw/锁/IO helper；temp 写入保 `0o600`（#5） |
 | `src/services/oncall-store.ts` | 改为 import 共享 helper（纯重构） |
-| `src/services/grant-store.ts` | **新增**：add/removeGlobalGrant、add/removeChatGrant |
-| `src/bot-registry.ts` | `BotConfig.chatGrants` 字段；`getOwnerOpenId()` |
-| `src/im/lark/event-dispatcher.ts` | `canTalk`/`canOperate` 加 chatGrants 放行；not_allowed 分支改弹卡片 + 节流；引入 grant-command 拦截 |
-| `src/im/lark/grant-command.ts` | **新增**：`tryHandleGrantCommand`（/grant、/revoke） |
-| `src/im/lark/card-builder.ts` | **新增**：`buildGrantCard` |
-| `src/im/lark/card-handler.ts` | 处理 `grant_chat`/`grant_global`/`grant_deny`，owner 强闸门 |
-| `src/i18n/zh.ts` `en.ts` | 命令回执、卡片、toast 文案 |
+| `src/services/grant-store.ts` | **新增**：add/removeGlobalGrant、add/removeChatGrant；removeGlobalGrant 防清空守卫（#1） |
+| `src/bot-registry.ts` | `BotConfig.chatGrants` 字段；`getOwnerOpenId()`；**`parseBotConfigFile` 白名单解析+过滤 `chatGrants`**（#4） |
+| `src/im/lark/event-dispatcher.ts` | `canTalk` 加 chatGrants 放行（**`canOperate` 不动**, #2）；not_allowed 分支改弹卡片+节流，覆盖 ownsSession（#7）；grant-command 拦截（要求 isBotMentioned, #3） |
+| `src/daemon.ts` | 去掉 daemon 命令路径（`455-464`/`760-768`）的 oncall 前置，**所有群** daemon 命令统一要求 `canOperate`（#2） |
+| `src/im/lark/grant-command.ts` | **新增**：`tryHandleGrantCommand`（/grant、/revoke）；isBotMentioned 守卫 + 排除 bot 自身 mention（#3） |
+| `src/im/lark/card-builder.ts` | **新增**：`buildGrantCard`（按钮带 nonce, #6） |
+| `src/im/lark/card-handler.ts` | 处理 `grant_chat`/`grant_global`/`grant_deny`：owner 强闸门 + nonce 校验（#6），在 session 解析之前 |
+| `src/im/lark/grant-pending.ts` | **新增**：内存 pending+节流表（key=`bot:chat:target`→{nonce,ts}），含 nonce 生成/校验/清除 |
+| `src/i18n/zh.ts` `en.ts` | 命令回执、卡片、toast、失效提示文案 |
 | `src/core/command-handler.ts` `/help` | 文档里补 `/grant` `/revoke` 说明 |
 
 ## 测试要点
 
-- `grant-store`：add/remove 全局与本群，去重、幂等、内存与 `bots.json` 同步、并发锁（与 oncall 测试同款）。
-- 闸门：`chatGrants` 命中放行；跨 chat 不串；开放模式不受影响。
+- `grant-store`：add/remove 全局与本群，去重、幂等、内存与 `bots.json` 同步、并发锁（与 oncall 同款）。
+- **#1**：`removeGlobalGrant` 删到只剩最后一个 / owner 时被守卫拒绝（`would_open_bot`），bot 不变开放。
+- **#2**：`chatGrants` 命中只过 `canTalk` 不过 `canOperate`；chat-granted 用户在非 oncall 群跑 `/cd`/`/oncall bind` 被 `canOperate` 挡；现有 allowedUsers 用户不受影响（回归）。
+- **#3**：裸 `/grant @x`（未 @bot）不被处理；`@bot /grant @x` 生效；mention 解析排除 bot 自身。
+- **#4**：写入 `chatGrants` → 重启 → `parseBotConfigFile` 正确回填进内存。
+- **#5**：写 `bots.json` 后文件权限仍是 `0o600`。
+- **#6**：旧卡 / revoke 后 / 重启后点击授权 → nonce 不匹配 → toast 失效，不重新授权。
+- **#7**：not_allowed 在 ownsSession=true 时也弹卡，且消息不进 session。
+- 闸门跨 chat 不串；开放模式不受影响。
 - 命令解析：`/grant @x`、`/revoke @x`、无 mention、非 owner 调用被拒。
-- 卡片点击：非 owner 点击被拦（toast）；三种 action 终态正确；节流清除。
+- 卡片点击：非 owner（非 owner 本人）点击被拦（toast）；三种 action 终态正确；pending 清除。
 - 入口 A：not_allowed → 弹卡（@owner）；同人重复发不刷屏；revoke 后可再次申请。
 
 ## 待评审决策点（已与用户确认）
 
 1. 命令名：`/grant` ✔
-2. 谁能批准卡片：**仅 owner** ✔
-3. 撤销：`/revoke @xx`（彻底撤销本群+全局）✔
+2. 谁能批准卡片：**仅 owner**（当前 app 的 `operator.open_id === getOwnerOpenId`）✔
+3. 撤销：`/revoke @xx`（彻底撤销本群+全局，但受 #1 守卫不清空全局）✔
+
+## Codex review 处置（基于 a2cb248，全部采纳）
+
+| # | 级别 | 处置 |
+| --- | --- | --- |
+| 1 | Critical | removeGlobalGrant 守卫：不允许删到空 / 删 owner，避免「空=开放」反转 |
+| 2 | High | chatGrant 只进 canTalk；daemon 命令统一要求 canOperate（去掉 oncall 前置） |
+| 3 | High | /grant 拦截要求 isBotMentioned；mention 解析排除 bot 自身 |
+| 4 | Medium | chatGrants 进 parseBotConfigFile 白名单解析+过滤 |
+| 5 | Medium | config-store temp 写入保 0o600 |
+| 6 | Medium | 授权卡带 nonce，card-handler 校验 pending+nonce，旧卡失效 |
+| 7 | Med/Low | not_allowed 覆盖 ownsSession 场景，但不喂 session |
+| 8 | Low | 明确记录：revoke 不停历史 schedule（本期不联动） |
+
+**唯一产品决策（#2 语义）**：「授权本群」= 仅对话使用，不含 daemon 管理命令权——管理权保留
+owner / 全局 allowedUsers。符合用户「加使用权限」的原意。
