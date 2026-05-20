@@ -194,6 +194,17 @@ export class TmuxPipeBackend implements SessionBackend {
     });
   }
 
+  /**
+   * Paste text into the pane via load-buffer + paste-buffer.
+   * The -p flag asks tmux to wrap the buffer in bracketed-paste markers
+   * (\e[200~ … \e[201~) when the application has requested bracketed paste.
+   * This is REQUIRED for CoCo/Ink: without the markers the TUI treats the
+   * paste as a rapid input burst and swallows the trailing Enter as a soft
+   * newline, stranding the message in the input box (it then gets submitted
+   * by the *next* paste — the "replies to the previous message" off-by-one).
+   * NB: TmuxPipeBackend is the only backend used at runtime (see
+   * selectSessionBackend), so this is the path that actually matters.
+   */
   pasteText(text: string): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
@@ -204,7 +215,7 @@ export class TmuxPipeBackend implements SessionBackend {
         timeout: 5000,
         env: tmuxEnv(),
       });
-      execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d'], {
+      execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d', '-p'], {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),

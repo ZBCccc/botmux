@@ -130,6 +130,12 @@ describe('TmuxPipeBackend input addressing', () => {
     expect(pasteArgs).toContain('paste-buffer');
     const tIdx = pasteArgs.indexOf('-t');
     expect(pasteArgs[tIdx + 1]).toBe('0:5.0');
+    // -p forces bracketed-paste markers, REQUIRED for CoCo/Ink to treat the
+    // content as one paste and accept the trailing Enter as a submit. Without
+    // it the Enter is swallowed as a soft-newline and the message strands in
+    // the input box (replies-to-previous-message off-by-one). Regression guard
+    // for PR #25, which added -p only to the unused TmuxBackend.
+    expect(pasteArgs).toContain('-p');
   });
 
   it('write delegates to sendText (literal send-keys)', () => {
