@@ -38,7 +38,7 @@ vi.mock('node:fs', async () => {
 });
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
+import { unlinkSync, createReadStream } from 'node:fs';
 import { TmuxPipeBackend, normaliseCaptureLineEndings } from '../src/adapters/backend/tmux-pipe-backend.js';
 
 const mockedExecSync = vi.mocked(execSync);
@@ -438,6 +438,31 @@ describe('TmuxPipeBackend send failure handling', () => {
 
     expect(() => be.sendText('hi')).not.toThrow();
     expect(exits).toEqual([]);
+  });
+
+  it('dumps the piped output tail (CLI final stdout/stderr) when the pane is gone', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const be = new TmuxPipeBackend('bmx-dead3', { ownsSession: true });
+      be.spawn('', [], spawnOpts());
+      // Drive the fifo data handler so recentOutput holds the CLI's last bytes.
+      const stream: any = vi.mocked(createReadStream).mock.results.at(-1)!.value;
+      stream.emit('data', Buffer.from('Error: gateway 502 — model unavailable\n'));
+
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+        if ((args as string[]).includes('send-keys')) throw new Error('no server running');
+        return '' as any;
+      });
+      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+      be.sendSpecialKeys('Enter');
+
+      const dumped = errSpy.mock.calls.map(c => String(c[0])).join('');
+      expect(dumped).toContain('CLI last output before exit');
+      expect(dumped).toContain('gateway 502 — model unavailable');
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 
   it('paste failure with a gone pane fires onExit instead of throwing', () => {

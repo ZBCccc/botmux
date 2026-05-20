@@ -50,6 +50,13 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
   private readonly dataCbs: Array<(d: string) => void> = [];
+  /** Bounded tail of the most recent bytes tmux replicated from the pane.
+   *  Crash diagnostic: when a send fails because the pane vanished,
+   *  capture-pane can no longer read the (now-gone) screen — but these bytes
+   *  were already received over the pipe and are the CLI's actual final
+   *  stdout/stderr (e.g. a gateway/API error) right before it exited. */
+  private recentOutput = '';
+  private static readonly RECENT_OUTPUT_MAX = 4096;
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private lifecycleTimer: NodeJS.Timeout | null = null;
   private cols = 200;
@@ -126,6 +133,9 @@ export class TmuxPipeBackend implements SessionBackend {
 
     this.readStream.on('data', (chunk) => {
       const data = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      if (data) {
+        this.recentOutput = (this.recentOutput + data).slice(-TmuxPipeBackend.RECENT_OUTPUT_MAX);
+      }
       for (const cb of this.dataCbs) {
         try { cb(data); } catch { /* listener crash shouldn't kill the stream */ }
       }
@@ -235,11 +245,13 @@ export class TmuxPipeBackend implements SessionBackend {
         `[tmux-pipe-backend] ${op} failed (pane ${alive ? 'ALIVE' : 'GONE'}): ${err?.message ?? err}\n`,
       );
       if (!alive) {
-        // Diagnostic: snapshot whatever the CLI left on screen before it
-        // vanished — its final stderr/API error often explains WHY it exited.
-        const tail = this.captureViewport();
-        if (tail.trim()) {
-          process.stderr.write(`[tmux-pipe-backend] CLI pane final screen before exit:\n${tail}\n`);
+        // Diagnostic: the pane is gone, so capture-pane can't read the final
+        // screen. Instead dump the tail tmux already replicated over the pipe
+        // — the CLI's real last stdout/stderr before it exited, which often
+        // explains WHY it exited (e.g. a gateway/API error line).
+        const tail = this.recentOutput.trim();
+        if (tail) {
+          process.stderr.write(`[tmux-pipe-backend] CLI last output before exit (tail):\n${tail}\n`);
         }
         this.handlePaneExit();
       }
