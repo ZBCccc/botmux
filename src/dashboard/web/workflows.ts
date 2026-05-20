@@ -329,7 +329,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     <section class="wf-panel">
       <div class="wf-panel-title">
         <h3>Timeline</h3>
-        <button id="wf-load-older" type="button">Load older</button>
+        <button id="wf-load-older" type="button" hidden>Load older</button>
       </div>
       <div class="wf-table-scroll wf-timeline-scroll">
         <table>
@@ -416,7 +416,6 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
 
   async function poll(): Promise<void> {
     if (disposed || inflight || document.hidden) return;
-    if (snapshot && TERMINAL.has(snapshot.run.status)) return;
     inflight = true;
     try {
       await fetchSnapshot();
@@ -425,6 +424,13 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
         mergeEvents(win.events, 'append');
         if (win.newestSeq !== null) newestSeq = win.newestSeq;
         if (oldestSeq === null && win.oldestSeq !== null) oldestSeq = win.oldestSeq;
+        totalCount = win.totalCount;
+      } else {
+        const win = await fetchEvents(new URLSearchParams({ tail: '1' }));
+        mergeEvents(win.events, 'append');
+        oldestSeq = win.oldestSeq;
+        newestSeq = win.newestSeq;
+        hasOlder = win.hasOlder;
         totalCount = win.totalCount;
       }
       setError(null);
@@ -469,6 +475,10 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
 
   function scheduleNext(): void {
     if (timer !== null) window.clearTimeout(timer);
+    if (snapshot && TERMINAL.has(snapshot.run.status)) {
+      timer = null;
+      return;
+    }
     timer = window.setTimeout(async () => {
       await poll();
       if (!disposed) scheduleNext();
@@ -477,7 +487,9 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
 
   function onVisibility(): void {
     if (document.hidden) return;
-    void poll();
+    void poll().then(() => {
+      if (!disposed && timer === null) scheduleNext();
+    });
   }
 
   loadOlder.addEventListener('click', () => void loadOlderEvents());
@@ -591,6 +603,9 @@ function renderAttemptDetail(at: AttemptState): string {
       ? `${at.wait.resolution.kind}${at.wait.resolution.resolution ? ':' + at.wait.resolution.resolution : ''}`
       : 'open';
     parts.push(`wait ${escapeHtml(at.wait.waitKind)} ${escapeHtml(res)}`);
+    if (at.wait.deadlineAt !== undefined) {
+      parts.push(`deadline ${escapeHtml(formatClock(at.wait.deadlineAt))}`);
+    }
   }
   if (at.error) parts.push(`<span class="muted error">${escapeHtml(at.error.errorCode)}</span>`);
   if (at.output) parts.push(`output ${escapeHtml(short(at.output.outputHash))}`);
@@ -614,10 +629,12 @@ function renderEventRow(ev: WorkflowEvent): string {
     <td>${ctx.nodeId ? `<code>${escapeHtml(ctx.nodeId)}</code>` : '-'}</td>
     <td>${ctx.activityId ? `<code>${escapeHtml(ctx.activityId)}</code>` : '-'}</td>
     <td>${ctx.errorCode ? `<span class="muted error">${escapeHtml(ctx.errorCode)}</span>` : '-'}</td>
-    <td title="${escapeHtml(new Date(ev.timestamp).toISOString())}">${fmtUpdated(ev.timestamp)}</td>
+    <td title="${escapeHtml(new Date(ev.timestamp).toISOString())}">${escapeHtml(formatClock(ev.timestamp))}</td>
   </tr>`;
 }
 
+// Browser-side copies of ops-projection helpers.  Keep these tiny to avoid
+// pulling the Node/Zod projection module into the dashboard bundle.
 function eventSeqFromId(eventId: string): number {
   const dash = eventId.lastIndexOf('-');
   if (dash < 0) return 0;
@@ -644,4 +661,12 @@ function extractEventContext(
 function short(value?: string): string {
   if (!value) return '-';
   return value.length > 18 ? value.slice(0, 10) + '...' + value.slice(-6) : value;
+}
+
+function formatClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
 }
