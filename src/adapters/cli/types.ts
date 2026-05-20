@@ -87,6 +87,10 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    /** Non-transient reason when the adapter knows submission is impossible
+     *  without waiting for transcript confirmation (for example an unsupported
+     *  terminal keybinding). Worker surfaces this immediately. */
+    failureReason?: string;
     recheck?: () => boolean | Promise<boolean>;
   }>;
 

@@ -43,7 +43,7 @@ import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -53,6 +53,7 @@ import { dirname, join } from 'node:path';
 
 const CODEX_HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
 const COCO_HISTORY_PATH = join(homedir(), '.cache', 'coco', 'history.jsonl');
+const CLAUDE_KEYBINDINGS_PATH = join(homedir(), '.claude', 'keybindings.json');
 
 function appendCodexHistory(content: string, sessionId?: string): void {
   mkdirSync(dirname(CODEX_HISTORY_PATH), { recursive: true });
@@ -72,6 +73,17 @@ function appendCocoHistory(content: string): void {
 function resetCocoHistory(): void {
   mkdirSync(dirname(COCO_HISTORY_PATH), { recursive: true });
   writeFileSync(COCO_HISTORY_PATH, '');
+}
+
+function writeClaudeKeybindings(bindings: Record<string, string>): void {
+  mkdirSync(dirname(CLAUDE_KEYBINDINGS_PATH), { recursive: true });
+  writeFileSync(CLAUDE_KEYBINDINGS_PATH, JSON.stringify({
+    bindings: [{ context: 'Chat', bindings }],
+  }));
+}
+
+function removeClaudeKeybindings(): void {
+  try { rmSync(CLAUDE_KEYBINDINGS_PATH); } catch { /* absent */ }
 }
 
 function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
@@ -216,6 +228,112 @@ describe('writeInput: multiline, tmux mode', () => {
     const backslashCalls = pty.sendText.mock.calls.filter(c => c[0] === '\\').length;
     expect(backslashCalls).toBe(2);
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+  });
+
+  it('claude-code: respects custom chat keybindings where Enter is newline and Meta+Enter submits', async () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({
+      'cmd+enter': 'chat:submit',
+      'meta+enter': 'chat:submit',
+      enter: 'chat:newline',
+    });
+    try {
+      const pty = makeTmuxPty();
+      await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.pasteText).not.toHaveBeenCalled();
+      expect(pty.sendText).toHaveBeenCalledWith('first line');
+      expect(pty.sendText).toHaveBeenCalledWith('Session ID: abc-123');
+      expect(pty.sendText).not.toHaveBeenCalledWith('\\');
+      expect(pty.sendSpecialKeys.mock.calls).toEqual([
+        ['Enter'],
+        ['Enter'],
+        ['M-Enter'],
+      ]);
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: fails before typing when only unsupported Cmd+Enter can submit', async () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({
+      'cmd+enter': 'chat:submit',
+      enter: 'chat:newline',
+    });
+    try {
+      const pty = makeTmuxPty();
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.pasteText).not.toHaveBeenCalled();
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        submitted: false,
+        failureReason: expect.stringContaining('terminal-sendable'),
+      });
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: fails before typing when only unsendable Ctrl+Enter can submit', async () => {
+    // Terminals cannot distinguish Ctrl+Enter from Enter, so it must NOT be
+    // treated as a sendable submit key — fail fast instead of phantom-submitting.
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({
+      'ctrl+enter': 'chat:submit',
+      enter: 'chat:newline',
+    });
+    try {
+      const pty = makeTmuxPty();
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        submitted: false,
+        failureReason: expect.stringContaining('terminal-sendable'),
+      });
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: fails before typing when Enter is newline and no submit key is bound', async () => {
+    // A config that remaps Enter to newline without binding any chat:submit key
+    // would otherwise type the message and emit newlines forever — fail fast.
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ enter: 'chat:newline' });
+    try {
+      const pty = makeTmuxPty();
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        submitted: false,
+        failureReason: expect.stringContaining('terminal-sendable'),
+      });
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: CLAUDE_CODE_SUBMIT_KEY env overrides the submit key', async () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    process.env.CLAUDE_CODE_SUBMIT_KEY = 'meta+enter';
+    try {
+      const pty = makeTmuxPty();
+      await adapter.writeInput(pty, MULTILINE);
+
+      // Enter still submits by default here, so soft-newlines stay backslashed;
+      // only the final submit honours the override.
+      expect(pty.sendSpecialKeys.mock.calls.at(-1)).toEqual(['M-Enter']);
+    } finally {
+      delete process.env.CLAUDE_CODE_SUBMIT_KEY;
+    }
   });
 
   it.each(PASTE_BUFFER_ADAPTERS)('%s: single pasteText(whole) + delayed Enter, no sendText', async (_name, adapter) => {

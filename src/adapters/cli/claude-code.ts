@@ -242,6 +242,121 @@ function findJsonlAcrossProjectsRoot(
 }
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed|Baked|Brewed) for \d+[smh]/;
+const CLAUDE_KEYBINDINGS_PATH = join(homedir(), '.claude', 'keybindings.json');
+/** Escape hatch: force a specific chat:submit key regardless of
+ *  keybindings.json. Accepts the same spellings as the config (e.g.
+ *  `meta+enter`, `alt+enter`, `enter`). A value that can't be sent through the
+ *  terminal makes writeInput fail fast with a clear reason. */
+const CLAUDE_SUBMIT_KEY_ENV = 'CLAUDE_CODE_SUBMIT_KEY';
+const CHAT_CONTEXT = 'Chat';
+const CHAT_SUBMIT_ACTION = 'chat:submit';
+const CHAT_NEWLINE_ACTION = 'chat:newline';
+const DEFAULT_SUBMIT_KEY = 'Enter';
+const UNSUPPORTED_SUBMIT_KEY_FAILURE =
+  'Claude Code Chat keybindings have no terminal-sendable chat:submit key. ' +
+  'Only Enter, Meta+Enter (Alt+Enter) can be delivered through tmux/PTY; ' +
+  'keys such as Cmd+Enter, Ctrl+Enter or Shift+Enter cannot.';
+
+interface ClaudeChatKeybindings {
+  submitKeys: string[] | null;
+  rawSubmitSequence: string | null;
+  enterIsNewline: boolean;
+  failureReason?: string;
+}
+
+function readClaudeChatBindings(): Record<string, string> | null {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(readFileSync(CLAUDE_KEYBINDINGS_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed?.bindings)) return null;
+  const chat = parsed.bindings.find((entry: any) => (
+    entry?.context === CHAT_CONTEXT &&
+    entry?.bindings &&
+    typeof entry.bindings === 'object' &&
+    !Array.isArray(entry.bindings)
+  ));
+  return chat?.bindings ?? null;
+}
+
+// Only keys that a terminal can actually deliver to Claude Code's Ink input
+// are listed here. Plain Enter is `\r`; Meta/Alt+Enter is the widely-supported
+// ESC-prefix (`\x1b\r`). Ctrl+Enter and Shift+Enter are deliberately omitted:
+// terminals can't distinguish them from a bare Enter unless the Kitty keyboard
+// protocol / modifyOtherKeys is negotiated, so sending `C-Enter`/`S-Enter`
+// would silently fail to submit. Anything not listed falls through to a
+// fail-fast with a clear reason rather than a phantom submit.
+function toTmuxSubmitKey(key: string): string | null {
+  const normalized = key.trim().toLowerCase();
+  switch (normalized) {
+    case 'enter':
+      return 'Enter';
+    case 'meta+enter':
+    case 'alt+enter':
+    case 'm-enter':
+      return 'M-Enter';
+    default:
+      return null;
+  }
+}
+
+function toRawSubmitSequence(key: string): string | null {
+  const normalized = key.trim().toLowerCase();
+  switch (normalized) {
+    case 'enter':
+      return '\r';
+    case 'meta+enter':
+    case 'alt+enter':
+    case 'm-enter':
+      return '\x1b\r';
+    default:
+      return null;
+  }
+}
+
+function selectSubmitKey(bindings: Record<string, string> | null): string | null {
+  const override = process.env[CLAUDE_SUBMIT_KEY_ENV]?.trim();
+  if (override) return toTmuxSubmitKey(override) ? override : null;
+  if (!bindings) return DEFAULT_SUBMIT_KEY;
+
+  const submitKeys = Object.entries(bindings)
+    .filter(([, action]) => action === CHAT_SUBMIT_ACTION)
+    .map(([key]) => key);
+
+  const terminalFriendlyOrder = ['meta+enter', 'alt+enter', 'enter'];
+  for (const candidate of terminalFriendlyOrder) {
+    if (submitKeys.some(key => key.toLowerCase() === candidate)) return candidate;
+  }
+  const supportedSubmitKey = submitKeys.find(key => toTmuxSubmitKey(key));
+  if (supportedSubmitKey) return supportedSubmitKey;
+  // No terminal-sendable submit binding (none configured, or only unsendable
+  // ones like cmd+enter). Fall back to plain Enter only when Enter is still
+  // unbound — i.e. Claude Code's built-in Enter=submit is intact. If Enter was
+  // remapped (e.g. to chat:newline), sending Enter would never submit, so we
+  // must fail fast instead.
+  return bindingActionForKey(bindings, DEFAULT_SUBMIT_KEY) === undefined ? DEFAULT_SUBMIT_KEY : null;
+}
+
+function bindingActionForKey(bindings: Record<string, string> | null, targetKey: string): string | undefined {
+  const normalizedTarget = targetKey.toLowerCase();
+  return Object.entries(bindings ?? {})
+    .find(([key]) => key.toLowerCase() === normalizedTarget)?.[1];
+}
+
+function resolveClaudeChatKeybindings(): ClaudeChatKeybindings {
+  const bindings = readClaudeChatBindings();
+  const submitKey = selectSubmitKey(bindings);
+  const tmuxSubmitKey = submitKey ? toTmuxSubmitKey(submitKey) : null;
+  const rawSubmitSequence = submitKey ? toRawSubmitSequence(submitKey) : null;
+  return {
+    submitKeys: tmuxSubmitKey ? [tmuxSubmitKey] : null,
+    rawSubmitSequence,
+    enterIsNewline: bindingActionForKey(bindings, DEFAULT_SUBMIT_KEY) === CHAT_NEWLINE_ACTION,
+    failureReason: submitKey === null ? UNSUPPORTED_SUBMIT_KEY_FAILURE : undefined,
+  };
+}
 
 /** PTYs that have already received at least one writeInput. The first write
  *  lands while Ink is still doing its startup render pass (banner, model
@@ -355,10 +470,18 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       const TYPING_THROTTLE_MS = isFirstWrite ? 80 : 30;
 
       const tick = () => new Promise<void>(r => setTimeout(r, TYPING_THROTTLE_MS));
+      const keybindings = resolveClaudeChatKeybindings();
 
-      const sendEnter = () => {
-        if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-        else pty.write('\r');
+      const sendSubmit = (): boolean => {
+        if (pty.sendSpecialKeys && keybindings.submitKeys) {
+          pty.sendSpecialKeys(...keybindings.submitKeys);
+          return true;
+        }
+        if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
+          pty.write(keybindings.rawSubmitSequence);
+          return true;
+        }
+        return false;
       };
 
       // Pid-state path resolver: ~/.claude/sessions/<pid>.json carries
@@ -387,6 +510,18 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       let baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
       const submitFingerprint = makeSubmitFingerprint(content);
       const submitSearchMinMtime = Date.now() - 60_000;
+      const buildResult = (submitted: boolean, failureReason?: string): { submitted: boolean; cliSessionId?: string; failureReason?: string } => {
+        const result = observedCliSessionId
+          ? { submitted, cliSessionId: observedCliSessionId }
+          : { submitted };
+        return failureReason ? { ...result, failureReason } : result;
+      };
+      const submitKeySupportedByBackend = pty.sendSpecialKeys
+        ? !!keybindings.submitKeys
+        : !!keybindings.rawSubmitSequence;
+      if (!submitKeySupportedByBackend) {
+        return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
+      }
 
       if (pty.sendText && pty.sendSpecialKeys) {
         const lines = content.split('\n');
@@ -396,10 +531,12 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
             await tick();
           }
           if (i < lines.length - 1) {
-            // Soft-newline: backslash + Enter inserts a newline in Claude
-            // Code's input box without submitting.
-            pty.sendText('\\');
-            await tick();
+            if (!keybindings.enterIsNewline) {
+              // Soft-newline: backslash + Enter inserts a newline in Claude
+              // Code's input box without submitting.
+              pty.sendText('\\');
+              await tick();
+            }
             pty.sendSpecialKeys('Enter');
             await tick();
           }
@@ -410,7 +547,9 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         pty.write('\x1b[200~' + content + '\x1b[201~');
       }
       await new Promise(r => setTimeout(r, submitDelay));
-      sendEnter();
+      if (!sendSubmit()) {
+        return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
+      }
 
       // Without a JSONL path we can't verify — trust the fixed delay and return.
       // Still surface any sessionId we observed via the pid resolver so the
@@ -485,12 +624,6 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         return false;
       };
 
-      const buildResult = (submitted: boolean): { submitted: boolean; cliSessionId?: string } => {
-        return observedCliSessionId
-          ? { submitted, cliSessionId: observedCliSessionId }
-          : { submitted };
-      };
-
       // Retry budget: up to 2 extra Enters (3 sends total), each followed by
       // an 800ms wait for the JSONL to record either a direct user-submit line
       // or a type-ahead enqueue line. If the user is concurrently typing in the
@@ -501,7 +634,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         if (await confirmSubmit(800)) {
           return observedCliSessionId ? buildResult(true) : undefined;
         }
-        sendEnter();
+        if (!sendSubmit()) break;
       }
       // Final grace check.
       if (await confirmSubmit(800)) {

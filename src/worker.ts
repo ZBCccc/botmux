@@ -2053,8 +2053,26 @@ function scheduleSubmitFailureNotify(
   recheck: (() => boolean | Promise<boolean>) | undefined,
   transcriptLabel: string,
   bridgeTurnId?: string,
+  failureReason?: string,
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+  const dropBridgeMark = (): void => {
+    if (!bridgeTurnId) return;
+    const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
+    if (dropped) {
+      if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
+      log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}) — rotation-fallback scan will stop spinning on this fingerprint.`);
+    }
+  };
+  if (failureReason) {
+    dropBridgeMark();
+    log(`writeInput: submit impossible — notifying user immediately. reason="${failureReason}" preview="${preview}"`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ 刚才那条消息没有写入 ${cliName()}，因为当前按键配置无法从终端自动提交。\n原因：${failureReason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：${preview}`,
+    });
+    return;
+  }
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   setTimeout(async () => {
     if (recheck) {
@@ -2067,13 +2085,7 @@ function scheduleSubmitFailureNotify(
         log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
       }
     }
-    if (bridgeTurnId) {
-      const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
-      if (dropped) {
-        if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
-        log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}) — rotation-fallback scan will stop spinning on this fingerprint.`);
-      }
-    }
+    dropBridgeMark();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     send({
       type: 'user_notify',
@@ -2147,7 +2159,7 @@ async function flushPending(): Promise<void> {
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
       }
       if (result && result.submitted === false) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId);
+        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason);
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's
       // bridge queue doesn't yet attribute queued_command-equivalents, so
@@ -3100,7 +3112,7 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history');
+                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason);
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);
