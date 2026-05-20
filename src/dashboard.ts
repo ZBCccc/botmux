@@ -367,7 +367,11 @@ const server = createServer(async (req, res) => {
       }
       const owner = snap.chatBinding?.larkAppId;
       if (!owner) {
-        return jsonRes(res, 409, { ok: false, error: 'workflow_owner_missing' });
+        return jsonRes(res, 409, {
+          ok: false,
+          error: 'needs_cli_cancel',
+          hint: `This run has no chat-binding owner; use 'botmux workflow cancel ${runId}' instead.`,
+        });
       }
       const upstream = await proxyToDaemon(
         owner,

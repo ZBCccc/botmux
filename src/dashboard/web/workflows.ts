@@ -106,6 +106,7 @@ type EventWindow = {
 type CancelRunResponse = {
   ok: boolean;
   error?: string;
+  hint?: string;
   status?: string;
   alreadyTerminal?: boolean;
   lastSeq?: number;
@@ -474,10 +475,14 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   async function cancelRun(): Promise<void> {
     if (!snapshot || TERMINAL.has(snapshot.run.status) || canceling) return;
     if (!snapshot.chatBinding?.larkAppId) {
-      setError('cancel unavailable: this run has no chat-binding owner');
+      setError(`cancel unavailable: use botmux workflow cancel ${runId}`);
       return;
     }
-    if (!window.confirm(`Cancel workflow run ${runId}?`)) return;
+    const dangling = danglingSummary(snapshot);
+    const message = `Cancel workflow run ${runId}?\n\n` +
+      `${dangling.total} dangling item(s) will be handled by cancel-driven recovery.\n` +
+      `effects=${dangling.effects}, activities=${dangling.activities}, waits=${dangling.waits}, cancels=${dangling.cancels}`;
+    if (!window.confirm(message)) return;
     canceling = true;
     cancelBtn.disabled = true;
     try {
@@ -488,7 +493,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
       });
       const body = (await res.json().catch(() => ({}))) as CancelRunResponse;
       if (!res.ok || !body.ok) {
-        throw new Error(body.error ?? `cancel HTTP ${res.status}`);
+        throw new Error(body.hint ?? body.error ?? `cancel HTTP ${res.status}`);
       }
       setError(null);
       await poll();
@@ -508,9 +513,10 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     refresh.textContent = `refreshed ${new Date().toLocaleTimeString()}`;
     cancelBtn.hidden = TERMINAL.has(run.status);
     cancelBtn.disabled = canceling || !snapshot.chatBinding?.larkAppId;
+    cancelBtn.textContent = snapshot.chatBinding?.larkAppId ? 'Cancel' : 'CLI cancel only';
     cancelBtn.title = snapshot.chatBinding?.larkAppId
       ? 'Cancel this workflow run'
-      : 'Cancel unavailable: no chat-binding owner';
+      : `Cancel unavailable: use botmux workflow cancel ${runId}`;
     renderSummary(summaryEl, snapshot);
     renderDangling(danglingEl, snapshot);
     renderNodeActivityRows(nodeTbody, snapshot);
@@ -578,6 +584,28 @@ function renderSummary(el: HTMLElement, snap: RunSnapshot): void {
   el.innerHTML = items
     .map(([label, value]) => `<div class="wf-summary-item"><span>${label}</span><strong>${value}</strong></div>`)
     .join('');
+}
+
+function danglingSummary(snap: RunSnapshot): {
+  total: number;
+  effects: number;
+  activities: number;
+  waits: number;
+  cancels: number;
+} {
+  const d = snap.dangling;
+  return {
+    total: new Set([
+      ...d.activities,
+      ...d.effectAttempted,
+      ...d.waits,
+      ...d.cancels,
+    ]).size,
+    effects: d.effectAttempted.length,
+    activities: d.activities.length,
+    waits: d.waits.length,
+    cancels: d.cancels.length,
+  };
 }
 
 function renderDangling(el: HTMLElement, snap: RunSnapshot): void {
