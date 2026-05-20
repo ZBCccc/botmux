@@ -16,7 +16,8 @@
  *   off the per-line typing model that claude-code uses: Trae CLI 0.120.31
  *   fresh-spawn treated the rapid send-keys -l burst as an open-ended paste
  *   and swallowed the trailing Enter as a soft-newline, stranding the
- *   message in the input box. Submit is verified via ~/.cache/coco/history.jsonl.
+ *   message in the input box. Submit is verified via CoCo's platform-specific
+ *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
  * - Other adapters (Aiden/Codex/Gemini/OpenCode): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
@@ -44,7 +45,7 @@ import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -52,7 +53,9 @@ import { dirname, join } from 'node:path';
 // ---------------------------------------------------------------------------
 
 const CODEX_HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
-const COCO_HISTORY_PATH = join(homedir(), '.cache', 'coco', 'history.jsonl');
+const COCO_HISTORY_PATH = platform() === 'darwin'
+  ? join(homedir(), 'Library', 'Caches', 'coco', 'history.jsonl')
+  : join(homedir(), '.cache', 'coco', 'history.jsonl');
 const CLAUDE_KEYBINDINGS_PATH = join(homedir(), '.claude', 'keybindings.json');
 
 function appendCodexHistory(content: string, sessionId?: string): void {
