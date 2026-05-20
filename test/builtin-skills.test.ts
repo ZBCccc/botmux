@@ -40,3 +40,18 @@ describe('built-in botmux-quoted skill', () => {
     expect(quoted!.content).toContain('用户引用了消息');
   });
 });
+
+describe('built-in botmux-workflow-create skill', () => {
+  it('exists and teaches validate + current workflow binding constraints', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow-create');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux workflow validate');
+    expect(skill!.content).toContain('botmux bots list');
+    expect(skill!.content).toContain('description');
+    expect(skill!.content).toContain('feishu-send');
+    expect(skill!.content).toContain('feishu-reply');
+    expect(skill!.content).toContain('botmux-schedule');
+    expect(skill!.content).toContain('当前没有字符串模板语言');
+    expect(skill!.content).toContain('不支持 `params.*`');
+  });
+});

@@ -388,12 +388,294 @@ botmux send --mention "ou_yyy:Aiden" "请 @Aiden 帮忙处理"
 \`\`\`
 `;
 
+const WORKFLOW_CREATE_SKILL = `---
+name: botmux-workflow-create
+description: 根据用户自然语言描述生成 botmux workflow JSON 定义文件。触发场景：用户说"我想做个流程"、"创建 workflow"、"把 X 拆成自动化"、"编排"、"orchestrate"、"自动化跑这几步"；或显式提到 botmux workflow create。必须先用 botmux bots list 查看可用 bot，先给用户确认设计，再写 workflows/<workflowId>.workflow.json，并用 botmux workflow validate 校验。
+---
+
+# botmux-workflow-create — Workflow 编排助手
+
+把用户口头描述的几步任务翻译成可执行的 workflow JSON。本 skill 只负责设计、生成、校验，不负责启动 run；启动用 \`botmux workflow run <id>\` 或 IM \`/workflow run <id>\`。
+
+## 硬规则
+
+1. 不要在用户确认设计稿前写文件。
+2. 必须先跑 \`botmux bots list\`，按输出里的 \`name\` 填 \`subagent.bot\`，不要猜 bot 名。
+3. 写到 \`workflows/<workflowId>.workflow.json\`；\`workflowId\` 推荐 kebab-case。
+4. 写完必须跑 \`botmux workflow validate <path>\`，失败就按错误修到通过。
+5. 高风险节点主动建议 \`humanGate\`：发消息、写文件、外部 API、git push、删除/覆盖。纯读、草稿、纯计算通常不加 gate。
+6. 当前没有字符串模板语言：不要写 \`{{params.name}}\` 或 \`{{draft.output}}\` 期望 runtime 展开。
+7. 当前 \`$ref\` 只支持整值替换 \`<nodeId>.output.<path>\`，不支持 \`params.*\`，也不能拼接字符串。
+
+## 工作流程
+
+### Step 1 — 理解需求
+
+先复述你理解的流程拆分，必要时问 1-3 个澄清问题。不要直接写 JSON。
+
+### Step 2 — 查 bot 清单
+
+\`\`\`bash
+botmux bots list
+\`\`\`
+
+记住每个 bot 的 \`name\`。后续 \`subagent.bot\` 必须使用这些 name。
+
+### Step 3 — 给用户确认设计草案
+
+用表格展示节点设计：
+
+| 节点 id | 类型 | bot/executor | 做什么 | 依赖 | humanGate |
+|---|---|---|---|---|---|
+| draft | subagent | claude-loopy | 写草稿 | - | - |
+| send | hostExecutor | feishu-send | 发到群里 | draft | 审批草稿 |
+
+同时说明：
+- 为什么选择这个 bot 或 executor；
+- 哪些字段从上游 output 通过 \`$ref\` 传递；
+- 哪些节点需要 humanGate，以及原因。
+
+等用户明确确认后再写文件。
+
+### Step 4 — 生成 JSON
+
+创建 \`workflows/<workflowId>.workflow.json\`。每个 node 建议写 \`description\`，记录设计理由或 bot 选择理由。
+
+### Step 5 — 校验
+
+\`\`\`bash
+botmux workflow validate workflows/<workflowId>.workflow.json
+\`\`\`
+
+validate 能抓 JSON/schema/graph 错误；但它不会检查 bot 是否真的存在，也不会检查 \`$ref\` 指向的 output 字段是否运行时一定存在，所以你仍要人工核对 bots list 和 outputSchema。
+
+### Step 6 — 交付
+
+告诉用户文件路径、validate 结果、启动命令：
+
+\`\`\`bash
+botmux workflow run <workflowId>
+# 或在飞书话题里:
+/workflow run <workflowId>
+\`\`\`
+
+## Schema 速查
+
+顶层：
+
+\`\`\`json
+{
+  "workflowId": "my-workflow",
+  "version": 1,
+  "params": {
+    "name": { "type": "string", "required": true, "description": "human input metadata" }
+  },
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {}
+}
+\`\`\`
+
+注意：\`params\` 当前用于 CLI/IM 入参校验和 run 记录，不会自动注入 prompt，也不能用 \`$ref: "params.x"\`。
+
+subagent node：
+
+\`\`\`json
+{
+  "type": "subagent",
+  "bot": "claude-loopy",
+  "prompt": "Static prompt string, or a whole-field { \\"$ref\\": \\"draft.output.text\\" }",
+  "depends": ["draft"],
+  "humanGate": { "stage": "before", "prompt": { "$ref": "draft.output.preview" } },
+  "outputSchema": { "type": "object" },
+  "description": "Why this bot/node exists"
+}
+\`\`\`
+
+hostExecutor node：
+
+\`\`\`json
+{
+  "type": "hostExecutor",
+  "executor": "feishu-send",
+  "depends": ["draft"],
+  "input": {
+    "larkAppId": "cli_xxx",
+    "chatId": "oc_xxx",
+    "content": { "$ref": "draft.output.text" },
+    "msgType": "text"
+  },
+  "description": "Side effect node; usually gated before execution"
+}
+\`\`\`
+
+已知默认 hostExecutor：
+- \`botmux-schedule\`：创建 botmux schedule task。
+- \`feishu-send\`：向 chatId 发飞书消息。
+- \`feishu-reply\`：回复 rootMessageId。
+
+如果用户提到其他 executor，先问他 executor 名和 input schema，不要猜。
+
+humanGate：
+
+\`\`\`json
+{
+  "stage": "before",
+  "prompt": "literal text or whole-field $ref",
+  "approvers": [],
+  "deadlineMs": 600000,
+  "onTimeout": "fail"
+}
+\`\`\`
+
+- \`stage\` 只支持 \`"before"\`。
+- \`approvers: []\` 或省略 = 任何 bot allowedUsers 都能批；非空 = open_id 白名单。
+- gate prompt 如果要展示上游产物，推荐让上游输出一个完整 \`preview\` 字段，然后写 \`{ "$ref": "draft.output.preview" }\`。
+
+## 数据流规则
+
+只支持 \`$ref\`：
+
+\`\`\`json
+{ "$ref": "draft.output.text" }
+\`\`\`
+
+约束：
+- 语法只能是 \`<nodeId>.output.<path>\`。
+- \`$ref\` 对象必须独占，不能有额外 key。
+- \`$ref\` 是整值替换，不能拼字符串。
+- 引用某个 node 的 output 时，当前 node 必须在 \`depends\` 里声明该 node。
+- validate 不会证明 output 字段存在；用 \`outputSchema\` 和 few-shot prompt 约束 subagent 返回 JSON。
+
+## humanGate 启发式
+
+| 操作 | humanGate | 理由 |
+|---|---|---|
+| 发飞书消息、邮件 | 加 | 不可撤回或高可见 |
+| 写 repo 文件、git commit/push | 加 | 影响代码状态 |
+| 调外部写 API、付费 API | 加 | 副作用或成本 |
+| 删除、覆盖 | 加 | 高风险 |
+| 纯读、草稿、总结、纯计算 | 通常不加 | gate 噪音大 |
+
+一般把 gate 放在副作用节点的 \`humanGate.stage="before"\`，让用户审批最终将要发送/执行的内容。
+
+## 范例 A — subagent → humanGate → subagent
+
+\`\`\`json
+{
+  "workflowId": "hello-review",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "draft": {
+      "type": "subagent",
+      "bot": "claude-loopy",
+      "prompt": "Write a short greeting. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["preview", "text"],
+        "properties": {
+          "preview": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      },
+      "description": "Generate the draft greeting."
+    },
+    "finalize": {
+      "type": "subagent",
+      "bot": "claude-loopy",
+      "depends": ["draft"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "draft.output.preview" },
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "prompt": { "$ref": "draft.output.text" },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message"],
+        "properties": { "message": { "type": "string" } }
+      },
+      "description": "Run only after approval and produce the final JSON."
+    }
+  }
+}
+\`\`\`
+
+## 范例 B — subagent → gated feishu-send
+
+\`\`\`json
+{
+  "workflowId": "weekly-report",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 8192
+  },
+  "nodes": {
+    "draft": {
+      "type": "subagent",
+      "bot": "claude-loopy",
+      "prompt": "Draft a weekly report. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
+      "outputSchema": {
+        "type": "object",
+        "required": ["preview", "text"],
+        "properties": {
+          "preview": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      },
+      "description": "Draft content before any side effect."
+    },
+    "send": {
+      "type": "hostExecutor",
+      "executor": "feishu-send",
+      "depends": ["draft"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "draft.output.preview" },
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "input": {
+        "larkAppId": "cli_PLACEHOLDER",
+        "chatId": "oc_PLACEHOLDER",
+        "content": { "$ref": "draft.output.text" },
+        "msgType": "text"
+      },
+      "description": "Send is an irreversible side effect, so it is gated."
+    }
+  }
+}
+\`\`\`
+
+## 常见错误
+
+- 写 \`{{...}}\` 模板：当前 runtime 不展开，改成整字段 \`$ref\` 或让上游输出完整字符串。
+- 写 \`{ "$ref": "params.x" }\`：不支持。参数当前不能作为 binding 来源。
+- \`$ref\` 引用的 node 没写进 \`depends\`：validate 可能过，运行时顺序不可靠。
+- \`humanGate.stage: "after"\`：不支持。
+- \`$ref\` 对象还有其他 key：schema 会拒绝。
+- nodeId 含 \`/\`、\`..\`、空格：schema 会拒绝。
+- executor 名不是默认三种之一且用户没确认：不要猜。
+`;
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
+  { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The
