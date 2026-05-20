@@ -113,6 +113,17 @@ describe('dashboard workflow API routes', () => {
     expect(proxyToDaemon).not.toHaveBeenCalled();
   });
 
+  it('rejects invalid cancel runId before touching disk or proxying', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/runs/..%2Fescape/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'stop' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_run_id' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
   it('returns needs_cli_cancel when a non-terminal run has no chat-binding owner', async () => {
     await seedWaitingRun('api-cli-only-01', WAIT_DEF);
 
