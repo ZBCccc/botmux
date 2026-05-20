@@ -1,5 +1,5 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -11,7 +11,9 @@ import type { CliAdapter, PtyHandle } from './types.js';
  *  the Codex adapter uses ~/.codex/history.jsonl: write → poll for our
  *  marker → retry Enter if missing → return {submitted:false, recheck}
  *  on final failure so worker can surface a Lark warning. */
-const HISTORY_PATH = join(homedir(), '.cache', 'coco', 'history.jsonl');
+const HISTORY_PATH = platform() === 'darwin'
+  ? join(homedir(), 'Library', 'Caches', 'coco', 'history.jsonl')
+  : join(homedir(), '.cache', 'coco', 'history.jsonl');
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -128,7 +130,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // OFF after slash commands; CoCo on a fresh-spawn message doesn't have
       // that concern.
       //
-      // Verification (unchanged): poll ~/.cache/coco/history.jsonl for the
+      // Verification (unchanged): poll CoCo's platform-specific history.jsonl for the
       // user-submit line whose decoded `content` starts with our prefix.
       // Retry Enter up to 3 times, then return {submitted:false, recheck}
       // for the worker's deferred recheck + Lark warning path.

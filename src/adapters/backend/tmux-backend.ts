@@ -269,7 +269,9 @@ export class TmuxBackend implements SessionBackend {
 
   /**
    * Paste text into the tmux pane via load-buffer + paste-buffer.
-   * Tmux automatically wraps in bracketed paste if the pane has it enabled.
+   * The -p flag asks tmux to insert bracketed-paste markers
+   * (\e[200~ … \e[201~) when the application has requested bracketed paste,
+   * so TUI apps (CoCo/Ink, etc.) can detect paste boundaries reliably.
    * Safe for multiline content (unlike sendText where \n becomes Enter).
    */
   pasteText(text: string): void {
@@ -280,7 +282,7 @@ export class TmuxBackend implements SessionBackend {
       timeout: 5000,
       env: tmuxEnv(),
     });
-    execFileSync('tmux', ['paste-buffer', '-t', this.cmdTarget, '-d'], {
+    execFileSync('tmux', ['paste-buffer', '-t', this.cmdTarget, '-d', '-p'], {
       stdio: 'ignore',
       timeout: 5000,
       env: tmuxEnv(),
