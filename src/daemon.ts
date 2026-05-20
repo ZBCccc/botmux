@@ -1169,7 +1169,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // tmux 版本自检：过低/异常构建在 tmux 模式下会导致输入异常、会话中途退出。
     // logger.error + 私信 admin 提示升级。异步 best-effort，不影响 daemon。
-    checkTmuxVersion(cfg.larkAppId).catch(err => {
+    // 只在实际使用 tmux 后端时校验（per-bot backendType ?? 全局默认），纯 PTY
+    // 部署不做提示，避免误报。
+    const effectiveBackend = cfg.backendType ?? config.daemon.backendType;
+    checkTmuxVersion(cfg.larkAppId, effectiveBackend).catch(err => {
       logger.debug(`[${cfg.larkAppId}] tmux version check failed: ${err?.message ?? err}`);
     });
 

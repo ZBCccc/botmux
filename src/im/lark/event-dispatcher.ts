@@ -241,7 +241,15 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
 // 路径——线上踩到的现象是「消息还没打完，CLI 就退出了」（进而曾打死整个 worker，
 // 见 TmuxPipeBackend guardedSend）。启动时核对一次 tmux 版本，过低就 logger.error
 // 并私信 admin 提示升级。校验异步、best-effort，失败不影响 daemon。
-export async function checkTmuxVersion(larkAppId: string): Promise<void> {
+//
+// effectiveBackend 由 daemon 传入（per-bot backendType ?? 全局默认）。只在实际
+// 走 tmux 后端时才校验——纯 PTY 部署即便机器上有旧 tmux 也不该收到“升级 tmux”
+// 的误报/私信（Codex review 指出）。
+export async function checkTmuxVersion(larkAppId: string, effectiveBackend: 'pty' | 'tmux'): Promise<void> {
+  if (effectiveBackend !== 'tmux') {
+    logger.debug(`[${larkAppId}] tmux 版本检查跳过：当前后端为 ${effectiveBackend}，不使用 tmux`);
+    return;
+  }
   const result = evaluateTmuxVersion();
   if (result.ok) {
     if (result.detected) logger.info(`[${larkAppId}] tmux 版本检查通过：${result.detected}（要求 ≥ tmux ${result.min}）`);

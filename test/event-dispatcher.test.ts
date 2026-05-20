@@ -41,11 +41,13 @@ const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; n
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
+const mockSendUserMessage = vi.fn(async () => 'dm-id');
 vi.mock('../src/im/lark/client.js', () => ({
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
+  sendUserMessage: (...args: any[]) => mockSendUserMessage(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -81,7 +83,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
-import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, checkTmuxVersion, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { logger } from '../src/utils/logger.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1459,5 +1462,23 @@ describe('writeBotInfoFile — multi-daemon merge', () => {
     const written = JSON.parse(mockWriteFileSync.mock.calls[0][1]);
     expect(written).toHaveLength(1);
     expect(written[0].larkAppId).toBe(MY_APP_ID);
+  });
+});
+
+describe('checkTmuxVersion backend gating', () => {
+  beforeEach(() => {
+    vi.mocked(logger.error).mockClear();
+    vi.mocked(logger.warn).mockClear();
+    mockSendUserMessage.mockClear();
+  });
+
+  // Codex review: a PTY-only deployment must NOT get an "upgrade tmux" warning
+  // even if the host has an old tmux binary lying around. The check returns
+  // before ever probing the version.
+  it('skips entirely when the effective backend is pty — no error log, no DM', async () => {
+    setupBotState();
+    await checkTmuxVersion(MY_APP_ID, 'pty');
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(mockSendUserMessage).not.toHaveBeenCalled();
   });
 });
