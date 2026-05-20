@@ -1,6 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  mkdirSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -99,5 +106,35 @@ describe('botmux workflow CLI', () => {
     expect(showOut.stdout).toContain('"workflowId": "cli-hello"');
     expect(showOut.stdout).toContain('"status": "running"');
     expect(showOut.stdout).toContain('danglingWaits');
+  });
+
+  it('cancel <runId> cancels an awaiting humanGate run', () => {
+    const runOut = runCli(['workflow', 'run', 'cli-hello', '--param', 'name=Cancel']);
+    expect(runOut.status).toBe(0);
+    const runId = runOut.stdout.match(/runId=(\S+)/)?.[1];
+    expect(runId).toBeDefined();
+
+    const cancelOut = runCli(['workflow', 'cancel', runId!, '--reason', 'stop-test']);
+    expect(cancelOut.status).toBe(0);
+    expect(cancelOut.stdout).toContain('run.status=cancelled');
+
+    const raw = readFileSync(join(runsDir, runId!, 'events.ndjson'), 'utf-8');
+    const types = raw
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line).type);
+    expect(types).toContain('cancelRequested');
+    expect(types).toContain('activityCanceled');
+    expect(types).toContain('nodeCanceled');
+    expect(types).toContain('runCanceled');
+
+    const showOut = runCli(['workflow', 'show', runId!]);
+    expect(showOut.status).toBe(0);
+    expect(showOut.stdout).toContain('"status": "cancelled"');
+
+    const cancelAgain = runCli(['workflow', 'cancel', runId!, '--reason', 'already-done']);
+    expect(cancelAgain.status).toBe(0);
+    expect(cancelAgain.stdout).toContain('terminal');
+    expect(readFileSync(join(runsDir, runId!, 'events.ndjson'), 'utf-8')).toBe(raw);
   });
 });

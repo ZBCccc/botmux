@@ -74,8 +74,10 @@ export async function runLoop(
     // those out before any forward decision.  Without reconcilers we
     // CANNOT silently proceed — the dangling effect represents real
     // external state we'd be ignoring.
+    const danglingCancelSet = new Set(snapshot.danglingCancels);
     const danglingRecoverableActivities = snapshot.danglingActivities.filter(
-      (activityId) => !snapshot.danglingWaits.includes(activityId),
+      (activityId) =>
+        !snapshot.danglingWaits.includes(activityId) || danglingCancelSet.has(activityId),
     );
     if (
       snapshot.danglingEffectAttempted.length > 0 ||
@@ -112,10 +114,11 @@ export async function runLoop(
         return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
       }
       if (before.size === 0 && beforeRecoverable.size > 0) {
+        const afterCancelSet = new Set(snapshot.danglingCancels);
         const stillRecoverable = snapshot.danglingActivities.filter(
           (activityId) =>
             beforeRecoverable.has(activityId) &&
-            !snapshot.danglingWaits.includes(activityId),
+            (!snapshot.danglingWaits.includes(activityId) || afterCancelSet.has(activityId)),
         );
         if (stillRecoverable.length === beforeRecoverable.size) {
           logger.warn?.(

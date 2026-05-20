@@ -14,6 +14,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import { EventLog } from '../workflows/events/append.js';
+import { replay, type Snapshot } from '../workflows/events/replay.js';
 import { parseWorkflowDefinition } from '../workflows/definition.js';
 import { loadWorkflowDefinition } from '../workflows/loader.js';
 import { runLoop } from '../workflows/loop.js';
@@ -25,6 +26,11 @@ import {
   createDefaultProviderReconcilers,
 } from '../workflows/hostExecutors/registry.js';
 import { loadEffectInputSidecar } from '../workflows/effect-input.js';
+import {
+  completeNodeCancel,
+  completeRunCancel,
+  requestCancel,
+} from '../workflows/cancel.js';
 import {
   createStubSpawnFn,
   type StubSpawnHandler,
@@ -67,6 +73,9 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
     case 'resume':
       await cmdWorkflowResume(rest);
       return;
+    case 'cancel':
+      await cmdWorkflowCancel(rest);
+      return;
     case 'show':
       await cmdWorkflowShow(rest);
       return;
@@ -83,7 +92,7 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
 }
 
 function printHelp(): void {
-  console.log(`用法: botmux workflow <run|resume|show> [...]
+  console.log(`用法: botmux workflow <run|resume|cancel|show> [...]
 
 子命令:
   run <id> [--param key=value ...] [--run-id <id>] [--bot-resolver echo]
@@ -96,6 +105,10 @@ function printHelp(): void {
       不伪造审批；run 已 terminal 则直接打摘要，零事件写入。
       CLI 不会 spawn 新 subagent —— 现有 in-flight subagent 会被标记
       WorkerCrashed/manual 并由 orchestrator 终结 run。
+
+  cancel <runId> [--reason <text>]
+      写入 run-level cancelRequested 并驱动 cancel recovery。terminal run
+      直接 no-op；不会发 IM 通知或重发审批卡。
 
   show <runId>
       replay 当前 run 的事件，打印 Snapshot 摘要。
@@ -326,6 +339,202 @@ async function cmdWorkflowResume(rest: string[]): Promise<void> {
   if (result.reason === 'terminal' && result.lastSnapshot.run.status !== 'succeeded') {
     process.exit(1);
   }
+}
+
+// ─── cancel ───────────────────────────────────────────────────────────────
+
+async function cmdWorkflowCancel(rest: string[]): Promise<void> {
+  const runId = positionals(rest)[0];
+  if (!runId) {
+    console.error('用法: botmux workflow cancel <runId> [--reason <text>]');
+    process.exit(1);
+  }
+  const reason = argValue(rest, '--reason') ?? 'cancelled via botmux workflow cancel';
+  const runsDir = getRunsDir();
+  const log = new EventLog(runId, runsDir);
+
+  const def = await loadRunWorkflowDefinition(runId, runsDir);
+  let snapshot = replay(await readExistingRunEvents(log, runsDir, runId));
+
+  console.log(`workflow=${def.workflowId} runId=${runId}`);
+  console.log(`runsDir=${runsDir}`);
+
+  if (isTerminalRunStatus(snapshot.run.status)) {
+    console.log(`\nrun.status=${snapshot.run.status} (terminal — nothing to cancel)`);
+    console.log(`events: ${snapshot.lastSeq}`);
+    return;
+  }
+
+  if (!snapshot.cancelledRunIntent) {
+    const cancel = await requestCancel(
+      log,
+      {
+        target: { kind: 'run', runId },
+        reason,
+        by: 'cli',
+      },
+      'human',
+    );
+    console.log(`cancelRequested: ${cancel.eventId}`);
+  } else {
+    console.log(`cancel already requested: ${snapshot.cancelledRunIntent.cancelOriginEventId}`);
+  }
+
+  snapshot = replay(await log.readAll());
+  await finalizeRunCancelIfPossible(log, def, snapshot);
+
+  const ctx = workflowCliRuntimeContext(log, def, cliResumeSpawnSubagent);
+  const result = await runLoop(ctx, { maxTicks: 200 });
+
+  snapshot = replay(await log.readAll());
+  await finalizeRunCancelIfPossible(log, def, snapshot);
+  snapshot = replay(await log.readAll());
+
+  console.log(`\nloop stopped: ${result.reason} after ${result.ticks} tick(s)`);
+  console.log(`run.status=${snapshot.run.status}`);
+  console.log(`events: ${snapshot.lastSeq}`);
+  if (snapshot.danglingCancels.length > 0) {
+    console.log(`dangling cancels: ${snapshot.danglingCancels.join(', ')}`);
+  }
+  if (snapshot.danglingEffectAttempted.length > 0) {
+    console.log(`dangling effects: ${snapshot.danglingEffectAttempted.join(', ')}`);
+  }
+  if (snapshot.danglingWaits.length > 0) {
+    console.log(`dangling waits: ${snapshot.danglingWaits.join(', ')}`);
+  }
+
+  if (snapshot.run.status !== 'cancelled') {
+    process.exit(1);
+  }
+}
+
+function workflowCliRuntimeContext(
+  log: EventLog,
+  def: Awaited<ReturnType<typeof loadRunWorkflowDefinition>>,
+  spawnSubagent: WorkerSpawnFn,
+): WorkflowRuntimeContext {
+  return {
+    log,
+    def,
+    spawnSubagent,
+    hostExecutors: createDefaultHostExecutorRegistry(),
+    reconcilers: createDefaultProviderReconcilers(),
+    loadEffectInput: (activityId, attemptId) =>
+      loadEffectInputSidecar(log, activityId, attemptId),
+  };
+}
+
+const cliResumeSpawnSubagent: WorkerSpawnFn = async (input) => ({
+  kind: 'failure',
+  errorCode: 'WorkerCrashed',
+  errorClass: 'manual',
+  errorMessage:
+    `subagent '${input.botName}' (node=${input.nodeId}, activity=${input.activityId}) ` +
+    `is not resumable via 'botmux workflow resume' — CLI does not spawn workers. ` +
+    `Use IM /workflow run for full execution, or restart the run.`,
+});
+
+async function loadRunWorkflowDefinition(
+  runId: string,
+  runsDir = getRunsDir(),
+): Promise<Awaited<ReturnType<typeof loadWorkflowDefinition>>> {
+  const workflowJsonPath = join(runDir(runId, runsDir), 'workflow.json');
+  let defRaw: string;
+  try {
+    defRaw = await fs.readFile(workflowJsonPath, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.error(`找不到 runDir 的 workflow.json：${workflowJsonPath}`);
+      console.error(`(runsDir=${runsDir}；用 BOTMUX_WORKFLOW_RUNS_DIR 覆盖)`);
+    } else {
+      console.error(`读取 ${workflowJsonPath} 失败：${(err as Error).message}`);
+    }
+    process.exit(1);
+  }
+
+  try {
+    return parseWorkflowDefinition(JSON.parse(defRaw!));
+  } catch (err) {
+    console.error(`解析 ${workflowJsonPath} 失败：${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
+async function readExistingRunEvents(
+  log: EventLog,
+  runsDir: string,
+  runId: string,
+) {
+  const events = await log.readAll();
+  if (events.length === 0) {
+    console.error(`runId=${runId} 没找到任何事件 (runsDir=${runsDir})`);
+    process.exit(1);
+  }
+  return events;
+}
+
+function isTerminalRunStatus(status: string): boolean {
+  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
+}
+
+async function finalizeRunCancelIfPossible(
+  log: EventLog,
+  def: Awaited<ReturnType<typeof loadRunWorkflowDefinition>>,
+  snapshot: Snapshot,
+): Promise<void> {
+  const intent = snapshot.cancelledRunIntent;
+  if (!intent) return;
+
+  for (const nodeId of Object.keys(def.nodes)) {
+    const nodeStatus = snapshot.nodes.get(nodeId)?.status ?? 'idle';
+    if (isTerminalNodeStatus(nodeStatus)) continue;
+    const ownedActivities = [...snapshot.activities.values()].filter(
+      (activity) => activity.ownerNodeId === nodeId,
+    );
+    const hasNonTerminalActivity = ownedActivities.some(
+      (activity) => !isTerminalActivityStatus(activity.status),
+    );
+    if (hasNonTerminalActivity) continue;
+    await completeNodeCancel(
+      log,
+      {
+        nodeId,
+        cancelOriginEventId: intent.cancelOriginEventId,
+      },
+      'scheduler',
+    );
+  }
+
+  const afterNodes = replay(await log.readAll());
+  if (!afterNodes.cancelledRunIntent) return;
+  const allNodesTerminal = Object.keys(def.nodes).every((nodeId) =>
+    isTerminalNodeStatus(afterNodes.nodes.get(nodeId)?.status ?? 'idle'),
+  );
+  if (!allNodesTerminal) return;
+
+  await completeRunCancel(
+    log,
+    { cancelOriginEventId: afterNodes.cancelledRunIntent.cancelOriginEventId },
+    'scheduler',
+  );
+}
+
+function isTerminalNodeStatus(status: string): boolean {
+  return (
+    status === 'succeeded' ||
+    status === 'failed' ||
+    status === 'skipped' ||
+    status === 'cancelled'
+  );
+}
+
+function isTerminalActivityStatus(status: string): boolean {
+  return (
+    status === 'succeeded' ||
+    status === 'failed' ||
+    status === 'timedOut' ||
+    status === 'cancelled'
+  );
 }
 
 function collectParams(rest: string[]): Record<string, unknown> {
