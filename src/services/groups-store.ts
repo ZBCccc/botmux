@@ -146,6 +146,33 @@ export async function transferChatOwner(
 }
 
 /**
+ * Fetch the current owner of a chat (as an open_id). Used by group-creator to
+ * verify the post-transfer state when transferChatOwner returns an error —
+ * Lark sometimes ACKs a transfer slowly (e.g. 504 Gateway Timeout) even though
+ * the server-side write succeeded, so a follow-up read disambiguates "really
+ * failed" from "ACK lost".
+ *
+ * Returns undefined when the API itself errors or doesn't include owner_id;
+ * callers treat undefined as "unknown" and keep the original error.
+ */
+export async function getChatOwner(
+  larkAppId: string, chatId: string,
+): Promise<string | undefined> {
+  const client = getBotClient(larkAppId);
+  try {
+    const res: any = await (client as any).im.v1.chat.get({
+      path: { chat_id: chatId },
+      params: { user_id_type: 'open_id' },
+    });
+    if (res.code !== 0 && res.code !== undefined) return undefined;
+    const owner = res.data?.owner_id;
+    return typeof owner === 'string' && owner.length > 0 ? owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Disband (delete) a chat. The Lark API only succeeds when the calling bot is
  * the chat's current owner, OR is the creator AND the app holds
  * `im:chat:operate_as_owner`. Routes that fan-out to multiple bots can use

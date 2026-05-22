@@ -17,7 +17,7 @@
  * `notifyOwnerOpenId` MUST be in `creatorLarkAppId`'s app scope. Enforcing
  * this is the decision layer's job — the service trusts its inputs.
  */
-import { createChat, transferChatOwner } from './groups-store.js';
+import { createChat, transferChatOwner, getChatOwner } from './groups-store.js';
 import { sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
 
@@ -69,8 +69,21 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       transferError = 'invitee_rejected';
     } else {
       const tr = await transferChatOwner(opts.creatorLarkAppId, r.chatId, opts.transferOwnerTo);
-      if (tr.ok) ownerTransferredTo = opts.transferOwnerTo;
-      else transferError = tr.error;
+      if (tr.ok) {
+        ownerTransferredTo = opts.transferOwnerTo;
+      } else {
+        // Lark occasionally ACKs the owner transfer slowly (504 Gateway Timeout
+        // or transient network error) even though the write actually committed
+        // server-side. Verify by reading back the current owner before
+        // surfacing the error — if the chat is already owned by the target,
+        // the transfer really did succeed and the warning would mislead.
+        const currentOwner = await getChatOwner(opts.creatorLarkAppId, r.chatId);
+        if (currentOwner === opts.transferOwnerTo) {
+          ownerTransferredTo = opts.transferOwnerTo;
+        } else {
+          transferError = tr.error;
+        }
+      }
     }
   }
 

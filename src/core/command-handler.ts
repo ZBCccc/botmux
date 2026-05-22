@@ -11,7 +11,7 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage } from '../im/lark/client.js';
+import { deleteMessage, sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
@@ -27,7 +27,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt', '/oncall']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/login', '/adopt', '/oncall', '/group', '/g']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -672,6 +672,115 @@ export async function handleCommand(
         break;
       }
 
+      case '/group':
+      case '/g': {
+        // Extract the requested group name from the user's message body.
+        // Strip whichever alias was used; split on newlines and take the first
+        // non-blank line so multi-line pastes don't smear into the name field.
+        const rawArgs = message.content.replace(/^\/(group|g)\s*/i, '');
+        const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const MAX_NAME = 50; // Lark group names cap around 60; leave headroom for '…'
+        let groupName: string;
+        if (firstLine) {
+          groupName = firstLine.length > MAX_NAME ? firstLine.slice(0, MAX_NAME) + '…' : firstLine;
+        } else {
+          const now = new Date();
+          const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+          groupName = t('cmd.group.empty_fallback', { ts }, loc);
+        }
+
+        const creatorAppId = larkAppId ?? ds?.larkAppId;
+        if (!creatorAppId) {
+          await sessionReply(rootId, t('cmd.group.no_bot', undefined, loc));
+          break;
+        }
+
+        const senderOpenId = message.senderId;
+        if (!senderOpenId) {
+          await sessionReply(rootId, t('cmd.group.no_sender', undefined, loc));
+          break;
+        }
+
+        try {
+          const { createGroupWithBots } = await import('../services/group-creator.js');
+          const result = await createGroupWithBots({
+            creatorLarkAppId: creatorAppId,
+            larkAppIds: [creatorAppId],
+            name: groupName,
+            userOpenIds: [senderOpenId],
+            transferOwnerTo: senderOpenId,
+            notifyOwnerOpenId: senderOpenId,
+          });
+          const link = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
+          // Partial failures are non-fatal — the chat exists; surface them as
+          // hints so the user knows whether to expect to be auto-invited.
+          const hints: string[] = [];
+          if (result.invalidUserIds.includes(senderOpenId)) {
+            hints.push(t('cmd.group.warn_invite_rejected', undefined, loc));
+          } else if (result.transferError) {
+            hints.push(t('cmd.group.warn_transfer_failed', { reason: result.transferError }, loc));
+          }
+          const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
+          await sessionReply(rootId, t('cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
+          logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" invitee=${senderOpenId}`);
+
+          // Auto-bootstrap the new chat: scan repos and post a repo-select card
+          // so the user doesn't need to send a second message to start the
+          // session. Mirrors the chat-scope auto-create branch in
+          // daemon.handleNewTopic, minus the worker spawn — clicking a repo on
+          // the card flows through card-handler which spawns the worker.
+          // Non-fatal: failures here just leave the new chat empty; user can
+          // still kick things off by sending any message.
+          try {
+            const scanDirs = getProjectScanDirs({ larkAppId: creatorAppId } as DaemonSession).filter(d => existsSync(d));
+            const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs) : [];
+            if (projects.length > 0) {
+              const newSession = sessionStore.createSession(result.chatId, result.chatId, `/group ${groupName}`.substring(0, 50), 'group');
+              const now = Date.now();
+              newSession.larkAppId = creatorAppId;
+              newSession.scope = 'chat';
+              newSession.ownerOpenId = senderOpenId;
+              newSession.lastCallerOpenId = senderOpenId;
+              newSession.lastMessageAt = new Date(now).toISOString();
+              sessionStore.updateSession(newSession);
+
+              const newDs: DaemonSession = {
+                session: newSession,
+                worker: null,
+                workerPort: null,
+                workerToken: null,
+                larkAppId: creatorAppId,
+                chatId: result.chatId,
+                chatType: 'group',
+                scope: 'chat',
+                spawnedAt: now,
+                cliVersion: 'unknown',
+                lastMessageAt: now,
+                hasHistory: false,
+                pendingRepo: true,
+                ownerOpenId: senderOpenId,
+              };
+              activeSessions.set(sessionKey(result.chatId, creatorAppId), newDs);
+              deps.lastRepoScan.set(result.chatId, projects);
+
+              const currentCwd = getSessionWorkingDir(newDs);
+              const cardJson = buildRepoSelectCard(projects, currentCwd, result.chatId, loc);
+              const cardMessageId = await sendMessage(creatorAppId, result.chatId, cardJson, 'interactive');
+              newDs.repoCardMessageId = cardMessageId;
+              logger.info(`[${logTag}] /group posted repo-select card in new chat ${result.chatId} (${projects.length} projects)`);
+            } else {
+              logger.info(`[${logTag}] /group skipped repo-select card: no projects under scan dirs`);
+            }
+          } catch (bootstrapErr: any) {
+            logger.warn(`[${logTag}] /group auto-bootstrap failed: ${bootstrapErr?.message ?? bootstrapErr}`);
+          }
+        } catch (err: any) {
+          logger.error(`[${logTag}] /group failed: ${err?.message ?? err}`);
+          await sessionReply(rootId, t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
+        }
+        break;
+      }
+
       case '/help': {
         const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
@@ -712,6 +821,9 @@ export async function handleCommand(
           t('help.heading_grant', undefined, loc),
           t('help.grant', undefined, loc),
           t('help.revoke', undefined, loc),
+          '',
+          t('help.heading_group', undefined, loc),
+          t('help.group', undefined, loc),
           '',
           t('help.help', undefined, loc),
         ];

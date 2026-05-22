@@ -134,6 +134,13 @@ export const messages: Record<string, string> = {
   'cmd.oncall.unbind_not_bound': 'This group is not bound to oncall. (Unbind intent recorded — default-oncall won\'t auto-bind this group again.)',
   'cmd.oncall.unbind_success': '✅ Oncall binding released. The next new topic will fall back to the default repo-selection flow.',
   'cmd.oncall.unknown_sub': 'Unknown subcommand: {sub}\nSupported: /oncall bind <path> | /oncall unbind | /oncall status',
+  'cmd.group.empty_fallback': 'New session {ts}',
+  'cmd.group.no_bot': '⚠️ Cannot identify the responding bot — /group aborted.',
+  'cmd.group.no_sender': '⚠️ Cannot get sender open_id — /group aborted.',
+  'cmd.group.created': '✅ Created group "{name}"\n👉 {link}\n\nJust start chatting in the new group — the whole group is one CLI session.{hints}',
+  'cmd.group.failed': '⚠️ Failed to create group: {error}',
+  'cmd.group.warn_invite_rejected': '⚠️ Feishu rejected the auto-invite (your open_id may not be in this bot\'s app scope). Please join the group manually.',
+  'cmd.group.warn_transfer_failed': '⚠️ Owner transfer failed ({reason}); the bot is still the group owner. You can transfer it manually inside the new group.',
 
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',
@@ -177,6 +184,8 @@ export const messages: Record<string, string> = {
   'help.heading_grant': '🔑 Access grants (owner only):',
   'help.grant': '@bot /grant @someone   - Pop an authorization card to grant "this chat" or "global" access',
   'help.revoke': '@bot /revoke @someone  - Revoke their this-chat + global access',
+  'help.heading_group': '🆕 One-shot session group:',
+  'help.group': '/group <name>  (alias /g)  - Auto-create a group and invite you (the whole group = one CLI session)',
   'help.help': '/help       - Show this help',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────

@@ -137,6 +137,13 @@ export const messages: Record<string, string> = {
   'cmd.oncall.unbind_not_bound': '当前群未绑定 oncall。（已记录解绑意图，default-oncall 不会再自动绑此群）',
   'cmd.oncall.unbind_success': '✅ 已解除 oncall 绑定。下次开新话题将恢复默认仓库选择卡片流程。',
   'cmd.oncall.unknown_sub': '未知子命令：{sub}\n支持：/oncall bind <path> | /oncall unbind | /oncall status',
+  'cmd.group.empty_fallback': '新会话 {ts}',
+  'cmd.group.no_bot': '⚠️ 无法识别当前响应的机器人，/group 创建失败。',
+  'cmd.group.no_sender': '⚠️ 无法获取发起人 open_id，/group 创建失败。',
+  'cmd.group.created': '✅ 已新建群「{name}」\n👉 {link}\n\n直接在新群里开聊就行，整个群是一个独立的 CLI 会话。{hints}',
+  'cmd.group.failed': '⚠️ 建群失败：{error}',
+  'cmd.group.warn_invite_rejected': '⚠️ 飞书拒绝了自动邀请（你可能不在当前机器人的 app scope 下）。请到群里手动加入。',
+  'cmd.group.warn_transfer_failed': '⚠️ 转让群主失败（{reason}），当前机器人仍是群主。可在新群里手动转让。',
 
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报',
@@ -180,6 +187,8 @@ export const messages: Record<string, string> = {
   'help.heading_grant': '🔑 使用授权（owner 专用）：',
   'help.grant': '@机器人 /grant @某人   - 弹授权卡片，授权对方「本群使用」或「全局」',
   'help.revoke': '@机器人 /revoke @某人  - 撤销对方的本群 + 全局授权',
+  'help.heading_group': '🆕 一键新建会话群：',
+  'help.group': '/group <群名>  (别名 /g)  - 自动建群、邀请你进群（整群=一个 CLI 会话）',
   'help.help': '/help       - 显示此帮助',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────

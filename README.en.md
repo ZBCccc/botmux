@@ -353,6 +353,12 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 | `@bot /grant @someone` | Pop an authorization card to add the user to the "this chat" or "global" allowlist; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
 | `@bot /revoke @someone` | Revoke the user's this-chat + global access |
 
+**🆕 One-shot session group**
+
+| Command | Description |
+|---------|-------------|
+| `/group <name>` (alias `/g`) | Auto-create a new Lark group, invite you, transfer ownership; the whole group acts as one chat-scope CLI session. Empty name falls back to a timestamp. |
+
 **👥 Multi-bot collaboration**
 
 | Command | Description |
