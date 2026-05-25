@@ -1477,8 +1477,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     rootMessageId: parsed.rootMessageId,
     sessionId: parsed.sessionId,
     approvers,
-    options: parsed.options,
-    prompt: parsed.prompt,
+    questions: parsed.questions,
     timeoutMs: parsed.timeoutMs,
   });
   return jsonRes(res, 200, result);
