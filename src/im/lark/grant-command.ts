@@ -85,7 +85,7 @@ export async function tryHandleGrantCommand(
         ? t('cmd.revoke.would_open', undefined, loc)
         : t('cmd.revoke.failed', { reason: r.reason }, loc);
     } else {
-      const scope = `${r.removed.chat ? t('cmd.revoke.scope_chat', undefined, loc) : ''}${r.removed.global ? t('cmd.revoke.scope_global', undefined, loc) : ''}`.trim()
+      const scope = `${r.removed.chat ? t('cmd.revoke.scope_chat', undefined, loc) : ''}${r.removed.globalTalk ? t('cmd.revoke.scope_global_talk', undefined, loc) : ''}${r.removed.global ? t('cmd.revoke.scope_global', undefined, loc) : ''}`.trim()
         || t('cmd.revoke.scope_none', undefined, loc);
       txt = t('cmd.revoke.done', { name: target.name, scope }, loc);
     }

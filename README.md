@@ -556,6 +556,7 @@ botmux setup
 | `defaultWorkingDir` | 否 | 单仓库默认目录：新话题在无 oncall 绑定 / 无同群兄弟 session 时直接进入该目录，跳过 repo 选择卡片。`/cd <path>` 仍可临时切换；下一个新话题回到该默认值。**与 `defaultOncall` 的区别**：不写 `oncallChats`、不修改 `canTalk`/`canOperate` 权限模型 |
 | `allowedUsers` | 否 | 允许的用户列表（**完整邮箱**如 `alice@example.com`，或 open_id `ou_xxx`）。邮箱前缀无法解析、会被丢弃。配置了 `allowedChatGroups` 时此项必须至少有一个条目作为 owner |
 | `allowedChatGroups` | 否 | 可对话群列表（飞书 `chat_id`，如 `oc_xxx`）。**在这些群里**任何成员都能与机器人对话（按消息所在群判断，新人进群即生效、退群即失权，无需重启）；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。等价于 owner 在该群发 `/grant`（不带 @）。 |
+| `globalGrants` | 否 | 全局可对话名单（`open_id` 列表，如 `ou_xxx`；人或 bot 均可）。名单内的对象可在**任意群**与机器人对话；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。通常由 owner 在授权卡上点「全局授权对话」写入，也可在此手动配置。 |
 | `oncallChats` | 否 | oncall 绑定（`/oncall bind` 写入），形如 `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`，群内任何成员可 @ 提问 |
 
 **配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`

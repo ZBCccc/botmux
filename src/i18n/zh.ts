@@ -57,8 +57,9 @@ export const messages: Record<string, string> = {
   'card.grant.body_request': '用户 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
   'card.grant.body_owner': '是否授权 **{name}** 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.btn_chat': '授权本群对话',
+  'card.grant.btn_global': '全局授权对话',
   'card.grant.btn_deny': '拒绝',
-  'card.grant.note': '仅授予「在本群与我对话」；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（owner）。',
+  'card.grant.note': '仅授予对话权（本群或全局）；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（owner）。',
   'card.grant.toast_owner_only': '仅 owner 可操作',
   'card.grant.toast_expired': '该授权请求已失效',
   'card.grant.toast_no_repo_perm': '无操作权限',
@@ -85,6 +86,7 @@ export const messages: Record<string, string> = {
   'cmd.revoke.failed': '⚠️ 撤销失败：{reason}',
   'cmd.revoke.scope_chat': '本群 ',
   'cmd.revoke.scope_global': '全局',
+  'cmd.revoke.scope_global_talk': '全局对话 ',
   'cmd.revoke.scope_none': '无',
 
   // ─── Adopt card ──────────────────────────────────────────────────────────

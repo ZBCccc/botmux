@@ -69,6 +69,13 @@ export interface BotConfig {
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
+   * 全局对话授权名单：被授权在**任意群**与本 bot 对话的 open_id 列表（人或 bot 通用）。
+   * 与 chatGrants 同属 talk-only —— 仅放行 canTalk / bot 路由闸，**canOperate 绝不读它**
+   * （敏感操作仍仅限 allowedUsers）。这是 chatGrants 的全局版：作用域升到全局，talk-only
+   * 性质不变。可由 /grant 卡片「全局」按钮写入，也可在 bots.json 手配 open_id。
+   */
+  globalGrants?: string[];
+  /**
    * Custom footer brand label for cards this bot sends. Three states:
    *   • `undefined` (unset)  → default `[botmux](github)` link
    *   • `''` (empty)         → brand suppressed (footer shows only 发送给 if any)
@@ -386,6 +393,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatGrants = out;
     }
 
+    // globalGrants：只保留非空 string[]（open_id 列表），逐项校验 typeof === 'string'。
+    // 未配置或全部非法 → undefined。
+    let globalGrants: string[] | undefined;
+    if (Array.isArray(entry.globalGrants)) {
+      const ids = (entry.globalGrants as any[]).filter((x): x is string => typeof x === 'string' && x.trim().length > 0);
+      if (ids.length > 0) globalGrants = ids;
+    }
+
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
@@ -404,6 +419,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.defaultWorkingDir.trim()
         : undefined,
       chatGrants,
+      globalGrants,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.

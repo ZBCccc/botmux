@@ -54,8 +54,9 @@ export const messages: Record<string, string> = {
   'card.grant.body_request': 'User **{name}** is requesting to use me in this chat. <at id={owner}></at> allow them to talk to me here?',
   'card.grant.body_owner': 'Grant **{name}** permission to talk to me in this chat? (<at id={owner}></at>)',
   'card.grant.btn_chat': 'Grant talk in this chat',
+  'card.grant.btn_global': 'Grant talk globally',
   'card.grant.btn_deny': 'Deny',
-  'card.grant.note': 'Grants "talk in this chat" only; /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (owner).',
+  'card.grant.note': 'Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (owner).',
   'card.grant.toast_owner_only': 'Only the owner can do this',
   'card.grant.toast_expired': 'This request has expired',
   'card.grant.toast_no_repo_perm': 'No permission',
@@ -82,6 +83,7 @@ export const messages: Record<string, string> = {
   'cmd.revoke.failed': '⚠️ Revoke failed: {reason}',
   'cmd.revoke.scope_chat': 'this-chat ',
   'cmd.revoke.scope_global': 'global',
+  'cmd.revoke.scope_global_talk': 'global-talk ',
   'cmd.revoke.scope_none': 'none',
 
   // ─── Adopt card ──────────────────────────────────────────────────────────

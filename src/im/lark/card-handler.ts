@@ -9,7 +9,7 @@ import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
 import { sendUserMessage, updateMessage, deleteMessage, replyMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
-import { addChatGrant } from '../../services/grant-store.js';
+import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied } from './grant-pending.js';
 import {
   handleWorkflowApprovalAction,
@@ -137,9 +137,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  // ─── 群内授权卡片动作（grant_chat / grant_deny，talk-only）─────────────
+  // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
-  if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_deny') && larkAppId) {
+  if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {
     const loc = localeForBot(larkAppId);
     const owner = getOwnerOpenId(larkAppId);
     // owner 强闸门：必须是当前 app 的 owner 本人（比 canOperate 更严）
@@ -159,15 +159,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       markDenied(larkAppId, grantChatId, target);
       return JSON.parse(buildGrantResultCard('deny', loc));
     }
-    // 授权（talk-only）：只写本群 chatGrants，绝不碰 allowedUsers（operate 只由 bots.json 配）。
+    // 授权（talk-only）：grant_chat 写本群 chatGrants，grant_global 写全局 globalGrants，
+    // 两者都绝不碰 allowedUsers（operate 只由 bots.json 配）。
     // 落库失败不撤卡、保留 pending（owner 可重试），给 toast。
-    const res = await addChatGrant(larkAppId, grantChatId, target);
+    const kind = value.action === 'grant_global' ? 'global' as const : 'chat' as const;
+    const res = kind === 'global'
+      ? await addGlobalGrant(larkAppId, target)
+      : await addChatGrant(larkAppId, grantChatId, target);
     if (!res.ok) {
       logger.warn(`Grant action "${value.action}" store failed: ${res.reason}`);
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: res.reason }, loc) } };
     }
     clearPending(larkAppId, grantChatId, target);
-    const kind = 'chat' as const;
     // 授权成功后：在原线程 @ 被授权人发通知 + 撤回授权卡（用户要求）。
     // 这两步失败不回滚授权（已落库），仅记日志，并兜底用 in-place patch 让 owner 看到结果。
     if (cardMessageId) {
